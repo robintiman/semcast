@@ -1,0 +1,15 @@
+[package]
+name = "semcast"
+version = "0.1.0"
+edition = "2024"
+description = "Planner-integrated semantic operators for Apache DataFusion"
+license = "Apache-2.0"
+repository = "https://github.com/robintiman/semcast"
+keywords = ["datafusion", "llm", "sql", "semantic"]
+categories = ["database"]
+
+[dependencies]
+async-trait = "0.1.89"
+datafusion = "54"
+thiserror = "2.0.18"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
