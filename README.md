@@ -261,14 +261,86 @@ the index and cache compound across queries.
 - **Entity resolution** — the semantic-join case: match a CRM against a
   purchased dataset without n×m model calls.
 
+## Getting started
+
+semcast is a Rust library that plugs into DataFusion. It isn't on crates.io
+yet — depend on it straight from git:
+
+```toml
+[dependencies]
+semcast    = { git = "https://github.com/robintiman/semcast" }
+datafusion = "54"
+tokio      = { version = "1", features = ["rt-multi-thread", "macros"] }
+```
+
+You'll also need a model. Two providers ship today:
+
+- **Ollama** (local, free) — `ollama pull llama3.2`, server on `localhost:11434`.
+  Also the embedding source once the semantic index lands.
+- **Anthropic** — `export ANTHROPIC_API_KEY=...`; defaults to Haiku, the right
+  tier for one-word verify calls. No embeddings.
+
+Then build a context and query. One honest caveat while the parser extension
+is pending: the surface syntax is a `means(text, 'condition')` function rather
+than the infix `MEANS` operator, and `WITH RECALL` isn't parsed yet.
+
+```rust
+use std::sync::Arc;
+use semcast::{model::OllamaProvider, semcast_context};
+// or: semcast::model::AnthropicProvider::from_env()?
+
+#[tokio::main]
+async fn main() -> datafusion::error::Result<()> {
+    let ctx = semcast_context(Arc::new(OllamaProvider::new("llama3.2")));
+    ctx.register_csv("meetings", "meetings.csv", Default::default()).await?;
+
+    ctx.sql(
+        "SELECT meeting_id, title FROM meetings
+         WHERE held_at >= CAST('2026-01-01' AS TIMESTAMP)
+           AND means(transcript, 'discussed the launch of offline sync in Atlas')",
+    )
+    .await?
+    .show()
+    .await?;
+
+    Ok(())
+}
+```
+
+What you get today: the planner rewrites `means(..)` into a `SemFilter` node
+above your free predicates (so they run first), verifies survivors through the
+model with batched async calls, caches every verdict by full provenance so
+re-running — or narrowing — the query costs zero new calls, and `EXPLAIN`
+prices the verify stage before you run:
+
+```text
+VerifyExec: MEANS('discussed the launch of offline sync in Atlas') model=ollama/llama3.2   ~3 model calls
+```
+
+`means()` is only supported as a top-level `AND` conjunct of `WHERE` for now;
+anything else (`OR`, `NOT`, the `SELECT` list) fails at plan time rather than
+silently costing a model call per row.
+
+To poke at it without wiring anything up:
+
+```sh
+git clone https://github.com/robintiman/semcast && cd semcast
+cargo run --example meetings                       # deterministic mock model, no setup
+cargo test                                         # full suite, no network
+cargo test --test live_ollama -- --ignored         # end-to-end against local Ollama
+```
+
 ## Status
 
 Early / experimental. Order of attack:
 
-1. `MEANS` logical operator + verify-only physical plan — correct first, cheap later
-2. `CREATE SEMANTIC INDEX` on Lance + the index pre-filter stage
+1. ~~`MEANS` logical operator + verify-only physical plan — correct first, cheap
+   later~~ **done** (as the `means()` function; infix syntax pending)
+2. `CREATE SEMANTIC INDEX` on Lance + the index pre-filter stage — **next**
 3. `WITH RECALL` — sampled threshold calibration
-4. Field-level cache with provenance keys
+4. Field-level cache with provenance keys — **in-memory version done**, shared
+   across queries within a session; the persistent, cross-session cache comes
+   with the index work
 5. Eval harness: a labeled corpus, reporting **calls saved and recall** against
    the LLM-on-every-row baseline — so the headline claim stays falsifiable
 
