@@ -2,15 +2,21 @@
 //!
 //! Everything above this module talks to models through [`ModelProvider`];
 //! swapping a small verify model for a strong extraction model is a matter of
-//! handing a different provider to the planner. Real HTTP-backed providers are
-//! deliberately absent from the skeleton — [`MockModel`] is deterministic and
-//! free, which is what the eval harness (roadmap step 5) needs as a baseline.
+//! handing a different provider to the planner. [`MockModel`] is deterministic
+//! and free — the eval harness (roadmap step 5) baseline; [`OllamaProvider`]
+//! runs local models (and embeddings, for the index); [`AnthropicProvider`]
+//! is the hosted option for verify-quality answers.
 
+mod anthropic;
 mod mock;
+mod ollama;
 
+pub use anthropic::AnthropicProvider;
 pub use mock::MockModel;
+pub use ollama::OllamaProvider;
 
 use async_trait::async_trait;
+use futures::StreamExt;
 
 use crate::Result;
 
@@ -57,4 +63,23 @@ pub trait ModelProvider: std::fmt::Debug + Send + Sync {
     async fn complete(&self, requests: Vec<CompletionRequest>) -> Vec<Result<Completion>>;
 
     async fn embed(&self, texts: Vec<String>) -> Result<Vec<Embedding>>;
+}
+
+/// How many requests an HTTP provider keeps in flight at once.
+const MAX_IN_FLIGHT: usize = 8;
+
+/// Run `send` over every request with bounded concurrency, preserving order —
+/// one result per request, so a single bad row can't fail the batch.
+async fn complete_concurrently<F, Fut>(
+    requests: Vec<CompletionRequest>,
+    send: F,
+) -> Vec<Result<Completion>>
+where
+    F: Fn(CompletionRequest) -> Fut,
+    Fut: Future<Output = Result<Completion>>,
+{
+    futures::stream::iter(requests.into_iter().map(send))
+        .buffered(MAX_IN_FLIGHT)
+        .collect()
+        .await
 }

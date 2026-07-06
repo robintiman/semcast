@@ -8,6 +8,7 @@ use datafusion::arrow::array::{Array, BooleanArray, StringArray};
 use datafusion::arrow::compute::{cast, filter_record_batch};
 use datafusion::arrow::datatypes::DataType;
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::common::stats::Precision;
 use datafusion::error::Result;
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
@@ -91,7 +92,18 @@ impl DisplayAs for VerifyExec {
             "VerifyExec: MEANS('{}') model={}",
             self.condition,
             self.model.id()
-        )
+        )?;
+        // Know the bill before you run: worst-case model calls from input
+        // statistics (cache hits and NULLs are free, so this is a ceiling).
+        match self
+            .input
+            .partition_statistics(None)
+            .map(|stats| stats.num_rows)
+        {
+            Ok(Precision::Exact(rows)) => write!(f, "   ≤{rows} model calls"),
+            Ok(Precision::Inexact(rows)) => write!(f, "   ~{rows} model calls"),
+            _ => write!(f, "   model calls unknown"),
+        }
     }
 }
 

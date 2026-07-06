@@ -43,6 +43,13 @@ async fn main() -> datafusion::error::Result<()> {
         .await?;
 
     println!("Optimized plan:\n{}\n", df.clone().into_optimized_plan()?.display_indent());
+
+    let physical = df.clone().create_physical_plan().await?;
+    println!(
+        "Physical plan (with the verify-stage call estimate):\n{}",
+        datafusion::physical_plan::displayable(physical.as_ref()).indent(false)
+    );
+
     println!("Results:");
     df.show().await?;
 
