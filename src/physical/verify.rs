@@ -4,46 +4,78 @@
 use std::fmt;
 use std::sync::Arc;
 
-use datafusion::common::not_impl_err;
+use datafusion::arrow::array::{Array, BooleanArray, StringArray};
+use datafusion::arrow::compute::{cast, filter_record_batch};
+use datafusion::arrow::datatypes::DataType;
+use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::error::Result;
 use datafusion::execution::TaskContext;
-use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::metrics::{Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
     SendableRecordBatchStream,
 };
+use futures::TryStreamExt;
 
-use crate::model::ModelProvider;
+use crate::model::{CompletionRequest, ModelProvider};
+
+/// Version of the synthesized `MEANS` verify prompt. Participates in cache
+/// keys: bump it and every cached verdict is honestly invalidated.
+pub const MEANS_PROMPT_VERSION: &str = "means-v1";
+
+/// The instruction the verify model sees. Users never write this.
+pub fn synthesize_means_prompt(condition: &str) -> String {
+    format!(
+        "You are evaluating a predicate over a document. \
+         Answer with exactly one word: yes or no.\n\n\
+         Predicate: {condition}\n\n\
+         Does the document satisfy the predicate?"
+    )
+}
 
 /// Filters input batches by asking the model whether each row's text meets
 /// the condition. Ground truth for `MEANS` — every cheaper stage upstream is
 /// an approximation of what this operator computes.
+///
+/// Row semantics ("rows fail, queries don't"): a NULL text never matches and
+/// costs no call; a row whose model call errors or answers unparseably is
+/// excluded and counted in the `rows_dropped` metric.
 #[derive(Debug)]
 pub struct VerifyExec {
     input: Arc<dyn ExecutionPlan>,
+    /// Evaluates to the text under scrutiny, against input batches.
+    text: Arc<dyn PhysicalExpr>,
     condition: String,
     model: Arc<dyn ModelProvider>,
     properties: Arc<PlanProperties>,
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl VerifyExec {
     pub fn new(
         input: Arc<dyn ExecutionPlan>,
+        text: Arc<dyn PhysicalExpr>,
         condition: impl Into<String>,
         model: Arc<dyn ModelProvider>,
     ) -> Self {
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(input.schema()),
-            Partitioning::UnknownPartitioning(1),
+            // Pass-through filter: same partitioning as the input, and every
+            // partition must be executed.
+            input.output_partitioning().clone(),
             EmissionType::Incremental,
             Boundedness::Bounded,
         ));
         Self {
             input,
+            text,
             condition: condition.into(),
             model,
             properties,
+            metrics: ExecutionPlanMetricsSet::new(),
         }
     }
 }
@@ -78,6 +110,7 @@ impl ExecutionPlan for VerifyExec {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(Self::new(
             Arc::clone(&children[0]),
+            Arc::clone(&self.text),
             self.condition.clone(),
             Arc::clone(&self.model),
         )))
@@ -85,13 +118,94 @@ impl ExecutionPlan for VerifyExec {
 
     fn execute(
         &self,
-        _partition: usize,
-        _context: Arc<TaskContext>,
+        partition: usize,
+        context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        // Roadmap step 1: stream input batches, build one CompletionRequest
-        // per row (later: top-k chunks from the index instead of full text),
-        // batch through ModelProvider::complete, keep rows answered "yes".
-        // Failed rows yield NULL + error column, not a failed query.
-        not_impl_err!("VerifyExec::execute — roadmap step 1 (verify-only physical plan)")
+        let input = self.input.execute(partition, context)?;
+        let verifier = Arc::new(Verifier {
+            text: Arc::clone(&self.text),
+            prompt: synthesize_means_prompt(&self.condition),
+            model: Arc::clone(&self.model),
+            model_calls: MetricBuilder::new(&self.metrics).counter("model_calls", partition),
+            rows_dropped: MetricBuilder::new(&self.metrics).counter("rows_dropped", partition),
+        });
+        let stream = input.and_then(move |batch| {
+            let verifier = Arc::clone(&verifier);
+            async move { verifier.verify_batch(batch).await }
+        });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            self.input.schema(),
+            stream,
+        )))
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
+    }
+}
+
+/// Everything one partition's stream needs, bundled so the closure stays
+/// cheap to clone.
+struct Verifier {
+    text: Arc<dyn PhysicalExpr>,
+    prompt: String,
+    model: Arc<dyn ModelProvider>,
+    model_calls: Count,
+    rows_dropped: Count,
+}
+
+impl Verifier {
+    async fn verify_batch(&self, batch: RecordBatch) -> Result<RecordBatch> {
+        if batch.num_rows() == 0 {
+            return Ok(batch);
+        }
+        let texts = self
+            .text
+            .evaluate(&batch)?
+            .into_array(batch.num_rows())?;
+        let texts = cast(&texts, &DataType::Utf8)?;
+        let texts = texts
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("array was just cast to Utf8");
+
+        // NULL text rows never match and never reach the model.
+        let mut requests = Vec::new();
+        let mut request_rows = Vec::new();
+        for row in 0..batch.num_rows() {
+            if texts.is_valid(row) {
+                requests.push(CompletionRequest {
+                    system: self.prompt.clone(),
+                    input: texts.value(row).to_owned(),
+                    max_tokens: 8,
+                });
+                request_rows.push(row);
+            }
+        }
+        self.model_calls.add(requests.len());
+
+        let mut keep = vec![false; batch.num_rows()];
+        let verdicts = self.model.complete(requests).await;
+        debug_assert_eq!(verdicts.len(), request_rows.len());
+        for (&row, verdict) in request_rows.iter().zip(&verdicts) {
+            match verdict.as_ref().map(|c| parse_verdict(&c.text)) {
+                Ok(Some(matched)) => keep[row] = matched,
+                // Row-level failure: exclude and count, don't fail the query.
+                Ok(None) | Err(_) => self.rows_dropped.add(1),
+            }
+        }
+        Ok(filter_record_batch(&batch, &BooleanArray::from(keep))?)
+    }
+}
+
+/// `None` means the model didn't give a usable yes/no.
+fn parse_verdict(text: &str) -> Option<bool> {
+    let normalized = text.trim().trim_matches(|c: char| c.is_ascii_punctuation());
+    if normalized.eq_ignore_ascii_case("yes") {
+        Some(true)
+    } else if normalized.eq_ignore_ascii_case("no") {
+        Some(false)
+    } else {
+        None
     }
 }

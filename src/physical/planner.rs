@@ -60,16 +60,21 @@ struct SemcastExtensionPlanner {
 impl ExtensionPlanner for SemcastExtensionPlanner {
     async fn plan_extension(
         &self,
-        _planner: &dyn PhysicalPlanner,
+        planner: &dyn PhysicalPlanner,
         node: &dyn UserDefinedLogicalNode,
-        _logical_inputs: &[&LogicalPlan],
+        logical_inputs: &[&LogicalPlan],
         physical_inputs: &[Arc<dyn ExecutionPlan>],
-        _session_state: &SessionState,
+        session_state: &SessionState,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         if let Some(filter) = node.as_any().downcast_ref::<SemFilterNode>() {
-            let input = Arc::clone(&physical_inputs[0]);
+            let text = planner.create_physical_expr(
+                &filter.text,
+                logical_inputs[0].schema(),
+                session_state,
+            )?;
             return Ok(Some(Arc::new(VerifyExec::new(
-                input,
+                Arc::clone(&physical_inputs[0]),
+                text,
                 filter.condition.clone(),
                 Arc::clone(&self.model),
             ))));

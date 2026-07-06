@@ -11,5 +11,6 @@ categories = ["database"]
 [dependencies]
 async-trait = "0.1.89"
 datafusion = "54"
+futures = "0.3.32"
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
