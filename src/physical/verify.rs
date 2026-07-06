@@ -20,7 +20,8 @@ use datafusion::physical_plan::{
 };
 use futures::TryStreamExt;
 
-use crate::model::{CompletionRequest, ModelProvider};
+use crate::cache::{CacheKey, CachedValue, SemanticCache};
+use crate::model::{CompletionRequest, ModelId, ModelProvider};
 
 /// Version of the synthesized `MEANS` verify prompt. Participates in cache
 /// keys: bump it and every cached verdict is honestly invalidated.
@@ -50,6 +51,7 @@ pub struct VerifyExec {
     text: Arc<dyn PhysicalExpr>,
     condition: String,
     model: Arc<dyn ModelProvider>,
+    cache: Arc<dyn SemanticCache>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -60,6 +62,7 @@ impl VerifyExec {
         text: Arc<dyn PhysicalExpr>,
         condition: impl Into<String>,
         model: Arc<dyn ModelProvider>,
+        cache: Arc<dyn SemanticCache>,
     ) -> Self {
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(input.schema()),
@@ -74,6 +77,7 @@ impl VerifyExec {
             text,
             condition: condition.into(),
             model,
+            cache,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -113,6 +117,7 @@ impl ExecutionPlan for VerifyExec {
             Arc::clone(&self.text),
             self.condition.clone(),
             Arc::clone(&self.model),
+            Arc::clone(&self.cache),
         )))
     }
 
@@ -124,9 +129,13 @@ impl ExecutionPlan for VerifyExec {
         let input = self.input.execute(partition, context)?;
         let verifier = Arc::new(Verifier {
             text: Arc::clone(&self.text),
+            condition: self.condition.clone(),
             prompt: synthesize_means_prompt(&self.condition),
+            model_id: self.model.id(),
             model: Arc::clone(&self.model),
+            cache: Arc::clone(&self.cache),
             model_calls: MetricBuilder::new(&self.metrics).counter("model_calls", partition),
+            cache_hits: MetricBuilder::new(&self.metrics).counter("cache_hits", partition),
             rows_dropped: MetricBuilder::new(&self.metrics).counter("rows_dropped", partition),
         });
         let stream = input.and_then(move |batch| {
@@ -148,9 +157,13 @@ impl ExecutionPlan for VerifyExec {
 /// cheap to clone.
 struct Verifier {
     text: Arc<dyn PhysicalExpr>,
+    condition: String,
     prompt: String,
+    model_id: ModelId,
     model: Arc<dyn ModelProvider>,
+    cache: Arc<dyn SemanticCache>,
     model_calls: Count,
+    cache_hits: Count,
     rows_dropped: Count,
 }
 
@@ -169,32 +182,63 @@ impl Verifier {
             .downcast_ref::<StringArray>()
             .expect("array was just cast to Utf8");
 
-        // NULL text rows never match and never reach the model.
+        // NULL text rows never match and never reach the model; cached rows
+        // never reach it either — first evaluation wins.
+        let mut keep = vec![false; batch.num_rows()];
         let mut requests = Vec::new();
         let mut request_rows = Vec::new();
-        for row in 0..batch.num_rows() {
-            if texts.is_valid(row) {
-                requests.push(CompletionRequest {
-                    system: self.prompt.clone(),
-                    input: texts.value(row).to_owned(),
-                    max_tokens: 8,
-                });
-                request_rows.push(row);
+        for (row, keep_row) in keep.iter_mut().enumerate() {
+            if !texts.is_valid(row) {
+                continue;
             }
+            let text = texts.value(row);
+            if let Some(CachedValue::Value(verdict)) = self.cache.get(&self.cache_key(text)) {
+                self.cache_hits.add(1);
+                *keep_row = verdict == "yes";
+                continue;
+            }
+            requests.push(CompletionRequest {
+                system: self.prompt.clone(),
+                input: text.to_owned(),
+                max_tokens: 8,
+            });
+            request_rows.push(row);
         }
         self.model_calls.add(requests.len());
 
-        let mut keep = vec![false; batch.num_rows()];
         let verdicts = self.model.complete(requests).await;
         debug_assert_eq!(verdicts.len(), request_rows.len());
         for (&row, verdict) in request_rows.iter().zip(&verdicts) {
             match verdict.as_ref().map(|c| parse_verdict(&c.text)) {
-                Ok(Some(matched)) => keep[row] = matched,
+                Ok(Some(matched)) => {
+                    keep[row] = matched;
+                    // Only successful verdicts are cached: a transient model
+                    // failure must not permanently exclude a row.
+                    self.cache.put(
+                        self.cache_key(texts.value(row)),
+                        CachedValue::Value(if matched { "yes" } else { "no" }.to_owned()),
+                    );
+                }
                 // Row-level failure: exclude and count, don't fail the query.
                 Ok(None) | Err(_) => self.rows_dropped.add(1),
             }
         }
         Ok(filter_record_batch(&batch, &BooleanArray::from(keep))?)
+    }
+
+    /// Full provenance: same condition + text + model + prompt scheme →
+    /// same verdict, across every query that ever asks again.
+    fn cache_key(&self, text: &str) -> CacheKey {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        text.hash(&mut hasher);
+        CacheKey {
+            type_version: self.condition.clone(),
+            field: "means".to_owned(),
+            input_hash: hasher.finish(),
+            model_id: self.model_id.clone(),
+            prompt_version: MEANS_PROMPT_VERSION.to_owned(),
+        }
     }
 }
 

@@ -11,7 +11,11 @@ use semcast::semcast_context;
 /// meetings(meeting_id, title, transcript) — one matching transcript, one
 /// non-matching, one NULL.
 async fn meetings_context() -> SessionContext {
-    let ctx = semcast_context(Arc::new(MockModel::answering_yes_to(["offline sync"])));
+    meetings_context_with_model(Arc::new(MockModel::answering_yes_to(["offline sync"]))).await
+}
+
+async fn meetings_context_with_model(model: Arc<MockModel>) -> SessionContext {
+    let ctx = semcast_context(model);
     ctx.sql(
         "CREATE TABLE meetings AS
          SELECT * FROM (VALUES
@@ -155,6 +159,78 @@ async fn non_literal_condition_is_a_plan_time_error() {
         .into_optimized_plan()
         .unwrap_err();
     assert!(err.to_string().contains("string literal"), "{err}");
+}
+
+#[tokio::test]
+async fn repeat_query_is_served_from_cache() {
+    let model = Arc::new(MockModel::answering_yes_to(["offline sync"]));
+    let ctx = meetings_context_with_model(Arc::clone(&model)).await;
+    let query = "SELECT meeting_id FROM meetings WHERE means(transcript, 'discussed offline sync')";
+
+    let first = matching_ids(&ctx, query).await;
+    assert_eq!(model.completion_calls(), 2, "two non-NULL transcripts");
+
+    let second = matching_ids(&ctx, query).await;
+    assert_eq!(first, second);
+    assert_eq!(
+        model.completion_calls(),
+        2,
+        "second run must cost zero new model calls"
+    );
+}
+
+/// The README §3 story: a follow-up query sharing the means() predicate pays
+/// nothing for rows the cache has already seen — even though the query shape
+/// (projection, free predicates) changed.
+#[tokio::test]
+async fn narrower_followup_query_reuses_verdicts() {
+    let model = Arc::new(MockModel::answering_yes_to(["offline sync"]));
+    let ctx = meetings_context_with_model(Arc::clone(&model)).await;
+
+    matching_ids(
+        &ctx,
+        "SELECT meeting_id FROM meetings WHERE means(transcript, 'discussed offline sync')",
+    )
+    .await;
+    let calls_after_first = model.completion_calls();
+
+    let ids = matching_ids(
+        &ctx,
+        "SELECT meeting_id FROM meetings
+         WHERE meeting_id < 3 AND means(transcript, 'discussed offline sync')",
+    )
+    .await;
+    assert_eq!(ids, vec![1]);
+    assert_eq!(
+        model.completion_calls(),
+        calls_after_first,
+        "follow-up rows are a subset of already-verified rows"
+    );
+}
+
+/// Different condition, different provenance — the cache must not bleed
+/// verdicts across conditions.
+#[tokio::test]
+async fn different_condition_is_not_a_cache_hit() {
+    let model = Arc::new(MockModel::answering_yes_to(["offline sync"]));
+    let ctx = meetings_context_with_model(Arc::clone(&model)).await;
+
+    matching_ids(
+        &ctx,
+        "SELECT meeting_id FROM meetings WHERE means(transcript, 'discussed offline sync')",
+    )
+    .await;
+    let calls_after_first = model.completion_calls();
+
+    matching_ids(
+        &ctx,
+        "SELECT meeting_id FROM meetings WHERE means(transcript, 'discussed hiring')",
+    )
+    .await;
+    assert!(
+        model.completion_calls() > calls_after_first,
+        "a new condition must reach the model"
+    );
 }
 
 #[tokio::test]

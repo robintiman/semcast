@@ -1,5 +1,7 @@
 //! Deterministic in-process model for tests and the eval baseline.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use async_trait::async_trait;
 
 use super::{Completion, CompletionRequest, Embedding, ModelId, ModelProvider};
@@ -10,6 +12,7 @@ use crate::Result;
 #[derive(Debug, Default)]
 pub struct MockModel {
     truthy: Vec<String>,
+    calls: AtomicUsize,
 }
 
 impl MockModel {
@@ -22,7 +25,14 @@ impl MockModel {
     {
         Self {
             truthy: needles.into_iter().map(Into::into).collect(),
+            calls: AtomicUsize::new(0),
         }
+    }
+
+    /// Completion requests served so far — lets tests assert what the cache
+    /// saved, and the eval harness report calls against the baseline.
+    pub fn completion_calls(&self) -> usize {
+        self.calls.load(Ordering::Relaxed)
     }
 }
 
@@ -33,6 +43,7 @@ impl ModelProvider for MockModel {
     }
 
     async fn complete(&self, requests: Vec<CompletionRequest>) -> Vec<Result<Completion>> {
+        self.calls.fetch_add(requests.len(), Ordering::Relaxed);
         requests
             .into_iter()
             .map(|req| {

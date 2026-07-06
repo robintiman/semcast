@@ -15,6 +15,7 @@ use datafusion::logical_expr::{LogicalPlan, UserDefinedLogicalNode};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner};
 
+use crate::cache::SemanticCache;
 use crate::logical::SemFilterNode;
 use crate::model::ModelProvider;
 use crate::physical::VerifyExec;
@@ -23,11 +24,12 @@ use crate::physical::VerifyExec;
 #[derive(Debug)]
 pub struct SemcastQueryPlanner {
     model: Arc<dyn ModelProvider>,
+    cache: Arc<dyn SemanticCache>,
 }
 
 impl SemcastQueryPlanner {
-    pub fn new(model: Arc<dyn ModelProvider>) -> Self {
-        Self { model }
+    pub fn new(model: Arc<dyn ModelProvider>, cache: Arc<dyn SemanticCache>) -> Self {
+        Self { model, cache }
     }
 }
 
@@ -41,6 +43,7 @@ impl QueryPlanner for SemcastQueryPlanner {
         let planner = DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(
             SemcastExtensionPlanner {
                 model: Arc::clone(&self.model),
+                cache: Arc::clone(&self.cache),
             },
         )]);
         planner
@@ -54,6 +57,7 @@ impl QueryPlanner for SemcastQueryPlanner {
 /// cheap later; funnel stages slot in with roadmap step 2.
 struct SemcastExtensionPlanner {
     model: Arc<dyn ModelProvider>,
+    cache: Arc<dyn SemanticCache>,
 }
 
 #[async_trait]
@@ -77,6 +81,7 @@ impl ExtensionPlanner for SemcastExtensionPlanner {
                 text,
                 filter.condition.clone(),
                 Arc::clone(&self.model),
+                Arc::clone(&self.cache),
             ))));
         }
         Ok(None)
