@@ -2,72 +2,49 @@
 
 Planner-integrated semantic operators for [Apache DataFusion](https://datafusion.apache.org/).
 
-LLM calls today live in the application layer (Marvin, BAML) or as opaque SQL
-functions (FlockMTL, Databricks `ai_query`, Snowflake Cortex). Either way the
-query optimizer can't see them, so it can't make them cheaper. **semcast puts the
-model call inside the planner as a first-class operator** — so DataFusion can
-prune, reorder, and cache it like any other.
+LLM calls today live in the application layer (Marvin, BAML) or behind opaque
+SQL functions (FlockMTL, `ai_query`, Cortex) — invisible to the query
+optimizer, so it can't make them cheaper. **semcast puts the model call inside
+the planner as a first-class operator** DataFusion can prune, reorder, and
+cache.
 
-The closest relative is [LOTUS](https://github.com/lotus-data/lotus), which
-pioneered semantic operators with statistical accuracy guarantees — as a Python
-dataframe library. semcast bets the same ideas belong *inside a SQL planner*,
-where they compose with ordinary relations, indexes, and every other optimizer
-rule for free.
+Closest relative: [LOTUS](https://github.com/lotus-data/lotus), which pioneered
+semantic operators with accuracy guarantees as a Python dataframe library.
+semcast bets the same ideas belong *inside a SQL planner*, where they compose
+with ordinary relations, indexes, and every other optimizer rule for free.
 
 ## The idea
 
-You write one operator — `text MEANS 'a natural-language condition'` — and the
-planner does what planners have always done with expensive predicates: build the
-cheapest plan that still answers the question. You declare *intent* and an
-*accuracy target*; the funnel is derived, never hand-written.
+One operator — `text MEANS 'a natural-language condition'` — and the planner
+builds the cheapest plan that still answers the question. You declare intent
+and an accuracy target; the funnel is derived, never hand-written.
 
-- **Derived cheap-then-verify** — the planner pre-filters on free signals
-  (structured columns, a semantic index) and spends the LLM only on the
-  survivors, under a declared recall target — because a lossy pre-filter is an
-  approximation, and semcast treats it as one.
+- **Cheap-then-verify** — pre-filter on free signals (structured columns, a
+  semantic index), spend the LLM only on survivors, under a declared recall
+  target.
 - **Field-level caching** — pay once per `(type, field, value, model, prompt
   version)`, shared across every query that ever asks again.
 - **Agg split** — quantitative rollups run in SQL; the model touches only free text.
-- **Field pushdown** — generate only the fields the query actually uses. The
-  honest win here isn't tokens (for documents, input dwarfs output) — it's
-  finer-grained cache keys and per-field model routing: a `BOOL` field can go to
-  a small model while `TEXT` goes to a strong one.
+- **Field pushdown** — generate only the fields the query uses: finer cache
+  keys, per-field routing (`BOOL` to a small model, `TEXT` to a strong one).
 
-The net effect: a semantic query over ~20k documents costs tens of model calls —
-each reading a few hundred tokens — not tens of thousands reading everything.
+Net effect: a semantic query over ~20k documents costs tens of model calls —
+not tens of thousands reading everything.
 
 ---
 
-## Walk-through: "which meetings in the last 6 months discussed launching *offline sync* in *Atlas*?"
+## Walk-through (design target)
 
-The setting: your company transcribes every meeting — 18,400 transcripts and
-counting. The question is ad-hoc; next week it's a different feature. Nothing
-below is a pipeline built for this one question.
+This section is the design the roadmap builds toward; what runs today is under
+[Getting started](#getting-started).
 
-### 0. Your table is just your table
-
-```sql
--- meetings(meeting_id, title, held_at, attendees, transcript)
-```
-
-No bespoke ingest, no embedding columns to compute and babysit. semcast works
-on tables you already have.
-
-### 1. One line of setup: a semantic index
+*"Which meetings in the last 6 months discussed launching offline sync in
+Atlas?"* — 18,400 transcripts, ad-hoc question, no pipeline.
 
 ```sql
+-- meetings(meeting_id, title, held_at, attendees, transcript) — your existing table
 CREATE SEMANTIC INDEX ON meetings(transcript);
-```
 
-The database idiom that already means "maintain a cheap search structure so
-queries don't scan everything." semcast chunks each transcript (~512-token
-slices), embeds every chunk, and keeps the index fresh as meetings arrive —
-exactly as incremental as any other index. It's also optional: queries work
-without it, the planner just warns you the plan has no cheap stage.
-
-### 2. The query is the whole program
-
-```sql
 SELECT meeting_id, title, held_at
 FROM meetings
 WHERE held_at >= now() - INTERVAL '6 months'
@@ -75,9 +52,11 @@ WHERE held_at >= now() - INTERVAL '6 months'
 WITH RECALL 0.9;
 ```
 
-`MEANS` is defined as ground truth: *a model reading the full transcript would
-say yes*. Everything the planner substitutes for that is an approximation,
-managed under your recall target. `EXPLAIN` shows the funnel it derived:
+The index chunks each transcript (~512-token slices), embeds every chunk, and
+stays fresh incrementally. It's optional — without it the planner warns the
+plan has no cheap stage. `MEANS` is ground truth: *a model reading the full
+transcript would say yes*; everything cheaper is an approximation managed
+under your recall target. `EXPLAIN` shows the derived funnel:
 
 ```text
 SemFilter: MEANS('discussed the launch of offline sync in Atlas')   recall ≥ 0.90
@@ -86,76 +65,50 @@ SemFilter: MEANS('discussed the launch of offline sync in Atlas')   recall ≥ 0
 └─ verify (small model)      47 calls         ~$0.04   reads top-3 chunks per meeting
 ```
 
-**47 model calls, not 18,400 — and none of them reads a whole transcript.**
+**47 model calls, not 18,400 — none reading a whole transcript.** Because:
 
-Three things earned that number:
+- To the optimizer, `MEANS` is simply a very expensive predicate; the free
+  date filter runs first. Predicate ordering is just predicate ordering.
+- The chunk vectors that pre-filter 3,100 → 47 also pick which three chunks
+  the verify model reads.
+- The index scan has false negatives, so `WITH RECALL` calibrates: sample
+  date-surviving rows, get ground-truth labels, set the threshold so ≥90% of
+  true matches survive (the cascade technique pioneered by LOTUS). Omit the
+  clause and thresholds are best-effort — `EXPLAIN` says so.
 
-- **Predicate ordering is just predicate ordering.** The date filter is free and
-  runs first; to the optimizer, `MEANS` is simply a very expensive predicate in
-  a framework that has always reordered predicates by cost.
-- **The index pulls double duty.** The same chunk vectors that pre-filter
-  3,100 → 47 also tell the verify step *which three chunks* to show the model.
-- **`WITH RECALL` keeps the shortcut honest.** The index scan has false
-  negatives — a meeting that discussed the launch in oblique language can score
-  below threshold and vanish — so unlike classic pushdown, this rewrite changes
-  the answer. Given a target, the planner samples a few hundred date-surviving
-  rows, gets ground-truth labels, and sets the threshold so ≥90% of true
-  matches survive (the cascade technique pioneered by LOTUS). Calibration cost
-  appears in `EXPLAIN` and is cached for repeat questions of the same shape.
-  Omit the clause and thresholds are best-effort — fine for exploration, and
-  `EXPLAIN` says so.
-
-### 3. Follow-up extraction, inline
+Follow-ups reuse cached verdicts — the filter below costs zero new calls; the
+model runs only to extract from the ~12 survivors:
 
 ```sql
 SELECT held_at,
        EXTRACT(decisions TEXT[] 'concrete decisions made' FROM transcript) AS decisions
 FROM meetings
-WHERE held_at >= now() - INTERVAL '6 months'
-  AND transcript MEANS 'discussed the launch of offline sync in Atlas';
+WHERE transcript MEANS 'discussed the launch of offline sync in Atlas';
 ```
 
-`EXTRACT(x FROM y)` is already SQL; here it takes a typed field spec. The
-`MEANS` verdicts are cached from the previous query, so the filter costs zero
-new model calls — the model runs only to extract `decisions` from the ~12
-surviving meetings. Extraction happens *after* the funnel, never before it.
-
-### 4. Reuse when a question recurs
+Recurring questions become macros; next month's variant reuses every embedding
+for free:
 
 ```sql
 CREATE SEMANTIC PREDICATE discussed_launch(t, feature, product) AS
   t MEANS 'discussed the launch of {feature} in {product}';
-
-SELECT meeting_id FROM meetings
-WHERE discussed_launch(transcript, 'offline sync', 'Beacon');
 ```
 
-A macro, nothing more. Next month's Beacon question reuses the date filter and
-every embedding for free; only fresh verify calls are paid.
+### Know the bill
 
----
-
-## Know the bill before you run
-
-The funnel above is real output: `EXPLAIN` prices every plan — stage by stage,
-in model calls and dollars — before a single token is spent. Estimates come
-from cached history when it exists, otherwise from sampling a small slice of
-the corpus. And because estimates are estimates, queries take a hard cap:
+`EXPLAIN` prices every stage — calls and dollars — before a token is spent,
+from cached history or a sampled slice. Estimates are estimates, so queries
+take a hard cap:
 
 ```sql
-SELECT ... BUDGET 1.00 USD;   -- stop at the cap; return partial rows + a warning
+SELECT ... BUDGET 1.00 USD;   -- stop at the cap; partial rows + a warning
 ```
 
----
+### Typed extraction
 
-## Typed extraction
-
-Inline `EXTRACT` covers one-off fields. When the same extraction recurs, name
-it — a **semantic type** is the whole specification: field names, types, and a
-one-line doc per field. semcast synthesizes the prompt from this; you never
-write one. The type also drives constrained decoding (the model *must* return
-conforming output) and decides how much of a downstream aggregate becomes
-plain SQL.
+A **semantic type** names a recurring extraction: field names, types, one doc
+line each. semcast synthesizes the prompt, constrains decoding, and turns as
+much of a downstream aggregate as possible into plain SQL.
 
 ```sql
 CREATE SEMANTIC TYPE MeetingFacts AS (
@@ -171,100 +124,81 @@ CREATE SEMANTIC TYPE MeetingFacts AS (
 SELECT CAST(transcript AS MeetingFacts).launch_stage FROM meetings WHERE ...;
 ```
 
-| Field type | Meaning | Why it matters |
-|------------|---------|----------------|
-| `TEXT` | free-form string | the only truly "prose" field; stays with the model |
-| `INT`, `REAL` | numbers | aggregate in SQL (`avg`, `sum`) — no LLM at rollup |
-| `REAL CHECK (a..b)` | bounded number | validated at decode time |
-| `BOOL` | yes/no | becomes a plain predicate |
-| `ONEOF(a, b, c)` | closed category | classification; `GROUP BY`-able |
-| `LEVEL(a, b, c)` | ordered category (declared low→high) | ordinal — comparable and rankable |
-| `T[]` | list of any above | multi-valued extraction (e.g. `decisions`) |
-| `<AnotherType>` | nested semantic type | compose structured extractions |
+| Field type | Meaning |
+|------------|---------|
+| `TEXT` | prose; stays with the model |
+| `INT`, `REAL` | aggregate in SQL — no LLM at rollup |
+| `REAL CHECK (a..b)` | validated at decode time |
+| `BOOL` | becomes a plain predicate |
+| `ONEOF(a, b, c)` | closed category; `GROUP BY`-able |
+| `LEVEL(a, b, c)` | ordered low→high; comparable, rankable |
+| `T[]` | list of any above |
+| `<AnotherType>` | nested semantic type |
 
-Fields are **independent by default** — that's what enables field pushdown.
-`TOGETHER(...)` marks a group that must be generated in one shot; the planner
-never prunes one member without the others.
+Fields are independent by default — that's what enables pushdown. `TOGETHER`
+groups are generated in one shot, never pruned apart.
 
-## Kinds of semantic operator
+### Operators
 
 | Kind | Signature | Example |
 |------|-----------|---------|
 | **Predicate** | `text → bool` | `transcript MEANS 'discussed a launch'` |
-| **Map** (extract) | `text → typed fields` | `EXTRACT(... FROM transcript)`, `CAST(transcript AS MeetingFacts)` |
-| **Aggregate** | `set<text> → summary` | `sem_summary(transcript, 'recurring blockers')` (hierarchical fold) |
-| **Join** | `text × text → bool` | `JOIN ... ON (c.notes, v.description) MEANS 'the same company'` |
+| **Map** | `text → typed fields` | `EXTRACT(...)`, `CAST(... AS MeetingFacts)` |
+| **Aggregate** | `set<text> → summary` | `sem_summary(transcript, 'recurring blockers')` |
+| **Join** | `text × text → bool` | `ON (c.notes, v.description) MEANS 'the same company'` |
 
-All of them plan the same way: derived cheap stage, calibrated threshold,
-model verify, field-level cache.
-
-Semantic join is where planner integration pays off hardest: evaluated naively
-it costs O(n×m) model calls, so the planner always *blocks* first — semantic
-indexes on both sides, join on vector proximity, LLM adjudication only on the
-surviving candidate pairs.
-
-For power users, `CHEAP` / `VERIFY` clauses exist as **overrides** on a named
-predicate — pin a shortcut the planner can't guess, like a metadata column that
-happens to encode the answer:
+All plan the same way: cheap stage, calibrated threshold, verify, cache. Joins
+block on vector proximity first — never O(n×m) model calls. For shortcuts the
+planner can't guess, `CHEAP USING <expr>` pins one on a named predicate:
 
 ```sql
 CREATE SEMANTIC PREDICATE discussed_launch(t, feature, product) AS
   t MEANS 'discussed the launch of {feature} in {product}'
-  CHEAP USING attendees @> ARRAY['launch-committee'];   -- optional hint, not homework
+  CHEAP USING attendees @> ARRAY['launch-committee'];
 ```
 
 ---
 
 ## Execution semantics
 
-LLMs break two assumptions databases have always made: functions are
-deterministic, and evaluation doesn't fail halfway through. semcast picks
-explicit answers instead of inheriting silent ones:
+LLMs break two database assumptions — determinism, and evaluation that doesn't
+fail halfway. semcast answers explicitly:
 
-- **Cache keys are full provenance** — `(type version, field, input value,
-  model id, prompt-synthesis version)`. Editing one field's doc line invalidates
-  exactly that field's entries and nothing else.
-- **First evaluation wins** — results are cached, so re-running a query is
-  deterministic even though the model isn't.
-- **Rows fail, queries don't** — a row that still errors after retries yields
-  `NULL` plus an error column. The cache doubles as a checkpoint: a 10k-row job
-  killed at row 6,000 resumes for the cost of the rows it hadn't reached.
-
----
+- **Full-provenance cache keys** — `(type version, field, input value, model,
+  prompt version)`. Editing one field's doc line invalidates exactly that field.
+- **First evaluation wins** — re-running a query is deterministic even though
+  the model isn't.
+- **Rows fail, queries don't** — a row that errors after retries yields `NULL`
+  plus an error column. The cache doubles as a checkpoint for resumed jobs.
 
 ## Architecture
 
-| Piece | DataFusion hook |
-|-------|-----------------|
-| `MEANS` / `EXTRACT` logical operators | `UserDefinedLogicalNodeCore` → `LogicalPlan::Extension` |
-| `CREATE SEMANTIC INDEX / TYPE / PREDICATE` syntax | `RelationPlanner` |
-| Semantic index (chunk, embed, incremental maintenance) | [Lance](https://lancedb.github.io/lance/) (Arrow-native) |
-| Funnel derivation, threshold calibration, field pushdown, agg split | `OptimizerRule` / `PhysicalOptimizerRule` |
-| Physical ops (stream / batch / cascade / cached) | custom `ExecutionPlan` via `ExtensionPlanner` |
-| Async batched model calls | `tokio` |
+| Piece | DataFusion hook | Status |
+|-------|-----------------|--------|
+| `MEANS` logical operator | `UserDefinedLogicalNodeCore` → `LogicalPlan::Extension` | ✅ `SemFilter` |
+| `means()` → `SemFilter` rewrite | `OptimizerRule` | ✅ |
+| Verify stage + call estimate | `ExecutionPlan` via `ExtensionPlanner` | ✅ `VerifyExec` |
+| Async batched model calls | `tokio` + `reqwest` | ✅ Ollama, Anthropic |
+| Verdict cache | provenance-keyed, in-memory | ✅ |
+| `CREATE SEMANTIC INDEX / TYPE / PREDICATE` syntax | parser extension | planned |
+| Semantic index | [Lance](https://lancedb.github.io/lance/) (Arrow-native) | planned |
+| Funnel derivation, calibration, field pushdown, agg split | `OptimizerRule` / `PhysicalOptimizerRule` | planned |
 
 ## Where this bites
 
-The pattern that pays: a large corpus, per-document review that's expensive
-(human or LLM), and *ad-hoc* questions rather than one fixed pipeline — because
-the index and cache compound across queries.
+Large corpus, expensive per-document review, ad-hoc questions — index and
+cache compound across queries.
 
-- **eDiscovery / legal review** — "find documents responsive to this request"
-  over millions of emails. A recall target there isn't a nicety; it's
-  defensibility.
-- **Contract analytics** — extract renewal dates and liability caps into typed
-  fields once, then `SUM` exposure and `GROUP BY` governing law in plain SQL.
-- **Literature screening** — cast papers to typed fields (`is_survey BOOL`,
-  `audience LEVEL`) and filter; systematic reviews start exactly this way.
-- **Support-ticket mining** — classify once into `ONEOF` categories, trend by
-  week forever; new questions re-slice the cache instead of re-labeling.
-- **Entity resolution** — the semantic-join case: match a CRM against a
-  purchased dataset without n×m model calls.
+- **eDiscovery / legal review** — a recall target is defensibility, not a nicety.
+- **Contract analytics** — extract typed fields once, `SUM` exposure in SQL.
+- **Literature screening** — `is_survey BOOL`, `audience LEVEL`, filter.
+- **Support-ticket mining** — classify once, trend forever; new questions
+  re-slice the cache.
+- **Entity resolution** — semantic join without n×m model calls.
 
 ## Getting started
 
-semcast is a Rust library that plugs into DataFusion. It isn't on crates.io
-yet — depend on it straight from git:
+Not on crates.io yet — depend on it from git:
 
 ```toml
 [dependencies]
@@ -273,16 +207,9 @@ datafusion = "54"
 tokio      = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
-You'll also need a model. Two providers ship today:
-
-- **Ollama** (local, free) — `ollama pull llama3.2`, server on `localhost:11434`.
-  Also the embedding source once the semantic index lands.
-- **Anthropic** — `export ANTHROPIC_API_KEY=...`; defaults to Haiku, the right
-  tier for one-word verify calls. No embeddings.
-
-Then build a context and query. One honest caveat while the parser extension
-is pending: the surface syntax is a `means(text, 'condition')` function rather
-than the infix `MEANS` operator, and `WITH RECALL` isn't parsed yet.
+Pick a provider: **Ollama** (local, free — `ollama pull llama3.2`; also the
+future embedding source) or **Anthropic** (`export ANTHROPIC_API_KEY=...`;
+defaults to Haiku, the right tier for one-word verify calls).
 
 ```rust
 use std::sync::Arc;
@@ -307,25 +234,25 @@ async fn main() -> datafusion::error::Result<()> {
 }
 ```
 
-What you get today: the planner rewrites `means(..)` into a `SemFilter` node
-above your free predicates (so they run first), verifies survivors through the
-model with batched async calls, caches every verdict by full provenance so
-re-running — or narrowing — the query costs zero new calls, and `EXPLAIN`
-prices the verify stage before you run:
+Until the parser extension lands, the surface is a `means(text, 'condition')`
+function — top-level `AND` conjuncts of `WHERE` only; anything else (`OR`,
+`NOT`, the `SELECT` list) fails at plan time rather than silently costing a
+call per row. `WITH RECALL` isn't parsed yet.
+
+What runs today: `means(..)` rewrites to a `SemFilter` above your free
+predicates (so they run first), survivors are verified with batched async
+calls, verdicts are cached by provenance — reruns and narrower follow-ups cost
+zero new calls — and `EXPLAIN` prices the verify stage:
 
 ```text
 VerifyExec: MEANS('discussed the launch of offline sync in Atlas') model=ollama/llama3.2   ~3 model calls
 ```
 
-`means()` is only supported as a top-level `AND` conjunct of `WHERE` for now;
-anything else (`OR`, `NOT`, the `SELECT` list) fails at plan time rather than
-silently costing a model call per row.
-
-To poke at it without wiring anything up:
+Try it with no setup:
 
 ```sh
 git clone https://github.com/robintiman/semcast && cd semcast
-cargo run --example meetings                       # deterministic mock model, no setup
+cargo run --example meetings                       # deterministic mock model
 cargo test                                         # full suite, no network
 cargo test --test live_ollama -- --ignored         # end-to-end against local Ollama
 ```
@@ -334,14 +261,13 @@ cargo test --test live_ollama -- --ignored         # end-to-end against local Ol
 
 Early / experimental. Order of attack:
 
-1. ~~`MEANS` logical operator + verify-only physical plan — correct first, cheap
-   later~~ **done** (as the `means()` function; infix syntax pending)
+1. ~~`MEANS` logical operator + verify-only physical plan~~ **done**
+   (as the `means()` function; infix syntax pending)
 2. `CREATE SEMANTIC INDEX` on Lance + the index pre-filter stage — **next**
 3. `WITH RECALL` — sampled threshold calibration
-4. Field-level cache with provenance keys — **in-memory version done**, shared
-   across queries within a session; the persistent, cross-session cache comes
-   with the index work
-5. Eval harness: a labeled corpus, reporting **calls saved and recall** against
+4. Field-level cache with provenance keys — **in-memory done**; the
+   persistent, cross-session cache comes with the index work
+5. Eval harness: labeled corpus, reporting **calls saved and recall** against
    the LLM-on-every-row baseline — so the headline claim stays falsifiable
 
 ## License
