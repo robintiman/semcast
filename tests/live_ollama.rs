@@ -29,17 +29,17 @@ async fn means_filter_against_live_ollama() {
     .await
     .unwrap();
 
-    let batches = ctx
-        .sql(
-            "SELECT meeting_id FROM meetings
-             WHERE means(transcript, 'discussed shipping an offline sync feature')
-             ORDER BY meeting_id",
-        )
-        .await
-        .unwrap()
-        .collect()
-        .await
-        .unwrap();
+    let batches = semcast::sql(
+        &ctx,
+        "SELECT meeting_id FROM meetings
+         WHERE transcript MEANS 'discussed shipping an offline sync feature'
+         ORDER BY meeting_id",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
 
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     println!("live ollama verify kept {rows} of 2 rows");

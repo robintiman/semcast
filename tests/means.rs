@@ -1,5 +1,5 @@
-//! End-to-end tests for roadmap step 1: the `means()` rewrite rule and the
-//! verify-only physical plan, against the deterministic mock model.
+//! End-to-end tests for roadmap step 1: infix `MEANS`, the rewrite rule, and
+//! the verify-only physical plan, against the deterministic mock model.
 
 use std::sync::Arc;
 
@@ -33,7 +33,12 @@ async fn meetings_context_with_model(model: Arc<MockModel>) -> SessionContext {
 }
 
 async fn matching_ids(ctx: &SessionContext, sql: &str) -> Vec<i64> {
-    let batches: Vec<RecordBatch> = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+    let batches: Vec<RecordBatch> = semcast::sql(ctx, sql)
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
     batches
         .iter()
         .flat_map(|b| {
@@ -50,12 +55,15 @@ async fn matching_ids(ctx: &SessionContext, sql: &str) -> Vec<i64> {
 #[tokio::test]
 async fn optimized_plan_contains_sem_filter_above_free_predicates() {
     let ctx = meetings_context().await;
-    let plan = ctx
-        .sql("SELECT meeting_id FROM meetings WHERE meeting_id < 3 AND means(transcript, 'discussed offline sync')")
-        .await
-        .unwrap()
-        .into_optimized_plan()
-        .unwrap();
+    let plan = semcast::sql(
+        &ctx,
+        "SELECT meeting_id FROM meetings
+         WHERE meeting_id < 3 AND transcript MEANS 'discussed offline sync'",
+    )
+    .await
+    .unwrap()
+    .into_optimized_plan()
+    .unwrap();
 
     let display = format!("{}", plan.display_indent());
     assert!(
@@ -79,7 +87,7 @@ async fn means_filter_executes_end_to_end() {
     let ids = matching_ids(
         &ctx,
         "SELECT meeting_id FROM meetings
-         WHERE means(transcript, 'discussed offline sync')
+         WHERE transcript MEANS 'discussed offline sync'
          ORDER BY meeting_id",
     )
     .await;
@@ -93,10 +101,10 @@ async fn free_predicates_still_apply() {
     let ids = matching_ids(
         &ctx,
         "SELECT meeting_id FROM meetings
-         WHERE meeting_id > 1 AND means(transcript, 'discussed offline sync')",
+         WHERE meeting_id > 1 AND transcript MEANS 'discussed offline sync'",
     )
     .await;
-    assert!(ids.is_empty(), "meeting 1 matches means() but not the free predicate");
+    assert!(ids.is_empty(), "meeting 1 matches MEANS but not the free predicate");
 }
 
 #[tokio::test]
@@ -104,21 +112,39 @@ async fn bare_means_with_no_free_predicates_works() {
     let ctx = meetings_context().await;
     let ids = matching_ids(
         &ctx,
-        "SELECT meeting_id FROM meetings WHERE means(transcript, 'discussed offline sync')",
+        "SELECT meeting_id FROM meetings WHERE transcript MEANS 'discussed offline sync'",
     )
     .await;
     assert_eq!(ids, vec![1]);
 }
 
+/// The `means()` marker UDF stays a supported entry point through plain
+/// `ctx.sql()`, for callers who can't route through [`semcast::sql`].
+#[tokio::test]
+async fn direct_means_udf_call_works_through_ctx_sql() {
+    let ctx = meetings_context().await;
+    let batches = ctx
+        .sql("SELECT meeting_id FROM meetings WHERE means(transcript, 'discussed offline sync')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(rows, 1);
+}
+
 #[tokio::test]
 async fn means_under_or_is_a_plan_time_error() {
     let ctx = meetings_context().await;
-    let err = ctx
-        .sql("SELECT meeting_id FROM meetings WHERE meeting_id = 3 OR means(transcript, 'x')")
-        .await
-        .unwrap()
-        .into_optimized_plan()
-        .unwrap_err();
+    let err = semcast::sql(
+        &ctx,
+        "SELECT meeting_id FROM meetings WHERE meeting_id = 3 OR transcript MEANS 'x'",
+    )
+    .await
+    .unwrap()
+    .into_optimized_plan()
+    .unwrap_err();
     assert!(
         err.to_string().contains("top-level AND conjunct"),
         "unexpected error: {err}"
@@ -128,20 +154,21 @@ async fn means_under_or_is_a_plan_time_error() {
 #[tokio::test]
 async fn means_under_not_is_a_plan_time_error() {
     let ctx = meetings_context().await;
-    let err = ctx
-        .sql("SELECT meeting_id FROM meetings WHERE NOT means(transcript, 'x')")
-        .await
-        .unwrap()
-        .into_optimized_plan()
-        .unwrap_err();
+    let err = semcast::sql(
+        &ctx,
+        "SELECT meeting_id FROM meetings WHERE NOT transcript MEANS 'x'",
+    )
+    .await
+    .unwrap()
+    .into_optimized_plan()
+    .unwrap_err();
     assert!(err.to_string().contains("top-level AND conjunct"), "{err}");
 }
 
 #[tokio::test]
 async fn means_in_select_list_is_a_plan_time_error() {
     let ctx = meetings_context().await;
-    let err = ctx
-        .sql("SELECT means(transcript, 'x') FROM meetings")
+    let err = semcast::sql(&ctx, "SELECT transcript MEANS 'x' FROM meetings")
         .await
         .unwrap()
         .into_optimized_plan()
@@ -152,12 +179,14 @@ async fn means_in_select_list_is_a_plan_time_error() {
 #[tokio::test]
 async fn non_literal_condition_is_a_plan_time_error() {
     let ctx = meetings_context().await;
-    let err = ctx
-        .sql("SELECT meeting_id FROM meetings WHERE means(transcript, title)")
-        .await
-        .unwrap()
-        .into_optimized_plan()
-        .unwrap_err();
+    let err = semcast::sql(
+        &ctx,
+        "SELECT meeting_id FROM meetings WHERE transcript MEANS title",
+    )
+    .await
+    .unwrap()
+    .into_optimized_plan()
+    .unwrap_err();
     assert!(err.to_string().contains("string literal"), "{err}");
 }
 
@@ -165,7 +194,8 @@ async fn non_literal_condition_is_a_plan_time_error() {
 async fn repeat_query_is_served_from_cache() {
     let model = Arc::new(MockModel::answering_yes_to(["offline sync"]));
     let ctx = meetings_context_with_model(Arc::clone(&model)).await;
-    let query = "SELECT meeting_id FROM meetings WHERE means(transcript, 'discussed offline sync')";
+    let query =
+        "SELECT meeting_id FROM meetings WHERE transcript MEANS 'discussed offline sync'";
 
     let first = matching_ids(&ctx, query).await;
     assert_eq!(model.completion_calls(), 2, "two non-NULL transcripts");
@@ -179,7 +209,7 @@ async fn repeat_query_is_served_from_cache() {
     );
 }
 
-/// The README §3 story: a follow-up query sharing the means() predicate pays
+/// The README §3 story: a follow-up query sharing the MEANS predicate pays
 /// nothing for rows the cache has already seen — even though the query shape
 /// (projection, free predicates) changed.
 #[tokio::test]
@@ -189,7 +219,7 @@ async fn narrower_followup_query_reuses_verdicts() {
 
     matching_ids(
         &ctx,
-        "SELECT meeting_id FROM meetings WHERE means(transcript, 'discussed offline sync')",
+        "SELECT meeting_id FROM meetings WHERE transcript MEANS 'discussed offline sync'",
     )
     .await;
     let calls_after_first = model.completion_calls();
@@ -197,7 +227,7 @@ async fn narrower_followup_query_reuses_verdicts() {
     let ids = matching_ids(
         &ctx,
         "SELECT meeting_id FROM meetings
-         WHERE meeting_id < 3 AND means(transcript, 'discussed offline sync')",
+         WHERE meeting_id < 3 AND transcript MEANS 'discussed offline sync'",
     )
     .await;
     assert_eq!(ids, vec![1]);
@@ -217,14 +247,14 @@ async fn different_condition_is_not_a_cache_hit() {
 
     matching_ids(
         &ctx,
-        "SELECT meeting_id FROM meetings WHERE means(transcript, 'discussed offline sync')",
+        "SELECT meeting_id FROM meetings WHERE transcript MEANS 'discussed offline sync'",
     )
     .await;
     let calls_after_first = model.completion_calls();
 
     matching_ids(
         &ctx,
-        "SELECT meeting_id FROM meetings WHERE means(transcript, 'discussed hiring')",
+        "SELECT meeting_id FROM meetings WHERE transcript MEANS 'discussed hiring'",
     )
     .await;
     assert!(
@@ -239,8 +269,8 @@ async fn two_means_conjuncts_both_apply() {
     let ids = matching_ids(
         &ctx,
         "SELECT meeting_id FROM meetings
-         WHERE means(transcript, 'discussed offline sync')
-           AND means(transcript, 'anything at all')",
+         WHERE transcript MEANS 'discussed offline sync'
+           AND transcript MEANS 'anything at all'",
     )
     .await;
     // The mock answers yes to both conditions for row 1 (same transcript

@@ -31,8 +31,8 @@ async fn means_udf_is_registered_and_plans() {
     let ctx = test_context();
     assert!(ctx.state().scalar_functions().contains_key("means"));
 
-    // A query using means() must plan cleanly. (Executing it is roadmap
-    // step 1 — the optimizer rewrite and VerifyExec::execute.)
+    // A query using the marker UDF directly must plan cleanly; the infix
+    // `MEANS` syntax desugars to this same call.
     ctx.sql("SELECT means('some transcript text', 'discussed a launch') AS hit")
         .await
         .unwrap();

@@ -176,6 +176,7 @@ fail halfway. semcast answers explicitly:
 | Piece | DataFusion hook | Status |
 |-------|-----------------|--------|
 | `MEANS` logical operator | `UserDefinedLogicalNodeCore` → `LogicalPlan::Extension` | ✅ `SemFilter` |
+| Infix `text MEANS '...'` syntax | custom sqlparser `Dialect` | ✅ via `semcast::sql` |
 | `means()` → `SemFilter` rewrite | `OptimizerRule` | ✅ |
 | Verify stage + call estimate | `ExecutionPlan` via `ExtensionPlanner` | ✅ `VerifyExec` |
 | Async batched model calls | `tokio` + `reqwest` | ✅ Ollama, Anthropic |
@@ -221,10 +222,11 @@ async fn main() -> datafusion::error::Result<()> {
     let ctx = semcast_context(Arc::new(OllamaProvider::new("gemma4:31b")));
     ctx.register_csv("meetings", "meetings.csv", Default::default()).await?;
 
-    ctx.sql(
+    semcast::sql(
+        &ctx,
         "SELECT meeting_id, title FROM meetings
          WHERE held_at >= CAST('2026-01-01' AS TIMESTAMP)
-           AND means(transcript, 'discussed the launch of offline sync in Atlas')",
+           AND transcript MEANS 'discussed the launch of offline sync in Atlas'",
     )
     .await?
     .show()
@@ -234,12 +236,13 @@ async fn main() -> datafusion::error::Result<()> {
 }
 ```
 
-Until the parser extension lands, the surface is a `means(text, 'condition')`
-function — top-level `AND` conjuncts of `WHERE` only; anything else (`OR`,
-`NOT`, the `SELECT` list) fails at plan time rather than silently costing a
-call per row. `WITH RECALL` isn't parsed yet.
+Infix `MEANS` needs `semcast::sql` (DataFusion's `ctx.sql` can't take a custom
+dialect); through `ctx.sql`, write it as `means(text, 'condition')`. Either
+way it's allowed in top-level `AND` conjuncts of `WHERE` only; anything else
+(`OR`, `NOT`, the `SELECT` list) fails at plan time rather than silently
+costing a call per row. `WITH RECALL` isn't parsed yet.
 
-What runs today: `means(..)` rewrites to a `SemFilter` above your free
+What runs today: `MEANS` rewrites to a `SemFilter` above your free
 predicates (so they run first), survivors are verified with batched async
 calls, verdicts are cached by provenance — reruns and narrower follow-ups cost
 zero new calls — and `EXPLAIN` prices the verify stage:
@@ -262,7 +265,6 @@ cargo test --test live_ollama -- --ignored         # end-to-end against local Ol
 Early / experimental. Order of attack:
 
 1. ~~`MEANS` logical operator + verify-only physical plan~~ **done**
-   (as the `means()` function; infix syntax pending)
 2. `CREATE SEMANTIC INDEX` on Lance + the index pre-filter stage — **next**
 3. `WITH RECALL` — sampled threshold calibration
 4. Field-level cache with provenance keys — **in-memory done**; the
