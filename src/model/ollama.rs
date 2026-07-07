@@ -35,7 +35,8 @@ impl OllamaProvider {
 
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
-        self.base_url.truncate(self.base_url.trim_end_matches('/').len());
+        self.base_url
+            .truncate(self.base_url.trim_end_matches('/').len());
         self
     }
 
@@ -58,6 +59,11 @@ impl OllamaProvider {
                 },
             ],
             stream: false,
+            // Verify wants a one-word verdict, not a reasoning trace. On a
+            // reasoning model the thinking phase would burn the whole
+            // `num_predict` budget and leave `content` empty; disabling it
+            // yields the bare "yes"/"no" and is ignored by plain models.
+            think: false,
             options: ChatOptions {
                 num_predict: request.max_tokens,
             },
@@ -126,6 +132,7 @@ struct ChatRequest<'a> {
     model: &'a str,
     messages: Vec<ChatMessage<'a>>,
     stream: bool,
+    think: bool,
     options: ChatOptions,
 }
 
@@ -172,7 +179,7 @@ mod tests {
     #[test]
     fn parses_chat_response() {
         let json = r#"{
-            "model": "llama3.2",
+            "model": "gemma4:31b",
             "created_at": "2026-07-06T10:00:00Z",
             "message": {"role": "assistant", "content": "yes"},
             "done": true,

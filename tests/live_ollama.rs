@@ -1,7 +1,7 @@
 //! Live end-to-end test against a local Ollama server. Ignored by default:
 //!
 //! ```sh
-//! ollama pull llama3.2   # or export SEMCAST_OLLAMA_MODEL=<model>
+//! ollama pull gemma4:31b   # or export SEMCAST_OLLAMA_MODEL=<model>
 //! cargo test --test live_ollama -- --ignored --nocapture
 //! ```
 
@@ -13,8 +13,7 @@ use semcast::semcast_context;
 #[tokio::test]
 #[ignore = "requires a running Ollama server with a pulled model"]
 async fn means_filter_against_live_ollama() {
-    let model =
-        std::env::var("SEMCAST_OLLAMA_MODEL").unwrap_or_else(|_| "llama3.2".to_owned());
+    let model = std::env::var("SEMCAST_OLLAMA_MODEL").unwrap_or_else(|_| "gemma4:31b".to_owned());
     let ctx = semcast_context(Arc::new(OllamaProvider::new(model)));
 
     ctx.sql(
@@ -46,5 +45,8 @@ async fn means_filter_against_live_ollama() {
     println!("live ollama verify kept {rows} of 2 rows");
     // Meeting 1 unambiguously matches; any reasonable model keeps it and
     // drops the cafeteria meeting.
-    assert_eq!(rows, 1, "expected exactly the offline-sync meeting to survive");
+    assert_eq!(
+        rows, 1,
+        "expected exactly the offline-sync meeting to survive"
+    );
 }

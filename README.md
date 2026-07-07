@@ -207,7 +207,7 @@ datafusion = "54"
 tokio      = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
-Pick a provider: **Ollama** (local, free — `ollama pull llama3.2`; also the
+Pick a provider: **Ollama** (local, free — `ollama pull gemma4:31b`; also the
 future embedding source) or **Anthropic** (`export ANTHROPIC_API_KEY=...`;
 defaults to Haiku, the right tier for one-word verify calls).
 
@@ -218,7 +218,7 @@ use semcast::{model::OllamaProvider, semcast_context};
 
 #[tokio::main]
 async fn main() -> datafusion::error::Result<()> {
-    let ctx = semcast_context(Arc::new(OllamaProvider::new("llama3.2")));
+    let ctx = semcast_context(Arc::new(OllamaProvider::new("gemma4:31b")));
     ctx.register_csv("meetings", "meetings.csv", Default::default()).await?;
 
     ctx.sql(
@@ -245,7 +245,7 @@ calls, verdicts are cached by provenance — reruns and narrower follow-ups cost
 zero new calls — and `EXPLAIN` prices the verify stage:
 
 ```text
-VerifyExec: MEANS('discussed the launch of offline sync in Atlas') model=ollama/llama3.2   ~3 model calls
+VerifyExec: MEANS('discussed the launch of offline sync in Atlas') model=ollama/gemma4:31b   ~3 model calls
 ```
 
 Try it with no setup:
