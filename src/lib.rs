@@ -34,8 +34,12 @@ pub use error::{Result, SemcastError};
 
 use std::sync::Arc;
 
+use datafusion::dataframe::DataFrame;
+use datafusion::error::DataFusionError;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::session_state::SessionStateBuilder;
+use datafusion::sql::parser::Statement as DFStatement;
+use datafusion::sql::sqlparser::parser::Parser;
 
 use crate::cache::{InMemoryCache, SemanticCache};
 use crate::model::ModelProvider;
@@ -60,6 +64,27 @@ use crate::physical::planner::SemcastQueryPlanner;
 /// ```
 pub fn semcast_context(model: Arc<dyn ModelProvider>) -> SessionContext {
     semcast_context_with_cache(model, Arc::new(InMemoryCache::default()))
+}
+
+/// Run a query written in semcast SQL — standard SQL plus the infix `MEANS`
+/// operator — against a context from [`semcast_context`].
+///
+/// This is `ctx.sql()` with [`sql::SemcastDialect`] in front. `ctx.sql()`
+/// only accepts sqlparser's built-in dialects, so the custom syntax needs its
+/// own entry point; queries that call `means()` directly work through either.
+pub async fn sql(ctx: &SessionContext, query: &str) -> Result<DataFrame> {
+    let mut statements =
+        Parser::parse_sql(&sql::SemcastDialect::default(), query).map_err(DataFusionError::from)?;
+    if statements.len() != 1 {
+        return Err(DataFusionError::Plan(format!(
+            "expected exactly one statement, got {}",
+            statements.len()
+        ))
+        .into());
+    }
+    let statement = DFStatement::Statement(Box::new(statements.pop().expect("checked len")));
+    let plan = ctx.state().statement_to_plan(statement).await?;
+    Ok(ctx.execute_logical_plan(plan).await?)
 }
 
 /// [`semcast_context`] with a caller-provided verdict cache.

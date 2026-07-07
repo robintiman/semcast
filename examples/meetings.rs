@@ -30,19 +30,22 @@ async fn main() -> datafusion::error::Result<()> {
     .collect()
     .await?;
 
-    // Eventually: transcript MEANS '...' WITH RECALL 0.9 — the means() UDF
-    // stands in for the operator until the parser extension lands.
-    let df = ctx
-        .sql(
-            "SELECT meeting_id, title, held_at
-             FROM meetings
-             WHERE held_at >= CAST('2026-01-01' AS TIMESTAMP)
-               AND means(transcript, 'discussed the launch of offline sync in Atlas')
-             ORDER BY held_at",
-        )
-        .await?;
+    // Eventually: transcript MEANS '...' WITH RECALL 0.9 — recall bounds
+    // arrive with calibration.
+    let df = semcast::sql(
+        &ctx,
+        "SELECT meeting_id, title, held_at
+         FROM meetings
+         WHERE held_at >= CAST('2026-01-01' AS TIMESTAMP)
+           AND transcript MEANS 'discussed the launch of offline sync in Atlas'
+         ORDER BY held_at",
+    )
+    .await?;
 
-    println!("Optimized plan:\n{}\n", df.clone().into_optimized_plan()?.display_indent());
+    println!(
+        "Optimized plan:\n{}\n",
+        df.clone().into_optimized_plan()?.display_indent()
+    );
 
     let physical = df.clone().create_physical_plan().await?;
     println!(
