@@ -22,11 +22,17 @@ use datafusion::physical_plan::{
 use futures::TryStreamExt;
 
 use crate::cache::{CacheKey, CachedValue, SemanticCache};
+use crate::index::doc_hash;
 use crate::model::{CompletionRequest, ModelId, ModelProvider};
+use crate::physical::index_scan::ChunkEvidence;
 
 /// Version of the synthesized `MEANS` verify prompt. Participates in cache
 /// keys: bump it and every cached verdict is honestly invalidated.
-pub const MEANS_PROMPT_VERSION: &str = "means-v1";
+pub const MEANS_PROMPT_VERSION: &str = "means-v2";
+
+/// Separates chunks in a chunked verify input; part of the cache-keyed
+/// input, so changing it invalidates exactly the chunked verdicts.
+pub const CHUNK_SEPARATOR: &str = "\n---\n";
 
 /// The instruction the verify model sees. Users never write this.
 pub fn synthesize_means_prompt(condition: &str) -> String {
@@ -35,6 +41,18 @@ pub fn synthesize_means_prompt(condition: &str) -> String {
          Answer with exactly one word: yes or no.\n\n\
          Predicate: {condition}\n\n\
          Does the document satisfy the predicate?"
+    )
+}
+
+/// The chunked variant: the model sees the document's best excerpts from
+/// the semantic index, not the whole text.
+pub fn synthesize_means_prompt_chunked(condition: &str) -> String {
+    format!(
+        "You are evaluating a predicate over excerpts from a document, \
+         separated by `---`. The excerpts may be partial. \
+         Answer with exactly one word: yes or no.\n\n\
+         Predicate: {condition}\n\n\
+         Do the excerpts show the document satisfies the predicate?"
     )
 }
 
@@ -53,6 +71,13 @@ pub struct VerifyExec {
     condition: String,
     model: Arc<dyn ModelProvider>,
     cache: Arc<dyn SemanticCache>,
+    /// Chunk evidence from an upstream [`IndexScanExec`]; rows it covers are
+    /// verified on their best chunks instead of the full text.
+    ///
+    /// [`IndexScanExec`]: crate::physical::index_scan::IndexScanExec
+    evidence: Option<Arc<ChunkEvidence>>,
+    /// How many chunks the evidence holds per document — display only.
+    chunks_per_doc: usize,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -64,6 +89,40 @@ impl VerifyExec {
         condition: impl Into<String>,
         model: Arc<dyn ModelProvider>,
         cache: Arc<dyn SemanticCache>,
+    ) -> Self {
+        Self::build(input, text, condition, model, cache, None, 0)
+    }
+
+    /// A verify stage fed by an index pre-filter: rows with evidence are
+    /// verified on their top chunks, unindexed passthrough rows on full text.
+    pub fn new_with_evidence(
+        input: Arc<dyn ExecutionPlan>,
+        text: Arc<dyn PhysicalExpr>,
+        condition: impl Into<String>,
+        model: Arc<dyn ModelProvider>,
+        cache: Arc<dyn SemanticCache>,
+        evidence: Arc<ChunkEvidence>,
+        chunks_per_doc: usize,
+    ) -> Self {
+        Self::build(
+            input,
+            text,
+            condition,
+            model,
+            cache,
+            Some(evidence),
+            chunks_per_doc,
+        )
+    }
+
+    fn build(
+        input: Arc<dyn ExecutionPlan>,
+        text: Arc<dyn PhysicalExpr>,
+        condition: impl Into<String>,
+        model: Arc<dyn ModelProvider>,
+        cache: Arc<dyn SemanticCache>,
+        evidence: Option<Arc<ChunkEvidence>>,
+        chunks_per_doc: usize,
     ) -> Self {
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(input.schema()),
@@ -79,6 +138,8 @@ impl VerifyExec {
             condition: condition.into(),
             model,
             cache,
+            evidence,
+            chunks_per_doc,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -93,6 +154,9 @@ impl DisplayAs for VerifyExec {
             self.condition,
             self.model.id()
         )?;
+        if self.evidence.is_some() {
+            write!(f, " reads top-{} chunks per doc", self.chunks_per_doc)?;
+        }
         // Know the bill before you run: worst-case model calls from input
         // statistics (cache hits and NULLs are free, so this is a ceiling).
         match self
@@ -124,12 +188,14 @@ impl ExecutionPlan for VerifyExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(Self::new(
+        Ok(Arc::new(Self::build(
             Arc::clone(&children[0]),
             Arc::clone(&self.text),
             self.condition.clone(),
             Arc::clone(&self.model),
             Arc::clone(&self.cache),
+            self.evidence.clone(),
+            self.chunks_per_doc,
         )))
     }
 
@@ -143,9 +209,11 @@ impl ExecutionPlan for VerifyExec {
             text: Arc::clone(&self.text),
             condition: self.condition.clone(),
             prompt: synthesize_means_prompt(&self.condition),
+            chunked_prompt: synthesize_means_prompt_chunked(&self.condition),
             model_id: self.model.id(),
             model: Arc::clone(&self.model),
             cache: Arc::clone(&self.cache),
+            evidence: self.evidence.clone(),
             model_calls: MetricBuilder::new(&self.metrics).counter("model_calls", partition),
             cache_hits: MetricBuilder::new(&self.metrics).counter("cache_hits", partition),
             rows_dropped: MetricBuilder::new(&self.metrics).counter("rows_dropped", partition),
@@ -171,9 +239,11 @@ struct Verifier {
     text: Arc<dyn PhysicalExpr>,
     condition: String,
     prompt: String,
+    chunked_prompt: String,
     model_id: ModelId,
     model: Arc<dyn ModelProvider>,
     cache: Arc<dyn SemanticCache>,
+    evidence: Option<Arc<ChunkEvidence>>,
     model_calls: Count,
     cache_hits: Count,
     rows_dropped: Count,
@@ -198,36 +268,48 @@ impl Verifier {
         // never reach it either — first evaluation wins.
         let mut keep = vec![false; batch.num_rows()];
         let mut requests = Vec::new();
-        let mut request_rows = Vec::new();
+        let mut pending: Vec<(usize, String)> = Vec::new();
         for (row, keep_row) in keep.iter_mut().enumerate() {
             if !texts.is_valid(row) {
                 continue;
             }
             let text = texts.value(row);
-            if let Some(CachedValue::Value(verdict)) = self.cache.get(&self.cache_key(text)) {
+            // With index evidence, the model reads the document's best
+            // chunks; without (no index, or an unindexed passthrough row),
+            // the full text. The cache keys the input actually sent, so the
+            // two kinds of verdict never collide.
+            let (input, prompt) = match self
+                .evidence
+                .as_deref()
+                .and_then(|evidence| evidence.chunks_for(doc_hash(text)))
+            {
+                Some(chunks) => (chunks.join(CHUNK_SEPARATOR), &self.chunked_prompt),
+                None => (text.to_owned(), &self.prompt),
+            };
+            if let Some(CachedValue::Value(verdict)) = self.cache.get(&self.cache_key(&input)) {
                 self.cache_hits.add(1);
                 *keep_row = verdict == "yes";
                 continue;
             }
             requests.push(CompletionRequest {
-                system: self.prompt.clone(),
-                input: text.to_owned(),
+                system: prompt.clone(),
+                input: input.clone(),
                 max_tokens: 8,
             });
-            request_rows.push(row);
+            pending.push((row, input));
         }
         self.model_calls.add(requests.len());
 
         let verdicts = self.model.complete(requests).await;
-        debug_assert_eq!(verdicts.len(), request_rows.len());
-        for (&row, verdict) in request_rows.iter().zip(&verdicts) {
+        debug_assert_eq!(verdicts.len(), pending.len());
+        for ((row, input), verdict) in pending.iter().zip(&verdicts) {
             match verdict.as_ref().map(|c| parse_verdict(&c.text)) {
                 Ok(Some(matched)) => {
-                    keep[row] = matched;
+                    keep[*row] = matched;
                     // Only successful verdicts are cached: a transient model
                     // failure must not permanently exclude a row.
                     self.cache.put(
-                        self.cache_key(texts.value(row)),
+                        self.cache_key(input),
                         CachedValue::Value(if matched { "yes" } else { "no" }.to_owned()),
                     );
                 }
@@ -238,12 +320,12 @@ impl Verifier {
         Ok(filter_record_batch(&batch, &BooleanArray::from(keep))?)
     }
 
-    /// Full provenance: same condition + text + model + prompt scheme →
-    /// same verdict, across every query that ever asks again.
-    fn cache_key(&self, text: &str) -> CacheKey {
+    /// Full provenance: same condition + sent input + model + prompt scheme
+    /// → same verdict, across every query that ever asks again.
+    fn cache_key(&self, input: &str) -> CacheKey {
         use std::hash::{DefaultHasher, Hash, Hasher};
         let mut hasher = DefaultHasher::new();
-        text.hash(&mut hasher);
+        input.hash(&mut hasher);
         CacheKey {
             type_version: self.condition.clone(),
             field: "means".to_owned(),

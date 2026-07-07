@@ -36,15 +36,19 @@ use std::sync::Arc;
 
 use datafusion::dataframe::DataFrame;
 use datafusion::error::DataFusionError;
-use datafusion::execution::context::SessionContext;
+use datafusion::execution::context::{SessionConfig, SessionContext};
 use datafusion::execution::session_state::SessionStateBuilder;
+use datafusion::logical_expr::LogicalPlanBuilder;
 use datafusion::sql::parser::Statement as DFStatement;
 use datafusion::sql::sqlparser::parser::Parser;
 
 use crate::cache::{InMemoryCache, SemanticCache};
+use crate::index::registry::SemcastRuntime;
 use crate::model::ModelProvider;
 use crate::optimizer::rewrite::MeansRewriteRule;
 use crate::physical::planner::SemcastQueryPlanner;
+
+pub use crate::index::{IndexOptions, create_semantic_index, refresh_semantic_index};
 
 /// Build a [`SessionContext`] with all semcast machinery registered:
 /// the `means()` UDF, the `MEANS`-rewrite optimizer rule, and a query
@@ -73,6 +77,21 @@ pub fn semcast_context(model: Arc<dyn ModelProvider>) -> SessionContext {
 /// only accepts sqlparser's built-in dialects, so the custom syntax needs its
 /// own entry point; queries that call `means()` directly work through either.
 pub async fn sql(ctx: &SessionContext, query: &str) -> Result<DataFrame> {
+    // `CREATE SEMANTIC ...` is semcast syntax, not SQL — intercept it before
+    // the parser. DDL yields an empty DataFrame, like DataFusion's own DDL.
+    if let Some(ddl) = sql::ddl::parse_semantic_ddl(query)? {
+        return match ddl {
+            sql::ddl::SemanticDdl::CreateIndex { table, column } => {
+                create_semantic_index(ctx, &table, &column, IndexOptions::default()).await?;
+                let no_rows = LogicalPlanBuilder::empty(false).build()?;
+                Ok(DataFrame::new(ctx.state(), no_rows))
+            }
+            other => Err(DataFusionError::Plan(format!(
+                "semantic DDL not implemented yet: {other:?}"
+            ))
+            .into()),
+        };
+    }
     let mut statements =
         Parser::parse_sql(&sql::SemcastDialect::default(), query).map_err(DataFusionError::from)?;
     if statements.len() != 1 {
@@ -92,8 +111,10 @@ pub fn semcast_context_with_cache(
     model: Arc<dyn ModelProvider>,
     cache: Arc<dyn SemanticCache>,
 ) -> SessionContext {
+    let runtime = Arc::new(SemcastRuntime::new(Arc::clone(&model)));
     let state = SessionStateBuilder::new()
         .with_default_features()
+        .with_config(SessionConfig::new().with_extension(runtime))
         .with_optimizer_rule(Arc::new(MeansRewriteRule))
         .with_query_planner(Arc::new(SemcastQueryPlanner::new(model, cache)))
         .build();

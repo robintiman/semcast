@@ -1,6 +1,8 @@
-//! The README walk-through, as far as the MVP takes it: a semantic filter
-//! that plans through the rewrite rule and executes through VerifyExec —
-//! against the deterministic mock model, so it runs without any setup.
+//! The README walk-through, as far as the roadmap takes it: a semantic
+//! index built with `CREATE SEMANTIC INDEX`, a `MEANS` filter that plans
+//! the derived funnel — free predicates, index pre-filter, chunk-fed
+//! verify — against the deterministic mock model, so it runs without any
+//! setup.
 //!
 //! Run with: `cargo run --example meetings`
 
@@ -13,11 +15,15 @@ use semcast::semcast_context;
 async fn main() -> datafusion::error::Result<()> {
     let ctx = semcast_context(Arc::new(MockModel::answering_yes_to(["offline sync"])));
 
+    // Transcript 1 runs long enough (>384 words) to be split into several
+    // chunks, so the verify stage demonstrably reads excerpts, not the
+    // whole document.
     ctx.sql(
         "CREATE TABLE meetings AS
          SELECT * FROM (VALUES
              (1, 'atlas planning',   CAST('2026-05-12 10:00:00' AS TIMESTAMP),
-              'we agreed to ship offline sync in Q3, pending the sync-engine work'),
+              'we agreed to ship offline sync in Q3, pending the sync-engine work. '
+              || repeat('the team walked through rollout details, conflict handling, and the storage budget. ', 60)),
              (2, 'weekly standup',   CAST('2026-06-02 09:30:00' AS TIMESTAMP),
               'status round, nothing notable happened'),
              (3, 'beacon retro',     CAST('2025-11-20 15:00:00' AS TIMESTAMP),
@@ -29,6 +35,11 @@ async fn main() -> datafusion::error::Result<()> {
     .await?
     .collect()
     .await?;
+
+    semcast::sql(&ctx, "CREATE SEMANTIC INDEX ON meetings(transcript)")
+        .await?
+        .collect()
+        .await?;
 
     // Eventually: transcript MEANS '...' WITH RECALL 0.9 — recall bounds
     // arrive with calibration.
@@ -49,7 +60,7 @@ async fn main() -> datafusion::error::Result<()> {
 
     let physical = df.clone().create_physical_plan().await?;
     println!(
-        "Physical plan (with the verify-stage call estimate):\n{}",
+        "Physical plan (the derived funnel, with the verify-stage call estimate):\n{}",
         datafusion::physical_plan::displayable(physical.as_ref()).indent(false)
     );
 

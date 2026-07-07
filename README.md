@@ -181,9 +181,9 @@ fail halfway. semcast answers explicitly:
 | Verify stage + call estimate | `ExecutionPlan` via `ExtensionPlanner` | ✅ `VerifyExec` |
 | Async batched model calls | `tokio` + `reqwest` | ✅ Ollama, Anthropic |
 | Verdict cache | provenance-keyed, in-memory | ✅ |
-| `CREATE SEMANTIC INDEX / TYPE / PREDICATE` syntax | parser extension | planned |
-| Semantic index | [Lance](https://lancedb.github.io/lance/) (Arrow-native) | planned |
-| Funnel derivation, calibration, field pushdown, agg split | `OptimizerRule` / `PhysicalOptimizerRule` | planned |
+| `CREATE SEMANTIC INDEX` syntax | parser extension | ✅ (`TYPE` / `PREDICATE` planned) |
+| Semantic index + pre-filter stage | [Lance](https://lancedb.github.io/lance/) (Arrow-native) | ✅ `IndexScanExec` |
+| Calibration, field pushdown, agg split | `OptimizerRule` / `PhysicalOptimizerRule` | planned |
 
 ## Where this bites
 
@@ -208,9 +208,13 @@ datafusion = "54"
 tokio      = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
-Pick a provider: **Ollama** (local, free — `ollama pull gemma4:31b`; also the
-future embedding source) or **Anthropic** (`export ANTHROPIC_API_KEY=...`;
-defaults to Haiku, the right tier for one-word verify calls).
+Building needs `protoc` (Lance requirement): `brew install protobuf`.
+
+Pick a provider: **Ollama** (local, free — `ollama pull gemma4:31b`, plus
+`nomic-embed-text` for the semantic index) or **Anthropic**
+(`export ANTHROPIC_API_KEY=...`; defaults to Haiku, the right tier for
+one-word verify calls — no embeddings, so bring an Ollama embedder in
+`IndexOptions` to index).
 
 ```rust
 use std::sync::Arc;
@@ -221,6 +225,10 @@ use semcast::{model::OllamaProvider, semcast_context};
 async fn main() -> datafusion::error::Result<()> {
     let ctx = semcast_context(Arc::new(OllamaProvider::new("gemma4:31b")));
     ctx.register_csv("meetings", "meetings.csv", Default::default()).await?;
+
+    // Optional but what makes it cheap: prunes candidates by vector
+    // similarity so the model reads chunks of survivors, not every row.
+    semcast::sql(&ctx, "CREATE SEMANTIC INDEX ON meetings(transcript)").await?;
 
     semcast::sql(
         &ctx,
@@ -244,11 +252,19 @@ costing a call per row. `WITH RECALL` isn't parsed yet.
 
 What runs today: `MEANS` rewrites to a `SemFilter` above your free
 predicates (so they run first), survivors are verified with batched async
-calls, verdicts are cached by provenance — reruns and narrower follow-ups cost
-zero new calls — and `EXPLAIN` prices the verify stage:
+calls, and verdicts are cached by provenance — reruns and narrower
+follow-ups cost zero new calls. With an index (the DDL above, or
+`create_semantic_index(...)` from Rust), the planner adds the cheap stage:
+chunks are embedded once into a Lance dataset, one embedding call per query
+prunes non-candidates by vector similarity, and the verify model reads each
+survivor's top-3 chunks instead of the whole document. Rows the index has
+never seen pass through to full-text verify — never silently dropped;
+`refresh_semantic_index` picks them up. Thresholds are best-effort until
+`WITH RECALL` lands, and `EXPLAIN` says so:
 
 ```text
-VerifyExec: MEANS('discussed the launch of offline sync in Atlas') model=ollama/gemma4:31b   ~3 model calls
+VerifyExec: MEANS('discussed the launch of offline sync in Atlas') model=ollama/gemma4:31b reads top-3 chunks per doc   ~3 model calls
+  IndexScanExec: MEANS('discussed the launch of offline sync in Atlas') embed_model=ollama/gemma4:31b floor=0.35 top-3 chunks (threshold best-effort — no WITH RECALL)
 ```
 
 Try it with no setup:
@@ -258,6 +274,7 @@ git clone https://github.com/robintiman/semcast && cd semcast
 cargo run --example meetings                       # deterministic mock model
 cargo test                                         # full suite, no network
 cargo test --test live_ollama -- --ignored         # end-to-end against local Ollama
+                                                   # (gemma4:31b + nomic-embed-text)
 ```
 
 ## Status
@@ -265,10 +282,10 @@ cargo test --test live_ollama -- --ignored         # end-to-end against local Ol
 Early / experimental. Order of attack:
 
 1. ~~`MEANS` logical operator + verify-only physical plan~~ **done**
-2. `CREATE SEMANTIC INDEX` on Lance + the index pre-filter stage — **next**
-3. `WITH RECALL` — sampled threshold calibration
-4. Field-level cache with provenance keys — **in-memory done**; the
-   persistent, cross-session cache comes with the index work
+2. ~~`CREATE SEMANTIC INDEX` on Lance + the index pre-filter stage~~ **done**
+3. `WITH RECALL` — sampled threshold calibration — **next**
+4. Field-level cache with provenance keys — **in-memory done**; persistent,
+   cross-session cache on disk
 5. Eval harness: labeled corpus, reporting **calls saved and recall** against
    the LLM-on-every-row baseline — so the headline claim stays falsifiable
 

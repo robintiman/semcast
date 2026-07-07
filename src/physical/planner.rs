@@ -8,16 +8,20 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use datafusion::common::DFSchema;
 use datafusion::error::Result;
 use datafusion::execution::context::QueryPlanner;
 use datafusion::execution::session_state::SessionState;
-use datafusion::logical_expr::{LogicalPlan, UserDefinedLogicalNode};
+use datafusion::logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNode};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner};
 
 use crate::cache::SemanticCache;
+use crate::index::SemanticIndex;
+use crate::index::registry::SemcastRuntime;
 use crate::logical::SemFilterNode;
 use crate::model::ModelProvider;
+use crate::physical::index_scan::{ChunkEvidence, IndexScanExec};
 use crate::physical::VerifyExec;
 
 /// The default DataFusion planner plus semcast extension planning.
@@ -76,6 +80,31 @@ impl ExtensionPlanner for SemcastExtensionPlanner {
                 logical_inputs[0].schema(),
                 session_state,
             )?;
+            // Funnel when an index covers the filtered column: index scan
+            // prunes, verify reads the surviving rows' top chunks. No index
+            // (or an unresolvable text expr) → verify-only, correct but full
+            // price.
+            if let Some(index) = resolve_index(filter, logical_inputs[0].schema(), session_state) {
+                let params = index.search_params();
+                let evidence = Arc::new(ChunkEvidence::default());
+                let scan = Arc::new(IndexScanExec::new(
+                    Arc::clone(&physical_inputs[0]),
+                    Arc::clone(&text),
+                    filter.condition.clone(),
+                    index,
+                    params,
+                    Arc::clone(&evidence),
+                ));
+                return Ok(Some(Arc::new(VerifyExec::new_with_evidence(
+                    scan,
+                    text,
+                    filter.condition.clone(),
+                    Arc::clone(&self.model),
+                    Arc::clone(&self.cache),
+                    evidence,
+                    params.chunks_per_doc,
+                ))));
+            }
             return Ok(Some(Arc::new(VerifyExec::new(
                 Arc::clone(&physical_inputs[0]),
                 text,
@@ -85,5 +114,37 @@ impl ExtensionPlanner for SemcastExtensionPlanner {
             ))));
         }
         Ok(None)
+    }
+}
+
+/// The registered index for the filtered column, if the text expression
+/// resolves to a plain qualified column. Resolution is deliberately exact:
+/// computed expressions or alias-erased qualifiers plan verify-only rather
+/// than borrow a possibly-wrong index.
+fn resolve_index(
+    filter: &SemFilterNode,
+    schema: &DFSchema,
+    session_state: &SessionState,
+) -> Option<Arc<dyn SemanticIndex>> {
+    let column = column_behind_casts(&filter.text)?;
+    let (qualifier, field) = schema.qualified_field_from_column(column).ok()?;
+    let table = qualifier?.table();
+    let runtime = session_state.config().get_extension::<SemcastRuntime>()?;
+    runtime.index_for(table, field.name())
+}
+
+/// The column a text expression reads, seen through casts and aliases —
+/// type coercion wraps string columns in `CAST(... AS Utf8)` for the
+/// `means` UDF signature, and a cast between string types doesn't change
+/// which document the text is (both stages hash the evaluated text, so the
+/// index keys still line up). Anything else is a computed expression: no
+/// index.
+fn column_behind_casts(expr: &Expr) -> Option<&datafusion::common::Column> {
+    match expr {
+        Expr::Column(column) => Some(column),
+        Expr::Cast(cast) => column_behind_casts(&cast.expr),
+        Expr::TryCast(cast) => column_behind_casts(&cast.expr),
+        Expr::Alias(alias) => column_behind_casts(&alias.expr),
+        _ => None,
     }
 }

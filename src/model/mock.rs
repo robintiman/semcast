@@ -1,5 +1,6 @@
 //! Deterministic in-process model for tests and the eval baseline.
 
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
@@ -13,6 +14,8 @@ use crate::Result;
 pub struct MockModel {
     truthy: Vec<String>,
     calls: AtomicUsize,
+    inputs: Mutex<Vec<String>>,
+    embed_calls: AtomicUsize,
 }
 
 impl MockModel {
@@ -25,7 +28,7 @@ impl MockModel {
     {
         Self {
             truthy: needles.into_iter().map(Into::into).collect(),
-            calls: AtomicUsize::new(0),
+            ..Default::default()
         }
     }
 
@@ -33,6 +36,17 @@ impl MockModel {
     /// saved, and the eval harness report calls against the baseline.
     pub fn completion_calls(&self) -> usize {
         self.calls.load(Ordering::Relaxed)
+    }
+
+    /// The input of every completion request served, in order — lets tests
+    /// assert what the model actually read (full text vs. chunks).
+    pub fn completion_inputs(&self) -> Vec<String> {
+        self.inputs.lock().expect("inputs poisoned").clone()
+    }
+
+    /// `embed` requests served so far (one per call, however many texts).
+    pub fn embed_calls(&self) -> usize {
+        self.embed_calls.load(Ordering::Relaxed)
     }
 }
 
@@ -44,6 +58,10 @@ impl ModelProvider for MockModel {
 
     async fn complete(&self, requests: Vec<CompletionRequest>) -> Vec<Result<Completion>> {
         self.calls.fetch_add(requests.len(), Ordering::Relaxed);
+        self.inputs
+            .lock()
+            .expect("inputs poisoned")
+            .extend(requests.iter().map(|req| req.input.clone()));
         requests
             .into_iter()
             .map(|req| {
@@ -62,6 +80,7 @@ impl ModelProvider for MockModel {
     }
 
     async fn embed(&self, texts: Vec<String>) -> Result<Vec<Embedding>> {
+        self.embed_calls.fetch_add(1, Ordering::Relaxed);
         Ok(texts.iter().map(|t| byte_histogram(t)).collect())
     }
 }

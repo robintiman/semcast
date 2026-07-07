@@ -12,8 +12,13 @@ categories = ["database"]
 async-trait = "0.1.89"
 datafusion = "54"
 futures = "0.3.32"
+lance = { version = "8", default-features = false }
+lance-linalg = "8"
 reqwest = { version = "0.13.4", features = ["json"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
