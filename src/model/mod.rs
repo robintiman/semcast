@@ -13,7 +13,7 @@ mod ollama;
 
 pub use anthropic::AnthropicProvider;
 pub use mock::MockModel;
-pub use ollama::OllamaProvider;
+pub use ollama::{DEFAULT_EMBED_MODEL, DEFAULT_OLLAMA_URL, OllamaProvider};
 
 use async_trait::async_trait;
 use futures::StreamExt;

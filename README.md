@@ -284,6 +284,31 @@ cargo test --test live_ollama -- --ignored         # end-to-end against local Ol
                                                    # (gemma4:31b + nomic-embed-text)
 ```
 
+### Serve it
+
+semcast is meant to be run as a service — any Postgres simple-protocol
+client connects (`psql` works; DBeaver needs the extended protocol, still on
+the roadmap):
+
+```sh
+cargo run --features server -- serve               # Ollama provider
+cargo run --features server -- serve --mock sync   # no model needed
+psql -h 127.0.0.1 -p 5433
+```
+
+Funnel progress streams back as NOTICE messages while the model runs:
+
+```text
+semcast=> SELECT meeting_id FROM meetings
+          WHERE transcript MEANS 'offline sync' WITH RECALL 0.9;
+NOTICE:  funnel: IndexScanExec: MEANS('offline sync') embed_model=ollama/nomic-embed-text floor=calibrated(recall≥0.90, sample≤64) top-3 chunks
+NOTICE:  funnel: VerifyExec: MEANS('offline sync') model=ollama/gemma4:31b reads top-3 chunks per doc   ≤47 model calls
+NOTICE:  funnel done — index scan: 47 hits, 3053 pruned; verify: 47 model calls, 12 cache hits, 35 dropped
+```
+
+`semcast serve --help` lists the knobs: `--port` (5433), `--model`,
+`--embed-model`, `--ollama-url`, `--index-dir`, `--mock`.
+
 ## Status
 
 Early / experimental. Order of attack:
@@ -298,6 +323,11 @@ Early / experimental. Order of attack:
    cross-session cache on disk
 6. Eval harness: labeled corpus, reporting **calls saved and recall** against
    the LLM-on-every-row baseline — so the headline claim stays falsifiable
+7. ~~pgwire server — semcast as a service; funnel progress streamed as
+   NOTICE messages mid-query~~ **done** for the simple protocol (`psql`);
+   extended protocol (DBeaver, Grafana, JDBC) still open
+8. Ingestion — `CREATE EXTERNAL TABLE` over Parquet/CSV on disk or object
+   storage; every demo starts with loading data
 
 ## License
 

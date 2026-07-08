@@ -27,6 +27,8 @@ pub mod logical;
 pub mod model;
 pub mod optimizer;
 pub mod physical;
+#[cfg(feature = "server")]
+pub mod server;
 pub mod sql;
 pub mod types;
 
@@ -106,14 +108,60 @@ pub fn semcast_context_with_cache(
     model: Arc<dyn ModelProvider>,
     cache: Arc<dyn SemanticCache>,
 ) -> SessionContext {
-    let runtime = Arc::new(SemcastRuntime::new(Arc::clone(&model)));
-    let state = SessionStateBuilder::new()
-        .with_default_features()
-        .with_config(SessionConfig::new().with_extension(runtime))
-        .with_optimizer_rule(Arc::new(MeansRewriteRule))
-        .with_query_planner(Arc::new(SemcastQueryPlanner::new(model, cache)))
-        .build();
-    let ctx = SessionContext::new_with_state(state);
-    ctx.register_udf(sql::means_udf::means_udf());
-    ctx
+    SemcastContextBuilder::new(model).with_cache(cache).build()
+}
+
+/// [`semcast_context`] with every knob exposed — the server binary needs an
+/// index root outside the temp dir and `information_schema` for `SHOW`.
+pub struct SemcastContextBuilder {
+    model: Arc<dyn ModelProvider>,
+    cache: Arc<dyn SemanticCache>,
+    index_root: Option<std::path::PathBuf>,
+    information_schema: bool,
+}
+
+impl SemcastContextBuilder {
+    pub fn new(model: Arc<dyn ModelProvider>) -> Self {
+        Self {
+            model,
+            cache: Arc::new(InMemoryCache::default()),
+            index_root: None,
+            information_schema: false,
+        }
+    }
+
+    pub fn with_cache(mut self, cache: Arc<dyn SemanticCache>) -> Self {
+        self.cache = cache;
+        self
+    }
+
+    /// Where `CREATE SEMANTIC INDEX` puts Lance datasets; defaults to the temp dir.
+    pub fn with_index_root(mut self, root: impl Into<std::path::PathBuf>) -> Self {
+        self.index_root = Some(root.into());
+        self
+    }
+
+    pub fn with_information_schema(mut self, on: bool) -> Self {
+        self.information_schema = on;
+        self
+    }
+
+    pub fn build(self) -> SessionContext {
+        let mut runtime = SemcastRuntime::new(Arc::clone(&self.model));
+        if let Some(root) = self.index_root {
+            runtime = runtime.with_index_root(root);
+        }
+        let config = SessionConfig::new()
+            .with_extension(Arc::new(runtime))
+            .with_information_schema(self.information_schema);
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_config(config)
+            .with_optimizer_rule(Arc::new(MeansRewriteRule))
+            .with_query_planner(Arc::new(SemcastQueryPlanner::new(self.model, self.cache)))
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        ctx.register_udf(sql::means_udf::means_udf());
+        ctx
+    }
 }

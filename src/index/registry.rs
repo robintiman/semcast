@@ -30,6 +30,12 @@ impl SemcastRuntime {
         }
     }
 
+    /// Store Lance datasets under `root` instead of the temp-dir default.
+    pub fn with_index_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.index_root = root.into();
+        self
+    }
+
     /// Where Lance datasets go when `IndexOptions.path` is not set.
     pub fn index_root(&self) -> &Path {
         &self.index_root

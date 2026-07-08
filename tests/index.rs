@@ -531,3 +531,32 @@ async fn calibrated_plan_explains_the_contract_not_a_number() {
     );
     assert!(!display.contains("best-effort"), "plan:\n{display}");
 }
+
+#[tokio::test]
+async fn builder_index_root_hosts_ddl_created_indexes() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = semcast::SemcastContextBuilder::new(Arc::new(MockModel::answering_yes_to(["sync"])))
+        .with_index_root(dir.path())
+        .build();
+    ctx.sql(&format!(
+        "CREATE TABLE meetings AS
+         SELECT * FROM (VALUES (1, '{MATCHING}')) AS t(meeting_id, transcript)",
+    ))
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    semcast::sql(&ctx, "CREATE SEMANTIC INDEX ON meetings(transcript)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    assert!(
+        dir.path().join("meetings.transcript.lance").is_dir(),
+        "Lance dataset lands under the builder's index root",
+    );
+}
