@@ -112,7 +112,9 @@ impl LanceIndex {
         let dataset = Dataset::open(uri).await.map_err(lance_err)?;
         let metadata = &dataset.schema().metadata;
         let recorded = metadata.get(META_EMBED_MODEL).ok_or_else(|| {
-            SemcastError::Index(format!("{uri} is not a semcast index (no embed-model metadata)"))
+            SemcastError::Index(format!(
+                "{uri} is not a semcast index (no embed-model metadata)"
+            ))
         })?;
         if *recorded != embedder.id().0 {
             return Err(SemcastError::Index(format!(
@@ -123,7 +125,11 @@ impl LanceIndex {
         }
         let dim = parse_meta(metadata.get(META_EMBED_DIM), uri, META_EMBED_DIM)?;
         let chunk_config = ChunkConfig {
-            max_tokens: parse_meta(metadata.get(META_CHUNK_MAX_TOKENS), uri, META_CHUNK_MAX_TOKENS)?,
+            max_tokens: parse_meta(
+                metadata.get(META_CHUNK_MAX_TOKENS),
+                uri,
+                META_CHUNK_MAX_TOKENS,
+            )?,
             overlap_tokens: parse_meta(
                 metadata.get(META_CHUNK_OVERLAP_TOKENS),
                 uri,

@@ -33,7 +33,10 @@ pub enum FieldType {
     Int,
     Real,
     /// `REAL CHECK (a..b)` — validated at decode time.
-    RealBounded { min: OrderedF64, max: OrderedF64 },
+    RealBounded {
+        min: OrderedF64,
+        max: OrderedF64,
+    },
     /// Becomes a plain predicate.
     Bool,
     /// `ONEOF(a, b, c)` — closed category; `GROUP BY`-able.

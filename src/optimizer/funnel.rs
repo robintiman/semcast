@@ -15,7 +15,10 @@ pub enum FunnelStage {
     /// Semantic index scan; threshold set by calibration (or best-effort).
     IndexScan { threshold: f32 },
     /// LLM verification of surviving rows, reading top-scoring chunks only.
-    Verify { model: ModelId, chunks_per_row: usize },
+    Verify {
+        model: ModelId,
+        chunks_per_row: usize,
+    },
 }
 
 /// A derived funnel plus the estimates `EXPLAIN` prints.

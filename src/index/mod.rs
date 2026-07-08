@@ -156,9 +156,9 @@ pub async fn refresh_semantic_index(
     column: &str,
 ) -> Result<usize> {
     let runtime = runtime(ctx)?;
-    let index = runtime.index_for(table, column).ok_or_else(|| {
-        SemcastError::Index(format!("no semantic index on {table}({column})"))
-    })?;
+    let index = runtime
+        .index_for(table, column)
+        .ok_or_else(|| SemcastError::Index(format!("no semantic index on {table}({column})")))?;
     let indexed = index.indexed_doc_hashes().await?;
     let new_texts: Vec<String> = read_column_texts(ctx, table, column)
         .await?
@@ -180,11 +180,7 @@ fn runtime(ctx: &SessionContext) -> Result<Arc<SemcastRuntime>> {
 }
 
 /// All non-null texts of `table.column`, deduped by [`doc_hash`].
-async fn read_column_texts(
-    ctx: &SessionContext,
-    table: &str,
-    column: &str,
-) -> Result<Vec<String>> {
+async fn read_column_texts(ctx: &SessionContext, table: &str, column: &str) -> Result<Vec<String>> {
     let batches = ctx
         .table(table)
         .await?
@@ -194,8 +190,8 @@ async fn read_column_texts(
     let mut seen = HashSet::new();
     let mut texts = Vec::new();
     for batch in &batches {
-        let strings = compute::cast(batch.column(0), &DataType::Utf8)
-            .map_err(DataFusionError::from)?;
+        let strings =
+            compute::cast(batch.column(0), &DataType::Utf8).map_err(DataFusionError::from)?;
         let strings = strings
             .as_any()
             .downcast_ref::<StringArray>()

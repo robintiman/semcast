@@ -34,8 +34,12 @@ pub fn parse_semantic_ddl(sql: &str) -> crate::Result<Option<SemanticDdl>> {
     // Cheap gate so ordinary statements never pay for a second parse: the
     // first two words must be CREATE SEMANTIC.
     let mut words = sql.split_whitespace();
-    let prefix_matches = words.next().is_some_and(|w| w.eq_ignore_ascii_case("create"))
-        && words.next().is_some_and(|w| w.eq_ignore_ascii_case("semantic"));
+    let prefix_matches = words
+        .next()
+        .is_some_and(|w| w.eq_ignore_ascii_case("create"))
+        && words
+            .next()
+            .is_some_and(|w| w.eq_ignore_ascii_case("semantic"));
     if !prefix_matches {
         return Ok(None);
     }
@@ -65,7 +69,11 @@ pub fn parse_semantic_ddl(sql: &str) -> crate::Result<Option<SemanticDdl>> {
                 ),
             )));
         }
-        other => return Err(error(format!("expected INDEX, TYPE, or PREDICATE, got {other}"))),
+        other => {
+            return Err(error(format!(
+                "expected INDEX, TYPE, or PREDICATE, got {other}"
+            )));
+        }
     }
     expect_word(&mut parser, "ON").map_err(&error)?;
     let table = parser

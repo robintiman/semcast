@@ -28,7 +28,11 @@ pub struct SemExtractNode {
 
 impl SemExtractNode {
     /// Compute `output_schema` from `input` and `target` and build the node.
-    pub fn try_new(_input: LogicalPlan, _source: Expr, _target: SemanticType) -> crate::Result<Self> {
+    pub fn try_new(
+        _input: LogicalPlan,
+        _source: Expr,
+        _target: SemanticType,
+    ) -> crate::Result<Self> {
         todo!("derive Arrow output schema from the semantic type (after roadmap step 1)")
     }
 }

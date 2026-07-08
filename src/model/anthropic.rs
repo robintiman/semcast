@@ -47,7 +47,8 @@ impl AnthropicProvider {
 
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
-        self.base_url.truncate(self.base_url.trim_end_matches('/').len());
+        self.base_url
+            .truncate(self.base_url.trim_end_matches('/').len());
         self
     }
 
@@ -84,7 +85,9 @@ impl AnthropicProvider {
         // A refusal is a row-level failure: the row gets dropped and counted,
         // never treated as a "no".
         if message.stop_reason.as_deref() == Some("refusal") {
-            return Err(SemcastError::Model("anthropic refused the request".to_owned()));
+            return Err(SemcastError::Model(
+                "anthropic refused the request".to_owned(),
+            ));
         }
         let text = message
             .content
@@ -144,7 +147,9 @@ struct MessagesResponse {
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ContentBlock {
-    Text { text: String },
+    Text {
+        text: String,
+    },
     #[serde(other)]
     Other,
 }

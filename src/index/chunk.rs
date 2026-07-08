@@ -58,7 +58,10 @@ mod tests {
     use super::*;
 
     fn words(n: usize) -> String {
-        (0..n).map(|i| format!("w{i}")).collect::<Vec<_>>().join(" ")
+        (0..n)
+            .map(|i| format!("w{i}"))
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     #[test]
