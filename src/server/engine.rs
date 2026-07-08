@@ -98,6 +98,8 @@ fn command_tag(sql: &str) -> String {
             Some(third) => format!("{first} SEMANTIC {third}"),
             None => format!("{first} SEMANTIC"),
         },
+        // psql knows `CREATE TABLE`; `CREATE EXTERNAL` would read as noise.
+        (Some("CREATE"), Some("EXTERNAL")) => "CREATE TABLE".to_owned(),
         (Some(first @ ("CREATE" | "DROP" | "ALTER")), Some(second)) => format!("{first} {second}"),
         (Some(first), _) => first.to_owned(),
         (None, _) => "OK".to_owned(),
@@ -173,6 +175,12 @@ mod tests {
         };
         assert_eq!(tag, "CREATE SEMANTIC INDEX");
         assert!(rx.try_recv().is_err(), "no progress events for DDL");
+    }
+
+    #[test]
+    fn create_external_table_tags_as_create_table() {
+        let tag = command_tag("CREATE EXTERNAL TABLE t STORED AS CSV LOCATION 'x.csv'");
+        assert_eq!(tag, "CREATE TABLE");
     }
 
     #[tokio::test]

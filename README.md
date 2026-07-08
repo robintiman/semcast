@@ -309,6 +309,25 @@ NOTICE:  funnel done — index scan: 47 hits, 3053 pruned; verify: 47 model call
 `semcast serve --help` lists the knobs: `--port` (5433), `--model`,
 `--embed-model`, `--ollama-url`, `--index-dir`, `--mock`.
 
+### Load data
+
+Local Parquet and CSV, DuckDB-style — query files by path (globs work),
+mount them as tables, or materialize into memory:
+
+```sql
+SELECT * FROM 'data/meetings.parquet';
+SELECT count(*) FROM 'data/part-*.parquet';
+
+CREATE EXTERNAL TABLE meetings STORED AS CSV LOCATION 'data/meetings.csv'
+  OPTIONS ('format.delimiter' ';');            -- header on by default
+
+CREATE TABLE mem AS SELECT * FROM 'data/meetings.csv';
+COPY mem TO 'out/meetings.parquet' STORED AS PARQUET;
+```
+
+Paths resolve on the server, and any client can read any file the process
+can. Object storage (s3) is on the roadmap.
+
 ## Status
 
 Early / experimental. Order of attack:
@@ -326,8 +345,9 @@ Early / experimental. Order of attack:
 7. ~~pgwire server — semcast as a service; funnel progress streamed as
    NOTICE messages mid-query~~ **done** for the simple protocol (`psql`);
    extended protocol (DBeaver, Grafana, JDBC) still open
-8. Ingestion — `CREATE EXTERNAL TABLE` over Parquet/CSV on disk or object
-   storage; every demo starts with loading data
+8. ~~Ingestion — `CREATE EXTERNAL TABLE` over Parquet/CSV on disk~~ **done**
+   for local files (path-literal `SELECT`, `CREATE EXTERNAL TABLE`, CTAS,
+   `COPY TO`); object storage (s3) still open
 
 ## License
 

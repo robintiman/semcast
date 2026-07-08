@@ -7,7 +7,7 @@
 //! every `means()` call in the plan.
 
 use datafusion::error::DataFusionError;
-use datafusion::sql::sqlparser::ast::Statement;
+use datafusion::sql::parser::{DFParserBuilder, Statement};
 use datafusion::sql::sqlparser::keywords::Keyword;
 use datafusion::sql::sqlparser::parser::Parser;
 use datafusion::sql::sqlparser::tokenizer::Token;
@@ -15,12 +15,16 @@ use datafusion::sql::sqlparser::tokenizer::Token;
 use super::SemcastDialect;
 
 /// Parse exactly one statement plus an optional trailing `WITH RECALL <f>`.
+///
+/// Statements go through DataFusion's [`DFParserBuilder`] rather than a raw
+/// sqlparser `Parser` so DataFusion-only syntax — `CREATE EXTERNAL TABLE`,
+/// `COPY ... TO` — parses too; everything else delegates to sqlparser under
+/// [`SemcastDialect`].
 pub fn parse_statement_with_recall(query: &str) -> crate::Result<(Statement, Option<f64>)> {
     let dialect = SemcastDialect::default();
-    let mut parser = Parser::new(&dialect)
-        .try_with_sql(query)
-        .map_err(DataFusionError::from)?;
-    let statement = parser.parse_statement().map_err(DataFusionError::from)?;
+    let mut df_parser = DFParserBuilder::new(query).with_dialect(&dialect).build()?;
+    let statement = df_parser.parse_statement()?;
+    let parser = &mut df_parser.parser;
 
     // The statement parse stops before a trailing WITH — only the
     // multi-statement loop of `Parser::parse_sql` would reject it.
@@ -33,7 +37,7 @@ pub fn parse_statement_with_recall(query: &str) -> crate::Result<(Statement, Opt
                 )));
             }
         }
-        Some(parse_recall_target(&mut parser)?)
+        Some(parse_recall_target(parser)?)
     } else {
         None
     };
@@ -108,8 +112,18 @@ mod tests {
     fn works_under_explain() {
         let (statement, recall) =
             parse_statement_with_recall("EXPLAIN SELECT 1 WITH RECALL 0.9").unwrap();
-        assert!(matches!(statement, Statement::Explain { .. }));
+        assert!(matches!(statement, Statement::Explain(_)));
         assert_eq!(recall, Some(0.9));
+    }
+
+    #[test]
+    fn parses_create_external_table() {
+        let (statement, recall) = parse_statement_with_recall(
+            "CREATE EXTERNAL TABLE t STORED AS CSV LOCATION '/data/t.csv'",
+        )
+        .unwrap();
+        assert!(matches!(statement, Statement::CreateExternalTable(_)));
+        assert_eq!(recall, None);
     }
 
     #[test]

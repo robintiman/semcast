@@ -133,6 +133,45 @@ async fn multi_statement_strings_split_and_chatter_is_tolerated() {
 }
 
 #[tokio::test]
+async fn csv_ingestion_round_trips_over_the_wire() {
+    let (client, _) = connect(Arc::new(MockModel::default())).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("meetings.csv");
+    std::fs::write(&path, "meeting_id,transcript\n1,planning\n2,standup\n").unwrap();
+
+    let messages = client
+        .simple_query(&format!(
+            "CREATE EXTERNAL TABLE meetings STORED AS CSV LOCATION '{}'",
+            path.display(),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        messages
+            .iter()
+            .any(|m| matches!(m, SimpleQueryMessage::CommandComplete(_))),
+        "external table DDL completes: {messages:?}",
+    );
+
+    let rows = client
+        .simple_query("SELECT meeting_id FROM meetings ORDER BY meeting_id")
+        .await
+        .unwrap();
+    assert_eq!(single_column(&rows), vec!["1", "2"]);
+
+    // Path literal, no DDL: the DuckDB-style direct file query.
+    let rows = client
+        .simple_query(&format!(
+            "SELECT transcript FROM '{}' ORDER BY meeting_id DESC",
+            path.display(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(single_column(&rows), vec!["standup", "planning"]);
+}
+
+#[tokio::test]
 async fn pg_catalog_queries_fail_politely() {
     let (client, _) = connect(Arc::new(MockModel::default())).await;
 

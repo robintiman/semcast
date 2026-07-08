@@ -41,7 +41,6 @@ use datafusion::error::DataFusionError;
 use datafusion::execution::context::{SessionConfig, SessionContext};
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::logical_expr::LogicalPlanBuilder;
-use datafusion::sql::parser::Statement as DFStatement;
 
 use crate::cache::{InMemoryCache, SemanticCache};
 use crate::index::registry::SemcastRuntime;
@@ -95,7 +94,6 @@ pub async fn sql(ctx: &SessionContext, query: &str) -> Result<DataFrame> {
         };
     }
     let (statement, recall) = sql::recall::parse_statement_with_recall(query)?;
-    let statement = DFStatement::Statement(Box::new(statement));
     let mut plan = ctx.state().statement_to_plan(statement).await?;
     if let Some(recall) = recall {
         plan = optimizer::rewrite::apply_recall(plan, recall)?;
@@ -113,6 +111,9 @@ pub fn semcast_context_with_cache(
 
 /// [`semcast_context`] with every knob exposed — the server binary needs an
 /// index root outside the temp dir and `information_schema` for `SHOW`.
+///
+/// Contexts can query files by path (`SELECT * FROM 'data.parquet'`), so any
+/// SQL client can read any local file the process can.
 pub struct SemcastContextBuilder {
     model: Arc<dyn ModelProvider>,
     cache: Arc<dyn SemanticCache>,
@@ -162,6 +163,8 @@ impl SemcastContextBuilder {
             .build();
         let ctx = SessionContext::new_with_state(state);
         ctx.register_udf(sql::means_udf::means_udf());
-        ctx
+        // Must stay last: it consumes and rebuilds the context (everything
+        // registered above carries over via `new_from_existing`).
+        ctx.enable_url_table()
     }
 }
