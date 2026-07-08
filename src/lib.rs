@@ -40,7 +40,6 @@ use datafusion::execution::context::{SessionConfig, SessionContext};
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::logical_expr::LogicalPlanBuilder;
 use datafusion::sql::parser::Statement as DFStatement;
-use datafusion::sql::sqlparser::parser::Parser;
 
 use crate::cache::{InMemoryCache, SemanticCache};
 use crate::index::registry::SemcastRuntime;
@@ -71,7 +70,8 @@ pub fn semcast_context(model: Arc<dyn ModelProvider>) -> SessionContext {
 }
 
 /// Run a query written in semcast SQL — standard SQL plus the infix `MEANS`
-/// operator — against a context from [`semcast_context`].
+/// operator and a trailing `WITH RECALL <target>` — against a context from
+/// [`semcast_context`].
 ///
 /// This is `ctx.sql()` with [`sql::SemcastDialect`] in front. `ctx.sql()`
 /// only accepts sqlparser's built-in dialects, so the custom syntax needs its
@@ -92,17 +92,12 @@ pub async fn sql(ctx: &SessionContext, query: &str) -> Result<DataFrame> {
             .into()),
         };
     }
-    let mut statements =
-        Parser::parse_sql(&sql::SemcastDialect::default(), query).map_err(DataFusionError::from)?;
-    if statements.len() != 1 {
-        return Err(DataFusionError::Plan(format!(
-            "expected exactly one statement, got {}",
-            statements.len()
-        ))
-        .into());
+    let (statement, recall) = sql::recall::parse_statement_with_recall(query)?;
+    let statement = DFStatement::Statement(Box::new(statement));
+    let mut plan = ctx.state().statement_to_plan(statement).await?;
+    if let Some(recall) = recall {
+        plan = optimizer::rewrite::apply_recall(plan, recall)?;
     }
-    let statement = DFStatement::Statement(Box::new(statements.pop().expect("checked len")));
-    let plan = ctx.state().statement_to_plan(statement).await?;
     Ok(ctx.execute_logical_plan(plan).await?)
 }
 

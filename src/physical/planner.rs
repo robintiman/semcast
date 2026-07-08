@@ -21,8 +21,9 @@ use crate::index::SemanticIndex;
 use crate::index::registry::SemcastRuntime;
 use crate::logical::SemFilterNode;
 use crate::model::ModelProvider;
-use crate::physical::index_scan::{ChunkEvidence, IndexScanExec};
+use crate::optimizer::calibrate::DEFAULT_CALIBRATION_SAMPLE;
 use crate::physical::VerifyExec;
+use crate::physical::index_scan::{CalibrationConfig, ChunkEvidence, IndexScanExec};
 
 /// The default DataFusion planner plus semcast extension planning.
 #[derive(Debug)]
@@ -86,6 +87,14 @@ impl ExtensionPlanner for SemcastExtensionPlanner {
             // price.
             if let Some(index) = resolve_index(filter, logical_inputs[0].schema(), session_state) {
                 let params = index.search_params();
+                // WITH RECALL: the scan calibrates its own floor at execution
+                // time by labeling a sample — same model and cache as verify.
+                let calibration = filter.recall.map(|target_recall| CalibrationConfig {
+                    target_recall,
+                    sample_size: DEFAULT_CALIBRATION_SAMPLE,
+                    model: Arc::clone(&self.model),
+                    cache: Arc::clone(&self.cache),
+                });
                 let evidence = Arc::new(ChunkEvidence::default());
                 let scan = Arc::new(IndexScanExec::new(
                     Arc::clone(&physical_inputs[0]),
@@ -93,6 +102,7 @@ impl ExtensionPlanner for SemcastExtensionPlanner {
                     filter.condition.clone(),
                     index,
                     params,
+                    calibration,
                     Arc::clone(&evidence),
                 ));
                 return Ok(Some(Arc::new(VerifyExec::new_with_evidence(

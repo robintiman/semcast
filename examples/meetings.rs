@@ -1,8 +1,8 @@
 //! The README walk-through, as far as the roadmap takes it: a semantic
-//! index built with `CREATE SEMANTIC INDEX`, a `MEANS` filter that plans
-//! the derived funnel — free predicates, index pre-filter, chunk-fed
-//! verify — against the deterministic mock model, so it runs without any
-//! setup.
+//! index built with `CREATE SEMANTIC INDEX`, a `MEANS` filter with a
+//! `WITH RECALL` target that plans the derived funnel — free predicates,
+//! calibrated index pre-filter, chunk-fed verify — against the
+//! deterministic mock model, so it runs without any setup.
 //!
 //! Run with: `cargo run --example meetings`
 
@@ -41,15 +41,17 @@ async fn main() -> datafusion::error::Result<()> {
         .collect()
         .await?;
 
-    // Eventually: transcript MEANS '...' WITH RECALL 0.9 — recall bounds
-    // arrive with calibration.
+    // WITH RECALL: the index threshold is calibrated at execution time by
+    // labeling a sample of the date-surviving rows, instead of trusting a
+    // fixed floor.
     let df = semcast::sql(
         &ctx,
         "SELECT meeting_id, title, held_at
          FROM meetings
          WHERE held_at >= CAST('2026-01-01' AS TIMESTAMP)
            AND transcript MEANS 'discussed the launch of offline sync in Atlas'
-         ORDER BY held_at",
+         ORDER BY held_at
+         WITH RECALL 0.9",
     )
     .await?;
 

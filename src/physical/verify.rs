@@ -13,7 +13,9 @@ use datafusion::error::Result;
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
-use datafusion::physical_plan::metrics::{Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
+use datafusion::physical_plan::metrics::{
+    Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
+};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
@@ -254,10 +256,7 @@ impl Verifier {
         if batch.num_rows() == 0 {
             return Ok(batch);
         }
-        let texts = self
-            .text
-            .evaluate(&batch)?
-            .into_array(batch.num_rows())?;
+        let texts = self.text.evaluate(&batch)?.into_array(batch.num_rows())?;
         let texts = cast(&texts, &DataType::Utf8)?;
         let texts = texts
             .as_any()
@@ -320,24 +319,30 @@ impl Verifier {
         Ok(filter_record_batch(&batch, &BooleanArray::from(keep))?)
     }
 
-    /// Full provenance: same condition + sent input + model + prompt scheme
-    /// → same verdict, across every query that ever asks again.
     fn cache_key(&self, input: &str) -> CacheKey {
-        use std::hash::{DefaultHasher, Hash, Hasher};
-        let mut hasher = DefaultHasher::new();
-        input.hash(&mut hasher);
-        CacheKey {
-            type_version: self.condition.clone(),
-            field: "means".to_owned(),
-            input_hash: hasher.finish(),
-            model_id: self.model_id.clone(),
-            prompt_version: MEANS_PROMPT_VERSION.to_owned(),
-        }
+        means_cache_key(&self.condition, input, &self.model_id)
+    }
+}
+
+/// Full provenance: same condition + sent input + model + prompt scheme
+/// → same verdict, across every query that ever asks again. Shared with
+/// `WITH RECALL` calibration, whose ground-truth labels are exactly
+/// full-text verdicts — the two stages pay for each other's cache.
+pub(crate) fn means_cache_key(condition: &str, input: &str, model_id: &ModelId) -> CacheKey {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    input.hash(&mut hasher);
+    CacheKey {
+        type_version: condition.to_owned(),
+        field: "means".to_owned(),
+        input_hash: hasher.finish(),
+        model_id: model_id.clone(),
+        prompt_version: MEANS_PROMPT_VERSION.to_owned(),
     }
 }
 
 /// `None` means the model didn't give a usable yes/no.
-fn parse_verdict(text: &str) -> Option<bool> {
+pub(crate) fn parse_verdict(text: &str) -> Option<bool> {
     let normalized = text.trim().trim_matches(|c: char| c.is_ascii_punctuation());
     if normalized.eq_ignore_ascii_case("yes") {
         Some(true)

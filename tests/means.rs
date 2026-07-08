@@ -104,7 +104,10 @@ async fn free_predicates_still_apply() {
          WHERE meeting_id > 1 AND transcript MEANS 'discussed offline sync'",
     )
     .await;
-    assert!(ids.is_empty(), "meeting 1 matches MEANS but not the free predicate");
+    assert!(
+        ids.is_empty(),
+        "meeting 1 matches MEANS but not the free predicate"
+    );
 }
 
 #[tokio::test]
@@ -194,8 +197,7 @@ async fn non_literal_condition_is_a_plan_time_error() {
 async fn repeat_query_is_served_from_cache() {
     let model = Arc::new(MockModel::answering_yes_to(["offline sync"]));
     let ctx = meetings_context_with_model(Arc::clone(&model)).await;
-    let query =
-        "SELECT meeting_id FROM meetings WHERE transcript MEANS 'discussed offline sync'";
+    let query = "SELECT meeting_id FROM meetings WHERE transcript MEANS 'discussed offline sync'";
 
     let first = matching_ids(&ctx, query).await;
     assert_eq!(model.completion_calls(), 2, "two non-NULL transcripts");
@@ -276,4 +278,87 @@ async fn two_means_conjuncts_both_apply() {
     // The mock answers yes to both conditions for row 1 (same transcript
     // contains 'offline sync'), so stacking two SemFilters keeps it.
     assert_eq!(ids, vec![1]);
+}
+
+// ---------------------------------------------------------------------------
+// WITH RECALL (roadmap step 3): the statement-level clause lands on the
+// SemFilter. Calibration itself is exercised in tests/index.rs — without an
+// index, verify reads everything and the target is trivially met.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn with_recall_lands_on_the_sem_filter() {
+    let ctx = meetings_context().await;
+    let plan = semcast::sql(
+        &ctx,
+        "SELECT meeting_id FROM meetings
+         WHERE transcript MEANS 'discussed offline sync'
+         WITH RECALL 0.9",
+    )
+    .await
+    .unwrap()
+    .into_optimized_plan()
+    .unwrap();
+
+    let display = format!("{}", plan.display_indent());
+    assert!(display.contains("recall ≥ 0.90"), "plan:\n{display}");
+}
+
+#[tokio::test]
+async fn with_recall_without_means_is_an_error() {
+    let ctx = meetings_context().await;
+    let err = semcast::sql(&ctx, "SELECT meeting_id FROM meetings WITH RECALL 0.9")
+        .await
+        .unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains("requires a MEANS predicate"),
+        "got: {message}"
+    );
+}
+
+#[tokio::test]
+async fn with_recall_still_executes_verify_only() {
+    let ctx = meetings_context().await;
+    let ids = matching_ids(
+        &ctx,
+        "SELECT meeting_id FROM meetings
+         WHERE transcript MEANS 'discussed offline sync'
+         WITH RECALL 0.9",
+    )
+    .await;
+    assert_eq!(ids, vec![1]);
+}
+
+#[tokio::test]
+async fn direct_means_udf_takes_a_recall_argument_through_ctx_sql() {
+    let ctx = meetings_context().await;
+    let plan = ctx
+        .sql(
+            "SELECT meeting_id FROM meetings
+             WHERE means(transcript, 'discussed offline sync', 0.9)",
+        )
+        .await
+        .unwrap()
+        .into_optimized_plan()
+        .unwrap();
+
+    let display = format!("{}", plan.display_indent());
+    assert!(display.contains("recall ≥ 0.90"), "plan:\n{display}");
+}
+
+#[tokio::test]
+async fn out_of_range_recall_argument_is_a_plan_error() {
+    let ctx = meetings_context().await;
+    let err = ctx
+        .sql(
+            "SELECT meeting_id FROM meetings
+             WHERE means(transcript, 'discussed offline sync', 1.5)",
+        )
+        .await
+        .unwrap()
+        .into_optimized_plan()
+        .unwrap_err();
+    let message = err.to_string();
+    assert!(message.contains("(0, 1]"), "got: {message}");
 }

@@ -183,7 +183,8 @@ fail halfway. semcast answers explicitly:
 | Verdict cache | provenance-keyed, in-memory | ✅ |
 | `CREATE SEMANTIC INDEX` syntax | parser extension | ✅ (`TYPE` / `PREDICATE` planned) |
 | Semantic index + pre-filter stage | [Lance](https://lancedb.github.io/lance/) (Arrow-native) | ✅ `IndexScanExec` |
-| Calibration, field pushdown, agg split | `OptimizerRule` / `PhysicalOptimizerRule` | planned |
+| `WITH RECALL` calibration | sampled labels at first poll of the scan | ✅ |
+| Field pushdown, agg split | `OptimizerRule` / `PhysicalOptimizerRule` | planned |
 
 ## Where this bites
 
@@ -244,11 +245,12 @@ async fn main() -> datafusion::error::Result<()> {
 }
 ```
 
-Infix `MEANS` needs `semcast::sql` (DataFusion's `ctx.sql` can't take a custom
-dialect); through `ctx.sql`, write it as `means(text, 'condition')`. Either
-way it's allowed in top-level `AND` conjuncts of `WHERE` only; anything else
-(`OR`, `NOT`, the `SELECT` list) fails at plan time rather than silently
-costing a call per row. `WITH RECALL` isn't parsed yet.
+Infix `MEANS` and trailing `WITH RECALL` need `semcast::sql` (DataFusion's
+`ctx.sql` can't take a custom dialect); through `ctx.sql`, write
+`means(text, 'condition', 0.9)` — the optional third argument is the recall
+target. Either way `MEANS` is allowed in top-level `AND` conjuncts of `WHERE`
+only; anything else (`OR`, `NOT`, the `SELECT` list) fails at plan time
+rather than silently costing a call per row.
 
 What runs today: `MEANS` rewrites to a `SemFilter` above your free
 predicates (so they run first), survivors are verified with batched async
@@ -259,12 +261,17 @@ chunks are embedded once into a Lance dataset, one embedding call per query
 prunes non-candidates by vector similarity, and the verify model reads each
 survivor's top-3 chunks instead of the whole document. Rows the index has
 never seen pass through to full-text verify — never silently dropped;
-`refresh_semantic_index` picks them up. Thresholds are best-effort until
-`WITH RECALL` lands, and `EXPLAIN` says so:
+`refresh_semantic_index` picks them up.
+
+Add `WITH RECALL 0.9` and the pruning threshold is calibrated instead of
+guessed: the scan labels a sample of surviving rows (≤64 full-text calls,
+shared with the verdict cache, so repeat questions relabel for free) and sets
+the floor so ≥90% of the sample's true matches survive. Without the clause
+thresholds are best-effort, and `EXPLAIN` says which you're getting:
 
 ```text
 VerifyExec: MEANS('discussed the launch of offline sync in Atlas') model=ollama/gemma4:31b reads top-3 chunks per doc   ~3 model calls
-  IndexScanExec: MEANS('discussed the launch of offline sync in Atlas') embed_model=ollama/gemma4:31b floor=0.35 top-3 chunks (threshold best-effort — no WITH RECALL)
+  IndexScanExec: MEANS('discussed the launch of offline sync in Atlas') embed_model=ollama/gemma4:31b floor=calibrated(recall≥0.90, sample≤64) top-3 chunks
 ```
 
 Try it with no setup:
@@ -283,9 +290,10 @@ Early / experimental. Order of attack:
 
 1. ~~`MEANS` logical operator + verify-only physical plan~~ **done**
 2. ~~`CREATE SEMANTIC INDEX` on Lance + the index pre-filter stage~~ **done**
-3. `WITH RECALL` — sampled threshold calibration — **next**
+3. ~~`WITH RECALL` — sampled threshold calibration~~ **done**
 4. Semantic types — `CREATE SEMANTIC TYPE`, `EXTRACT`/`CAST`, constrained
    decoding, field pushdown; the fields that make per-field caching possible
+   — **next**
 5. Field-level cache with provenance keys — **in-memory done**; persistent,
    cross-session cache on disk
 6. Eval harness: labeled corpus, reporting **calls saved and recall** against

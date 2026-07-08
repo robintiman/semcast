@@ -71,7 +71,11 @@ async fn search_ranks_the_identical_document_first() {
         .unwrap();
     assert!(!hits.is_empty());
     assert_eq!(hits[0].doc_hash, doc_hash(MATCHING));
-    assert!(hits[0].score > 0.999, "identical text scores ~1: {}", hits[0].score);
+    assert!(
+        hits[0].score > 0.999,
+        "identical text scores ~1: {}",
+        hits[0].score
+    );
     assert_eq!(hits[0].text, MATCHING, "chunk text is the verify evidence");
 }
 
@@ -84,7 +88,9 @@ async fn refresh_indexes_only_new_documents() {
         .unwrap();
 
     assert_eq!(
-        refresh_semantic_index(&ctx, "meetings", "transcript").await.unwrap(),
+        refresh_semantic_index(&ctx, "meetings", "transcript")
+            .await
+            .unwrap(),
         0,
         "nothing changed, nothing re-indexed",
     );
@@ -96,7 +102,9 @@ async fn refresh_indexes_only_new_documents() {
         .await
         .unwrap();
     assert_eq!(
-        refresh_semantic_index(&ctx, "meetings", "transcript").await.unwrap(),
+        refresh_semantic_index(&ctx, "meetings", "transcript")
+            .await
+            .unwrap(),
         1,
         "exactly the inserted row",
     );
@@ -133,7 +141,10 @@ async fn opening_with_a_different_embedder_errors() {
         ) -> Vec<semcast::Result<semcast::model::Completion>> {
             self.0.complete(requests).await
         }
-        async fn embed(&self, texts: Vec<String>) -> semcast::Result<Vec<semcast::model::Embedding>> {
+        async fn embed(
+            &self,
+            texts: Vec<String>,
+        ) -> semcast::Result<Vec<semcast::model::Embedding>> {
             self.0.embed(texts).await
         }
     }
@@ -147,8 +158,14 @@ async fn opening_with_a_different_embedder_errors() {
     .unwrap_err();
     let message = err.to_string();
     assert!(message.contains("built with embed model"), "got: {message}");
-    assert!(message.contains("mock"), "names the recorded model: {message}");
-    assert!(message.contains("other-model"), "names the session model: {message}");
+    assert!(
+        message.contains("mock"),
+        "names the recorded model: {message}"
+    );
+    assert!(
+        message.contains("other-model"),
+        "names the session model: {message}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -182,7 +199,12 @@ async fn separable_context(model: Arc<MockModel>) -> SessionContext {
 }
 
 async fn matching_ids(ctx: &SessionContext, sql: &str) -> Vec<i64> {
-    let batches: Vec<RecordBatch> = semcast::sql(ctx, sql).await.unwrap().collect().await.unwrap();
+    let batches: Vec<RecordBatch> = semcast::sql(ctx, sql)
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
     let mut ids: Vec<i64> = batches
         .iter()
         .flat_map(|b| {
@@ -379,4 +401,133 @@ async fn create_on_plain_datafusion_context_is_a_clear_error() {
         .await
         .unwrap_err();
     assert!(err.to_string().contains("semcast_context"), "got: {err}");
+}
+
+// ---------------------------------------------------------------------------
+// WITH RECALL (roadmap step 3): calibration with the index at the *default*
+// floor (0.35) so a calibrated floor visibly changes what survives. Against
+// the query 'sync', doc 1 scores 1.0 and the long doc 2 ~0.87 — the default
+// floor keeps both, a calibrated one only doc 1.
+//
+// Doc sizes are load-bearing for the call counts. Doc 1 is a single chunk,
+// so its chunked-verify input equals its full text — the same cache key its
+// calibration label wrote, making its verify free. Doc 2 spans multiple
+// chunks, so if it survives to verify, that's a separately-keyed (and
+// therefore countable) model call.
+// ---------------------------------------------------------------------------
+
+async fn calibration_context(model: Arc<MockModel>) -> SessionContext {
+    let long_doc = "abcdefghijkl ".repeat(800); // ≫ one 384-word chunk
+    let ctx = semcast_context(model);
+    ctx.sql(&format!(
+        "CREATE TABLE meetings AS
+         SELECT * FROM (VALUES
+             (1, 'a', 'sync'),
+             (2, 'b', '{long_doc}'),
+             (3, 'c', CAST(NULL AS VARCHAR))
+         ) AS t(meeting_id, title, transcript)",
+    ))
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    create_semantic_index(&ctx, "meetings", "transcript", index_options(&dir))
+        .await
+        .unwrap();
+    // Leak the tempdir so the Lance dataset outlives this helper.
+    std::mem::forget(dir);
+    ctx
+}
+
+const CALIBRATED_QUERY: &str =
+    "SELECT meeting_id FROM meetings WHERE transcript MEANS 'sync' WITH RECALL 0.9";
+
+#[tokio::test]
+async fn calibration_raises_the_floor_and_prunes_the_near_miss() {
+    let model = Arc::new(MockModel::answering_yes_to(["sync"]));
+    let ctx = calibration_context(Arc::clone(&model)).await;
+
+    let embeds_before = model.embed_calls();
+    assert_eq!(matching_ids(&ctx, CALIBRATED_QUERY).await, vec![1]);
+    // 2 label calls (docs 1 and 2, full text); doc 1's verify hits the
+    // cache entry its label wrote. Doc 2 scores ~0.87 — above the default
+    // floor, below the calibrated one (1.0, doc 1's score) — so it never
+    // reaches verify; surviving would cost a countable third call.
+    assert_eq!(model.completion_calls(), 2);
+    assert_eq!(
+        model.embed_calls() - embeds_before,
+        1,
+        "calibration reuses the query's single wide search",
+    );
+}
+
+#[tokio::test]
+async fn repeat_calibrated_query_costs_zero_new_completions() {
+    let model = Arc::new(MockModel::answering_yes_to(["sync"]));
+    let ctx = calibration_context(Arc::clone(&model)).await;
+
+    assert_eq!(matching_ids(&ctx, CALIBRATED_QUERY).await, vec![1]);
+    let calls = model.completion_calls();
+    assert_eq!(matching_ids(&ctx, CALIBRATED_QUERY).await, vec![1]);
+    assert_eq!(
+        model.completion_calls(),
+        calls,
+        "labels and verdicts are both served from the cache",
+    );
+}
+
+#[tokio::test]
+async fn unindexed_rows_still_pass_through_under_recall() {
+    let model = Arc::new(MockModel::answering_yes_to(["sync"]));
+    let ctx = calibration_context(Arc::clone(&model)).await;
+
+    // Inserted after the index was built — never indexed.
+    ctx.sql("INSERT INTO meetings VALUES (4, 'd', 'big sync news')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    assert_eq!(matching_ids(&ctx, CALIBRATED_QUERY).await, vec![1, 4]);
+    // 3 labels (docs 1, 2, 4); every verify is then free — doc 1's chunk
+    // equals its full text, and doc 4's passthrough verify is full text,
+    // the same cache key its label wrote. Doc 2 is pruned.
+    assert_eq!(model.completion_calls(), 3);
+}
+
+#[tokio::test]
+async fn all_negative_sample_falls_back_to_the_default_floor() {
+    let model = Arc::new(MockModel::answering_yes_to(["nothing matches this"]));
+    let ctx = calibration_context(Arc::clone(&model)).await;
+
+    assert_eq!(
+        matching_ids(&ctx, CALIBRATED_QUERY).await,
+        Vec::<i64>::new()
+    );
+    // With no positives the floor stays at the default 0.35, which both
+    // docs clear: 2 labels + doc 2's multi-chunk verify (doc 1's verify is
+    // a cache hit). A wrongly raised floor would prune doc 2 → 2 calls.
+    assert_eq!(model.completion_calls(), 3);
+}
+
+#[tokio::test]
+async fn calibrated_plan_explains_the_contract_not_a_number() {
+    let model = Arc::new(MockModel::answering_yes_to(["sync"]));
+    let ctx = calibration_context(model).await;
+
+    let plan = semcast::sql(&ctx, CALIBRATED_QUERY)
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
+    let display = displayable(plan.as_ref()).indent(true).to_string();
+    assert!(
+        display.contains("floor=calibrated(recall≥0.90, sample≤64)"),
+        "plan:\n{display}",
+    );
+    assert!(!display.contains("best-effort"), "plan:\n{display}");
 }

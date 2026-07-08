@@ -91,13 +91,39 @@ impl OptimizerRule for MeansRewriteRule {
             None => Arc::unwrap_or_clone(filter.input),
         };
         for call in semantic {
-            let (text, condition) = destructure_means(call)?;
+            let (text, condition, recall) = destructure_means(call)?;
             rewritten = LogicalPlan::Extension(Extension {
-                node: Arc::new(SemFilterNode::new(rewritten, text, condition, None)),
+                node: Arc::new(SemFilterNode::new(rewritten, text, condition, recall)),
             });
         }
         Ok(Transformed::yes(rewritten))
     }
+}
+
+/// Attach a statement-level `WITH RECALL` target to every `means()` call in
+/// the plan, as a third literal argument the rewrite reads back out. Zero
+/// calls is a user mistake, not a no-op.
+pub fn apply_recall(plan: LogicalPlan, recall: f64) -> Result<LogicalPlan> {
+    let mut rewrites = 0usize;
+    let transformed = plan.transform_up(|plan| {
+        plan.map_expressions(|expr| {
+            expr.transform_up(|expr| match expr {
+                Expr::ScalarFunction(mut call)
+                    if call.func.name() == MEANS_UDF_NAME && call.args.len() == 2 =>
+                {
+                    call.args
+                        .push(Expr::Literal(ScalarValue::Float64(Some(recall)), None));
+                    rewrites += 1;
+                    Ok(Transformed::yes(Expr::ScalarFunction(call)))
+                }
+                other => Ok(Transformed::no(other)),
+            })
+        })
+    })?;
+    if rewrites == 0 {
+        return plan_err!("WITH RECALL requires a MEANS predicate in the statement");
+    }
+    Ok(transformed.data)
 }
 
 fn is_means_call(expr: &Expr) -> bool {
@@ -108,13 +134,13 @@ fn contains_means(expr: &Expr) -> Result<bool> {
     expr.exists(|e| Ok(is_means_call(e)))
 }
 
-/// Pull `(text_expr, condition)` out of a validated `means(..)` call.
-fn destructure_means(expr: Expr) -> Result<(Expr, String)> {
+/// Pull `(text_expr, condition, recall)` out of a validated `means(..)` call.
+fn destructure_means(expr: Expr) -> Result<(Expr, String, Option<f64>)> {
     let Expr::ScalarFunction(ScalarFunction { args, .. }) = expr else {
         unreachable!("caller checked is_means_call");
     };
-    if args.len() != 2 {
-        return plan_err!("means() takes exactly 2 arguments, got {}", args.len());
+    if !(2..=3).contains(&args.len()) {
+        return plan_err!("means() takes 2 or 3 arguments, got {}", args.len());
     }
     let mut args = args.into_iter();
     let text = args.next().expect("length checked above");
@@ -129,5 +155,17 @@ fn destructure_means(expr: Expr) -> Result<(Expr, String)> {
             );
         }
     };
-    Ok((text, condition))
+    let recall = match args.next() {
+        None => None,
+        // Re-validated here because direct means() callers bypass the
+        // WITH RECALL parser's range check.
+        Some(Expr::Literal(ScalarValue::Float64(Some(r)), _)) if r > 0.0 && r <= 1.0 => Some(r),
+        Some(other) => {
+            return plan_err!(
+                "the third argument of means() must be a recall target in (0, 1] \
+                 as a float literal, got: {other}"
+            );
+        }
+    };
+    Ok((text, condition, recall))
 }
