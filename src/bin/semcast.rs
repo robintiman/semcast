@@ -34,7 +34,7 @@ struct ServeArgs {
     #[arg(long, default_value_t = 5433)]
     port: u16,
     /// Ollama chat model used to verify MEANS predicates.
-    #[arg(long, default_value = "llama3.2")]
+    #[arg(long, default_value = "gemma4:31b")]
     model: String,
     /// Ollama embedding model used by semantic indexes.
     #[arg(long, default_value = semcast::model::DEFAULT_EMBED_MODEL)]
