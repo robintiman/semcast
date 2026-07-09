@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use clap::{Args, Parser, Subcommand};
 use semcast::SemcastContextBuilder;
-use semcast::model::{MockModel, ModelProvider, OllamaProvider};
+use semcast::model::{ModelProvider, OllamaProvider};
 use semcast::server::{QueryEngine, serve};
 
 #[derive(Parser)]
@@ -44,10 +44,6 @@ struct ServeArgs {
     /// Where semantic indexes are stored; temp dir if unset.
     #[arg(long)]
     index_dir: Option<PathBuf>,
-    /// Serve without a model: a mock answers yes to rows containing any of
-    /// these comma-separated substrings (no value = yes to nothing).
-    #[arg(long, num_args = 0..=1, default_missing_value = "", value_name = "SUBSTRINGS")]
-    mock: Option<String>,
 }
 
 #[tokio::main]
@@ -56,16 +52,11 @@ async fn main() -> std::io::Result<()> {
         command: Command::Serve(args),
     } = Cli::parse();
 
-    let model: Arc<dyn ModelProvider> = match &args.mock {
-        Some(needles) => Arc::new(MockModel::answering_yes_to(
-            needles.split(',').map(str::trim).filter(|n| !n.is_empty()),
-        )),
-        None => Arc::new(
-            OllamaProvider::new(&args.model)
-                .with_base_url(&args.ollama_url)
-                .with_embed_model(&args.embed_model),
-        ),
-    };
+    let model: Arc<dyn ModelProvider> = Arc::new(
+        OllamaProvider::new(&args.model)
+            .with_base_url(&args.ollama_url)
+            .with_embed_model(&args.embed_model),
+    );
 
     let mut builder = SemcastContextBuilder::new(model).with_information_schema(true);
     if let Some(dir) = &args.index_dir {
