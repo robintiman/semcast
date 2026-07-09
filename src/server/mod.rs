@@ -24,7 +24,7 @@ pub async fn serve(listener: TcpListener, engine: Arc<QueryEngine>) -> std::io::
         let handler = SemcastServer::new(Arc::clone(&engine));
         tokio::spawn(async move {
             if let Err(error) = pgwire::tokio::process_socket(socket, None, handler).await {
-                eprintln!("semcast: connection error: {error}");
+                tracing::error!("semcast: connection error: {error}");
             }
         });
     }

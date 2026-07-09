@@ -25,7 +25,8 @@ use semcast::semcast_context;
 
 #[tokio::main]
 async fn main() -> datafusion::error::Result<()> {
-    let model: Arc<dyn ModelProvider> = Arc::new(OllamaProvider::new("gemma4:31b")); // embeds with nomic-embed-text
+    semcast::telemetry::init();
+    let model: Arc<dyn ModelProvider> = Arc::new(OllamaProvider::new("gemma4:e4b")); // embeds with nomic-embed-text
     let ctx = semcast_context(model);
 
     // Mount the CSV as an external table; paths resolve from the repo root.

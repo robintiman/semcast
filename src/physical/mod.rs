@@ -4,6 +4,7 @@
 pub mod extract;
 pub mod index_scan;
 pub mod planner;
+pub mod trace;
 pub mod verify;
 
 pub use extract::SemExtractExec;

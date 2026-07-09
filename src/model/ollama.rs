@@ -71,6 +71,13 @@ impl OllamaProvider {
                 num_predict: request.max_tokens,
             },
         };
+        tracing::debug!(
+            target: "semcast::model",
+            model = %self.model,
+            system = %request.system,
+            input = %request.input,
+            "llm request"
+        );
         let response = self
             .client
             .post(format!("{}/api/chat", self.base_url))
@@ -84,6 +91,14 @@ impl OllamaProvider {
             .json()
             .await
             .map_err(|e| SemcastError::Model(format!("invalid ollama response: {e}")))?;
+        tracing::debug!(
+            target: "semcast::model",
+            model = %self.model,
+            input_tokens = chat.prompt_eval_count,
+            output_tokens = chat.eval_count,
+            response = %chat.message.content,
+            "llm response"
+        );
         Ok(Completion {
             text: chat.message.content,
             input_tokens: chat.prompt_eval_count,

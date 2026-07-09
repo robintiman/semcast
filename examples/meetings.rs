@@ -14,6 +14,7 @@ use semcast::semcast_context;
 
 #[tokio::main]
 async fn main() -> datafusion::error::Result<()> {
+    semcast::telemetry::init();
     // One mock answers both surfaces: the yes/no `MEANS` verdict (via the
     // "offline sync" needle) and typed extraction (a JSON object keyed on the
     // transcript's content).

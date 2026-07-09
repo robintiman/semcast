@@ -30,6 +30,7 @@ pub mod physical;
 #[cfg(feature = "server")]
 pub mod server;
 pub mod sql;
+pub mod telemetry;
 pub mod types;
 
 pub use error::{Result, SemcastError};

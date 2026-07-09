@@ -51,9 +51,15 @@ impl QueryPlanner for SemcastQueryPlanner {
                 cache: Arc::clone(&self.cache),
             },
         )]);
-        planner
+        let plan = planner
             .create_physical_plan(logical_plan, session_state)
-            .await
+            .await?;
+        tracing::info!(
+            target: "semcast::plan",
+            "optimised plan:\n{}",
+            datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
+        );
+        Ok(plan)
     }
 }
 

@@ -168,10 +168,15 @@ impl ExecutionPlan for SemExtractExec {
             let extractor = Arc::clone(&extractor);
             async move { extractor.extract_batch(batch).await }
         });
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
+        let output = Box::pin(RecordBatchStreamAdapter::new(
             Arc::clone(&self.output_schema),
             stream,
-        )))
+        ));
+        Ok(crate::physical::trace::trace_stage(
+            "SemExtractExec",
+            partition,
+            output,
+        ))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {

@@ -229,10 +229,12 @@ impl ExecutionPlan for IndexScanExec {
                 })
                 .boxed()
         };
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            self.input.schema(),
-            stream,
-        )))
+        let output = Box::pin(RecordBatchStreamAdapter::new(self.input.schema(), stream));
+        Ok(crate::physical::trace::trace_stage(
+            "IndexScanExec",
+            partition,
+            output,
+        ))
     }
 
     /// At most `fetch_k` distinct documents survive the vector scan; Inexact

@@ -224,10 +224,8 @@ impl ExecutionPlan for VerifyExec {
             let verifier = Arc::clone(&verifier);
             async move { verifier.verify_batch(batch).await }
         });
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            self.input.schema(),
-            stream,
-        )))
+        let output = Box::pin(RecordBatchStreamAdapter::new(self.input.schema(), stream));
+        Ok(crate::physical::trace::trace_stage("VerifyExec", partition, output))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {

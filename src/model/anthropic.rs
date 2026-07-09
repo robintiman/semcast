@@ -54,6 +54,13 @@ impl AnthropicProvider {
 
     async fn complete_one(&self, request: CompletionRequest) -> Result<Completion> {
         let body = request_body(&self.model, &request);
+        tracing::debug!(
+            target: "semcast::model",
+            model = %self.model,
+            system = %request.system,
+            input = %request.input,
+            "llm request"
+        );
         let response = self
             .client
             .post(format!("{}/v1/messages", self.base_url))
@@ -94,6 +101,14 @@ impl AnthropicProvider {
             .ok_or_else(|| {
                 SemcastError::Model("anthropic response contained no text block".to_owned())
             })?;
+        tracing::debug!(
+            target: "semcast::model",
+            model = %self.model,
+            input_tokens = message.usage.input_tokens,
+            output_tokens = message.usage.output_tokens,
+            response = %text,
+            "llm response"
+        );
         Ok(Completion {
             text,
             input_tokens: message.usage.input_tokens,

@@ -48,6 +48,7 @@ struct ServeArgs {
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
+    semcast::telemetry::init();
     let Cli {
         command: Command::Serve(args),
     } = Cli::parse();
@@ -65,7 +66,7 @@ async fn main() -> std::io::Result<()> {
     let engine = Arc::new(QueryEngine::new(Arc::new(builder.build())));
 
     let listener = tokio::net::TcpListener::bind((args.host.as_str(), args.port)).await?;
-    println!(
+    tracing::info!(
         "semcast: listening on {} — connect with: psql -h {} -p {}",
         listener.local_addr()?,
         args.host,
