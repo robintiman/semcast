@@ -7,5 +7,6 @@
 //! under a recall target ([`calibrate`]).
 
 pub mod calibrate;
+pub mod extract;
 pub mod funnel;
 pub mod rewrite;

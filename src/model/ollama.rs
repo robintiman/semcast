@@ -64,6 +64,9 @@ impl OllamaProvider {
             // `num_predict` budget and leave `content` empty; disabling it
             // yields the bare "yes"/"no" and is ignored by plain models.
             think: false,
+            // Ollama's native structured-output field: a JSON Schema the model
+            // is constrained to. Absent for `MEANS` verdicts (free-form).
+            format: request.schema.as_ref(),
             options: ChatOptions {
                 num_predict: request.max_tokens,
             },
@@ -133,6 +136,8 @@ struct ChatRequest<'a> {
     messages: Vec<ChatMessage<'a>>,
     stream: bool,
     think: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    format: Option<&'a serde_json::Value>,
     options: ChatOptions,
 }
 
@@ -198,5 +203,29 @@ mod tests {
         let parsed: EmbedResponse = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.embeddings.len(), 2);
         assert_eq!(parsed.embeddings[0], vec![0.1, -0.2]);
+    }
+
+    fn chat_request<'a>(format: Option<&'a serde_json::Value>) -> ChatRequest<'a> {
+        ChatRequest {
+            model: "gemma4:31b",
+            messages: vec![],
+            stream: false,
+            think: false,
+            format,
+            options: ChatOptions { num_predict: 8 },
+        }
+    }
+
+    #[test]
+    fn chat_request_omits_format_when_absent() {
+        let body = serde_json::to_value(chat_request(None)).unwrap();
+        assert!(body.get("format").is_none(), "no format key when free-form");
+    }
+
+    #[test]
+    fn chat_request_serializes_schema_as_format() {
+        let schema = serde_json::json!({"type": "object"});
+        let body = serde_json::to_value(chat_request(Some(&schema))).unwrap();
+        assert_eq!(body["format"], schema);
     }
 }

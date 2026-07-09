@@ -1,8 +1,9 @@
 //! The README walk-through, as far as the roadmap takes it: a semantic
 //! index built with `CREATE SEMANTIC INDEX`, a `MEANS` filter with a
 //! `WITH RECALL` target that plans the derived funnel — free predicates,
-//! calibrated index pre-filter, chunk-fed verify — against the
-//! deterministic mock model, so it runs without any setup.
+//! calibrated index pre-filter, chunk-fed verify — then `CREATE SEMANTIC
+//! TYPE` + `CAST(... AS MeetingFacts)` typed extraction stacked above the
+//! funnel. All against the deterministic mock, so it runs without setup.
 //!
 //! Run with: `cargo run --example meetings`
 
@@ -13,7 +14,28 @@ use semcast::semcast_context;
 
 #[tokio::main]
 async fn main() -> datafusion::error::Result<()> {
-    let ctx = semcast_context(Arc::new(MockModel::answering_yes_to(["offline sync"])));
+    // One mock answers both surfaces: the yes/no `MEANS` verdict (via the
+    // "offline sync" needle) and typed extraction (a JSON object keyed on the
+    // transcript's content).
+    let model = Arc::new(
+        MockModel::answering_json_with(|req| {
+            let stage = if req.input.contains("agreed to ship") {
+                "shipped"
+            } else if req.input.contains("future idea") {
+                "idea"
+            } else {
+                "none"
+            };
+            serde_json::json!({
+                "launch_stage": stage,
+                "stage_quote": "the transcript line that shows the stage",
+                "products": ["offline sync"],
+                "decisions": [],
+            })
+        })
+        .also_answering_yes_to(["offline sync"]),
+    );
+    let ctx = semcast_context(model);
 
     // Transcript 1 runs long enough (>384 words) to be split into several
     // chunks, so the verify stage demonstrably reads excerpts, not the
@@ -68,6 +90,48 @@ async fn main() -> datafusion::error::Result<()> {
 
     println!("Results:");
     df.show().await?;
+
+    // ── Typed extraction ────────────────────────────────────────────────
+    // A semantic type names a recurring extraction; the planner synthesizes
+    // the prompt, constrains decoding to the schema, and turns the extracted
+    // columns into ordinary SQL. `TOGETHER` co-generates the launch stage and
+    // its evidence.
+    semcast::sql(
+        &ctx,
+        "CREATE SEMANTIC TYPE MeetingFacts AS (
+             products  TEXT[]   'product names discussed in this meeting',
+             decisions TEXT[]   'concrete decisions that were made',
+             TOGETHER (
+                 launch_stage ONEOF(none, idea, planned, scheduled, shipped)
+                              'the furthest launch stage discussed',
+                 stage_quote  TEXT 'the transcript line that shows that stage'
+             )
+         )",
+    )
+    .await?
+    .collect()
+    .await?;
+
+    // Extraction runs *after* the funnel: `SemExtract` sits above the
+    // `SemFilter`, so only the rows surviving the date predicate and the
+    // `MEANS` filter are ever extracted. Only `launch_stage` is referenced, so
+    // field pushdown generates just it and its `TOGETHER` sibling.
+    let typed = semcast::sql(
+        &ctx,
+        "SELECT meeting_id, CAST(transcript AS MeetingFacts).launch_stage AS launch_stage
+         FROM meetings
+         WHERE held_at >= CAST('2026-01-01' AS TIMESTAMP)
+           AND transcript MEANS 'offline sync'
+         ORDER BY meeting_id",
+    )
+    .await?;
+
+    println!(
+        "\nTyped extraction — optimized plan (SemExtract above the funnel):\n{}\n",
+        typed.clone().into_optimized_plan()?.display_indent()
+    );
+    println!("Extracted results:");
+    typed.show().await?;
 
     Ok(())
 }

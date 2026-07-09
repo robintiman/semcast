@@ -19,11 +19,11 @@ use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, Phy
 use crate::cache::SemanticCache;
 use crate::index::SemanticIndex;
 use crate::index::registry::SemcastRuntime;
-use crate::logical::SemFilterNode;
+use crate::logical::{SemExtractNode, SemFilterNode};
 use crate::model::ModelProvider;
 use crate::optimizer::calibrate::DEFAULT_CALIBRATION_SAMPLE;
-use crate::physical::VerifyExec;
 use crate::physical::index_scan::{CalibrationConfig, ChunkEvidence, IndexScanExec};
+use crate::physical::{SemExtractExec, VerifyExec};
 
 /// The default DataFusion planner plus semcast extension planning.
 #[derive(Debug)]
@@ -122,6 +122,21 @@ impl ExtensionPlanner for SemcastExtensionPlanner {
                 Arc::clone(&self.model),
                 Arc::clone(&self.cache),
             ))));
+        }
+        if let Some(extract) = node.as_any().downcast_ref::<SemExtractNode>() {
+            let source = planner.create_physical_expr(
+                &extract.source,
+                logical_inputs[0].schema(),
+                session_state,
+            )?;
+            return Ok(Some(Arc::new(SemExtractExec::new(
+                Arc::clone(&physical_inputs[0]),
+                source,
+                extract.target.clone(),
+                extract.id,
+                Arc::clone(&self.model),
+                Arc::clone(&self.cache),
+            )?)));
         }
         Ok(None)
     }

@@ -335,9 +335,10 @@ Early / experimental. Order of attack:
 1. ~~`MEANS` logical operator + verify-only physical plan~~ **done**
 2. ~~`CREATE SEMANTIC INDEX` on Lance + the index pre-filter stage~~ **done**
 3. ~~`WITH RECALL` — sampled threshold calibration~~ **done**
-4. Semantic types — `CREATE SEMANTIC TYPE`, `EXTRACT`/`CAST`, constrained
-   decoding, field pushdown; the fields that make per-field caching possible
-   — **next**
+4. ~~Semantic types — `CREATE SEMANTIC TYPE`, `EXTRACT`/`CAST`, constrained
+   decoding, field pushdown; the fields that make per-field caching possible~~
+   **done**; nested types, `CREATE SEMANTIC PREDICATE`, and `LEVEL` ordering
+   still open
 5. Field-level cache with provenance keys — **in-memory done**; persistent,
    cross-session cache on disk
 6. Eval harness: labeled corpus, reporting **calls saved and recall** against

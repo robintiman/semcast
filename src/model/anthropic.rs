@@ -53,12 +53,7 @@ impl AnthropicProvider {
     }
 
     async fn complete_one(&self, request: CompletionRequest) -> Result<Completion> {
-        let body = json!({
-            "model": self.model,
-            "max_tokens": request.max_tokens,
-            "system": request.system,
-            "messages": [{"role": "user", "content": request.input}],
-        });
+        let body = request_body(&self.model, &request);
         let response = self
             .client
             .post(format!("{}/v1/messages", self.base_url))
@@ -105,6 +100,26 @@ impl AnthropicProvider {
             output_tokens: message.usage.output_tokens,
         })
     }
+}
+
+/// The Messages API request body. When `request.schema` is present, adds the
+/// structured-output surface: `output_config.format` with `type: json_schema`.
+/// The schema is a single JSON object with `additionalProperties: false` and
+/// every field `required` (both demanded by the API); it carries no numeric
+/// bounds, so `RealBounded` ranges are validated client-side at decode time.
+fn request_body(model: &str, request: &CompletionRequest) -> serde_json::Value {
+    let mut body = json!({
+        "model": model,
+        "max_tokens": request.max_tokens,
+        "system": request.system,
+        "messages": [{"role": "user", "content": request.input}],
+    });
+    if let Some(schema) = &request.schema {
+        body["output_config"] = json!({
+            "format": {"type": "json_schema", "schema": schema},
+        });
+    }
+    body
 }
 
 // Manual impl: never print the API key.
@@ -204,5 +219,33 @@ mod tests {
         let provider = AnthropicProvider::new("sk-ant-secret", DEFAULT_ANTHROPIC_MODEL);
         let debug = format!("{provider:?}");
         assert!(!debug.contains("secret"), "{debug}");
+    }
+
+    #[test]
+    fn request_body_without_schema_has_no_output_config() {
+        let request = CompletionRequest {
+            system: "sys".to_owned(),
+            input: "in".to_owned(),
+            max_tokens: 8,
+            schema: None,
+        };
+        let body = request_body("claude-haiku-4-5", &request);
+        assert_eq!(body["model"], "claude-haiku-4-5");
+        assert_eq!(body["system"], "sys");
+        assert!(body.get("output_config").is_none());
+    }
+
+    #[test]
+    fn request_body_with_schema_injects_json_schema_format() {
+        let schema = json!({"type": "object", "properties": {"stage": {"type": "string"}}});
+        let request = CompletionRequest {
+            system: "sys".to_owned(),
+            input: "in".to_owned(),
+            max_tokens: 2048,
+            schema: Some(schema.clone()),
+        };
+        let body = request_body("claude-haiku-4-5", &request);
+        assert_eq!(body["output_config"]["format"]["type"], "json_schema");
+        assert_eq!(body["output_config"]["format"]["schema"], schema);
     }
 }

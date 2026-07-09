@@ -20,11 +20,16 @@ pub struct FunnelCounts {
     pub model_calls: usize,
     pub cache_hits: usize,
     pub rows_dropped: usize,
+    pub has_extract: bool,
+    pub extract_model_calls: usize,
+    pub extract_cache_hits: usize,
+    pub extract_rows_failed: usize,
+    pub extract_fields_failed: usize,
 }
 
 impl FunnelCounts {
     pub fn is_semantic(&self) -> bool {
-        self.has_index_scan || self.has_verify
+        self.has_index_scan || self.has_verify || self.has_extract
     }
 }
 
@@ -64,6 +69,15 @@ pub fn snapshot(plan: &Arc<dyn ExecutionPlan>) -> FunnelCounts {
                     counts.model_calls += counter_total(&metrics, "model_calls");
                     counts.cache_hits += counter_total(&metrics, "cache_hits");
                     counts.rows_dropped += counter_total(&metrics, "rows_dropped");
+                }
+            }
+            "SemExtractExec" => {
+                counts.has_extract = true;
+                if let Some(metrics) = metrics {
+                    counts.extract_model_calls += counter_total(&metrics, "model_calls");
+                    counts.extract_cache_hits += counter_total(&metrics, "cache_hits");
+                    counts.extract_rows_failed += counter_total(&metrics, "rows_failed");
+                    counts.extract_fields_failed += counter_total(&metrics, "fields_failed");
                 }
             }
             _ => unreachable!("semcast_nodes returns only semcast operators"),
@@ -113,6 +127,15 @@ fn render(counts: &FunnelCounts) -> String {
             counts.model_calls, counts.cache_hits, counts.rows_dropped,
         ));
     }
+    if counts.has_extract {
+        parts.push(format!(
+            "extract: {} model calls, {} cache hits, {} rows failed, {} fields failed",
+            counts.extract_model_calls,
+            counts.extract_cache_hits,
+            counts.extract_rows_failed,
+            counts.extract_fields_failed,
+        ));
+    }
     parts.join("; ")
 }
 
@@ -123,7 +146,10 @@ fn semcast_nodes(plan: &Arc<dyn ExecutionPlan>) -> Vec<Arc<dyn ExecutionPlan>> {
 }
 
 fn collect(plan: &Arc<dyn ExecutionPlan>, out: &mut Vec<Arc<dyn ExecutionPlan>>) {
-    if matches!(plan.name(), "IndexScanExec" | "VerifyExec") {
+    if matches!(
+        plan.name(),
+        "IndexScanExec" | "VerifyExec" | "SemExtractExec"
+    ) {
         out.push(Arc::clone(plan));
     }
     for child in plan.children() {

@@ -39,6 +39,10 @@ pub struct CompletionRequest {
     /// The text under scrutiny — a transcript, or its top-scoring chunks.
     pub input: String,
     pub max_tokens: usize,
+    /// JSON Schema for a single JSON object the model must return — the
+    /// constrained-decoding contract for typed extraction. `None` is today's
+    /// free-form behavior (a `MEANS` yes/no verdict).
+    pub schema: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]

@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::model::ModelProvider;
+use crate::types::registry::TypeRegistry;
 
 use super::SemanticIndex;
 
@@ -19,6 +20,9 @@ pub struct SemcastRuntime {
     /// Registered indexes keyed by `(table, column)`. Resolution is exact:
     /// a same-named column on a different table never borrows an index.
     indexes: Mutex<HashMap<(String, String), Arc<dyn SemanticIndex>>>,
+    /// `CREATE SEMANTIC TYPE` definitions. Shared with the marker UDFs, which
+    /// resolve a type's fields at plan time — hence an `Arc`, not inline.
+    types: Arc<TypeRegistry>,
 }
 
 impl SemcastRuntime {
@@ -27,7 +31,20 @@ impl SemcastRuntime {
             model,
             index_root: std::env::temp_dir().join("semcast-indexes"),
             indexes: Mutex::new(HashMap::new()),
+            types: Arc::new(TypeRegistry::default()),
         }
+    }
+
+    /// Share the type registry with a caller-provided `Arc` — the builder
+    /// creates one registry and hands the same handle to the marker UDFs.
+    pub fn with_type_registry(mut self, types: Arc<TypeRegistry>) -> Self {
+        self.types = types;
+        self
+    }
+
+    /// The session's semantic type registry.
+    pub fn type_registry(&self) -> &Arc<TypeRegistry> {
+        &self.types
     }
 
     /// Store Lance datasets under `root` instead of the temp-dir default.

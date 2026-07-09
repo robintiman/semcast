@@ -294,6 +294,7 @@ impl Verifier {
                 system: prompt.clone(),
                 input: input.clone(),
                 max_tokens: 8,
+                schema: None,
             });
             pending.push((row, input));
         }

@@ -71,6 +71,7 @@ async fn mock_model_is_deterministic() {
         system: "does this meeting discuss the condition?".into(),
         input: input.into(),
         max_tokens: 4,
+        schema: None,
     };
 
     let answers = model

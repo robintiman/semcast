@@ -14,13 +14,15 @@
 
 use datafusion::sql::sqlparser::ast::{
     Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, Ident,
-    ObjectName,
+    ObjectName, Value,
 };
 use datafusion::sql::sqlparser::dialect::{Dialect, GenericDialect, Precedence};
 use datafusion::sql::sqlparser::keywords::Keyword;
 use datafusion::sql::sqlparser::parser::{Parser, ParserError};
 use datafusion::sql::sqlparser::tokenizer::Token;
 
+use crate::sql::ddl::parse_field_type;
+use crate::sql::extract_udf::SEM_EXTRACT_INLINE_UDF_NAME;
 use crate::sql::means_udf::MEANS_UDF_NAME;
 
 /// Forward `fn(&self) -> bool` feature flags to the wrapped [`GenericDialect`]
@@ -52,6 +54,68 @@ fn peek_is_means(parser: &Parser) -> bool {
     }
 }
 
+/// Is the next token the unquoted word `word` (keyword status aside)?
+fn peek_is_word(parser: &Parser, word: &str) -> bool {
+    matches!(
+        &parser.peek_token_ref().token,
+        Token::Word(w) if w.quote_style.is_none() && w.value.eq_ignore_ascii_case(word)
+    )
+}
+
+/// Parse `EXTRACT ( field TYPE 'doc' FROM source )` into a
+/// `sem_extract_inline(source, 'field', '<typespec>', 'doc')` call. Errors
+/// (including a plain `EXTRACT(part FROM ts)`) make `maybe_parse` backtrack.
+fn parse_inline_extract(parser: &mut Parser) -> Result<Expr, ParserError> {
+    parser.next_token(); // EXTRACT
+    parser.expect_token(&Token::LParen)?;
+    let field = parser.parse_identifier()?;
+    // The field type has no registry here, so serialize it to its canonical
+    // string; the optimizer parses it back with the shared DDL parser.
+    let field_type =
+        parse_field_type(parser).map_err(|e| ParserError::ParserError(e.to_string()))?;
+    let doc = match parser.next_token().token {
+        Token::SingleQuotedString(s) => s,
+        other => {
+            return Err(ParserError::ParserError(format!(
+                "expected a single-quoted doc string in EXTRACT, got {other}"
+            )));
+        }
+    };
+    if !parser.parse_keyword(Keyword::FROM) {
+        return Err(ParserError::ParserError(
+            "expected FROM in EXTRACT(field TYPE 'doc' FROM source)".to_owned(),
+        ));
+    }
+    let source = parser.parse_expr()?;
+    parser.expect_token(&Token::RParen)?;
+
+    Ok(Expr::Function(Function {
+        name: ObjectName::from(vec![Ident::new(SEM_EXTRACT_INLINE_UDF_NAME)]),
+        uses_odbc_syntax: false,
+        parameters: FunctionArguments::None,
+        args: FunctionArguments::List(FunctionArgumentList {
+            duplicate_treatment: None,
+            args: vec![
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(source)),
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(string_literal(field.value))),
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(string_literal(
+                    field_type.to_string(),
+                ))),
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(string_literal(doc))),
+            ],
+            clauses: vec![],
+        }),
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: vec![],
+    }))
+}
+
+fn string_literal(s: String) -> Expr {
+    Expr::Value(Value::SingleQuotedString(s).with_empty_span())
+}
+
 impl Dialect for SemcastDialect {
     fn is_delimited_identifier_start(&self, ch: char) -> bool {
         self.generic.is_delimited_identifier_start(ch)
@@ -73,6 +137,23 @@ impl Dialect for SemcastDialect {
             return Some(Ok(self.prec_value(Precedence::Like)));
         }
         None
+    }
+
+    /// Inline `EXTRACT(field TYPE 'doc' FROM source)` — desugared to the
+    /// `sem_extract_inline` marker. Consulted before the standard prefix
+    /// parser, so it must not shadow SQL's `EXTRACT(YEAR FROM ts)`: the semcast
+    /// grammar is attempted under `maybe_parse` (which backtracks), and on any
+    /// mismatch we return `None` to let the default `EXTRACT` path run.
+    fn parse_prefix(&self, parser: &mut Parser) -> Option<Result<Expr, ParserError>> {
+        if !peek_is_word(parser, "EXTRACT") {
+            return None;
+        }
+        match parser.maybe_parse(parse_inline_extract) {
+            Ok(Some(expr)) => Some(Ok(expr)),
+            // Not the semcast grammar — fall back to standard EXTRACT parsing.
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
     }
 
     fn parse_infix(
@@ -239,6 +320,31 @@ mod tests {
         assert_eq!(
             parse("SELECT a, count(*) FROM t WHERE a LIKE 'x%' GROUP BY 1 + 1"),
             "SELECT a, count(*) FROM t WHERE a LIKE 'x%' GROUP BY 1 + 1"
+        );
+    }
+
+    #[test]
+    fn inline_extract_desugars_to_sem_extract_inline() {
+        assert_eq!(
+            parse("SELECT EXTRACT(products TEXT[] 'product names' FROM transcript) FROM meetings"),
+            "SELECT sem_extract_inline(transcript, 'products', 'TEXT[]', 'product names') \
+             FROM meetings"
+        );
+    }
+
+    #[test]
+    fn inline_extract_carries_oneof_typespec() {
+        assert_eq!(
+            parse("SELECT EXTRACT(stage ONEOF(none, shipped) 'the stage' FROM t) FROM m"),
+            "SELECT sem_extract_inline(t, 'stage', 'ONEOF(none,shipped)', 'the stage') FROM m"
+        );
+    }
+
+    #[test]
+    fn standard_extract_still_parses() {
+        assert_eq!(
+            parse("SELECT EXTRACT(YEAR FROM ts) FROM t"),
+            "SELECT EXTRACT(YEAR FROM ts) FROM t"
         );
     }
 

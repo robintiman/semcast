@@ -488,6 +488,7 @@ impl Scanner {
                         system: prompt.clone(),
                         input: text.clone(),
                         max_tokens: 8,
+                        schema: None,
                     });
                 }
             }

@@ -87,13 +87,30 @@ pub async fn sql(ctx: &SessionContext, query: &str) -> Result<DataFrame> {
                 let no_rows = LogicalPlanBuilder::empty(false).build()?;
                 Ok(DataFrame::new(ctx.state(), no_rows))
             }
+            sql::ddl::SemanticDdl::CreateType(ty) => {
+                let runtime = ctx
+                    .state()
+                    .config()
+                    .get_extension::<SemcastRuntime>()
+                    .ok_or_else(|| {
+                        DataFusionError::Plan("semcast runtime is not registered".to_owned())
+                    })?;
+                runtime.type_registry().register(ty)?;
+                let no_rows = LogicalPlanBuilder::empty(false).build()?;
+                Ok(DataFrame::new(ctx.state(), no_rows))
+            }
             other => Err(DataFusionError::Plan(format!(
                 "semantic DDL not implemented yet: {other:?}"
             ))
             .into()),
         };
     }
-    let (statement, recall) = sql::recall::parse_statement_with_recall(query)?;
+    let (mut statement, recall) = sql::recall::parse_statement_with_recall(query)?;
+    // Desugar `CAST(col AS SemanticType)[.field]` into the marker UDFs before
+    // planning — DataFusion can't plan the field access itself.
+    if let Some(runtime) = ctx.state().config().get_extension::<SemcastRuntime>() {
+        sql::typed::rewrite_semantic_casts(&mut statement, runtime.type_registry())?;
+    }
     let mut plan = ctx.state().statement_to_plan(statement).await?;
     if let Some(recall) = recall {
         plan = optimizer::rewrite::apply_recall(plan, recall)?;
@@ -148,7 +165,11 @@ impl SemcastContextBuilder {
     }
 
     pub fn build(self) -> SessionContext {
-        let mut runtime = SemcastRuntime::new(Arc::clone(&self.model));
+        // One type registry, shared between the runtime (DDL dispatch) and the
+        // marker UDFs (which resolve type fields at plan time).
+        let types = Arc::new(crate::types::registry::TypeRegistry::default());
+        let mut runtime =
+            SemcastRuntime::new(Arc::clone(&self.model)).with_type_registry(Arc::clone(&types));
         if let Some(root) = self.index_root {
             runtime = runtime.with_index_root(root);
         }
@@ -159,10 +180,18 @@ impl SemcastContextBuilder {
             .with_default_features()
             .with_config(config)
             .with_optimizer_rule(Arc::new(MeansRewriteRule))
+            .with_optimizer_rule(Arc::new(
+                crate::optimizer::extract::ExtractRewriteRule::new(Arc::clone(&types)),
+            ))
             .with_query_planner(Arc::new(SemcastQueryPlanner::new(self.model, self.cache)))
             .build();
         let ctx = SessionContext::new_with_state(state);
         ctx.register_udf(sql::means_udf::means_udf());
+        // Marker UDFs for typed extraction, sharing the runtime's registry so
+        // they resolve type fields at plan time.
+        for udf in sql::extract_udf::extract_udfs(types) {
+            ctx.register_udf(udf);
+        }
         // Must stay last: it consumes and rebuilds the context (everything
         // registered above carries over via `new_from_existing`).
         ctx.enable_url_table()
