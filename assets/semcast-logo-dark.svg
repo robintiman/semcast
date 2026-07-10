@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 268 72" width="268" height="72" role="img" aria-label="sem::cast">
+  <!-- the :: cast mark — raw (grey) resolves into typed (teal) -->
+  <circle cx="20" cy="27" r="5.2" fill="#8FA39B"/>
+  <circle cx="20" cy="45" r="5.2" fill="#8FA39B"/>
+  <circle cx="37" cy="27" r="5.2" fill="#1FCFB2"/>
+  <circle cx="37" cy="45" r="5.2" fill="#1FCFB2"/>
+  <text x="60" y="48" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="36" font-weight="600" letter-spacing="-0.5">
+    <tspan fill="#E7EEEA">sem</tspan><tspan fill="#1FCFB2">::</tspan><tspan fill="#E7EEEA">cast</tspan>
+  </text>
+</svg>

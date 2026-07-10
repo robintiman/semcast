@@ -10,7 +10,10 @@
 <!-- PROJECT LOGO -->
 <br />
 <div align="center">
-  <h3 align="center">SemCast</h3>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/semcast-logo-dark.svg">
+    <img alt="sem::cast" src="assets/semcast-logo.svg" width="240">
+  </picture>
 
   <p align="center">
     Planner-integrated semantic operators for <a href="https://datafusion.apache.org/">Apache DataFusion</a>.
