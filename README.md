@@ -1,6 +1,65 @@
-# semcast
+<a id="readme-top"></a>
 
-Planner-integrated semantic operators for [Apache DataFusion](https://datafusion.apache.org/).
+<!-- PROJECT SHIELDS -->
+[![Contributors][contributors-shield]][contributors-url]
+[![Forks][forks-shield]][forks-url]
+[![Stargazers][stars-shield]][stars-url]
+[![Issues][issues-shield]][issues-url]
+[![Apache-2.0 License][license-shield]][license-url]
+
+<!-- PROJECT LOGO -->
+<br />
+<div align="center">
+  <h3 align="center">SemCast</h3>
+
+  <p align="center">
+    Planner-integrated semantic operators for <a href="https://datafusion.apache.org/">Apache DataFusion</a>.
+    <br />
+    <a href="#getting-started"><strong>Get started »</strong></a>
+    <br />
+    <br />
+    <a href="https://github.com/robintiman/semcast/issues/new?labels=bug">Report Bug</a>
+    &middot;
+    <a href="https://github.com/robintiman/semcast/issues/new?labels=enhancement">Request Feature</a>
+  </p>
+</div>
+
+<!-- TABLE OF CONTENTS -->
+<details>
+  <summary>Table of Contents</summary>
+  <ol>
+    <li>
+      <a href="#about-the-project">About The Project</a>
+      <ul>
+        <li><a href="#the-idea">The idea</a></li>
+        <li><a href="#where-this-bites">Where this bites</a></li>
+        <li><a href="#built-with">Built With</a></li>
+      </ul>
+    </li>
+    <li>
+      <a href="#getting-started">Getting Started</a>
+      <ul>
+        <li><a href="#prerequisites">Prerequisites</a></li>
+        <li><a href="#installation">Installation</a></li>
+      </ul>
+    </li>
+    <li>
+      <a href="#usage">Usage</a>
+      <ul>
+        <li><a href="#serve-it">Serve it</a></li>
+        <li><a href="#load-data">Load data</a></li>
+      </ul>
+    </li>
+    <li><a href="#execution-semantics">Execution semantics</a></li>
+    <li><a href="#contributing">Contributing</a></li>
+    <li><a href="#license">License</a></li>
+    <li><a href="#contact">Contact</a></li>
+    <li><a href="#acknowledgments">Acknowledgments</a></li>
+  </ol>
+</details>
+
+<!-- ABOUT THE PROJECT -->
+## About The Project
 
 LLM calls today live in the application layer (Marvin, BAML) or behind opaque
 SQL functions (FlockMTL, `ai_query`, Cortex) — invisible to the query
@@ -13,192 +72,71 @@ semantic operators with accuracy guarantees as a Python dataframe library.
 semcast bets the same ideas belong *inside a SQL planner*, where they compose
 with ordinary relations, indexes, and every other optimizer rule for free.
 
-## The idea
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
+
+### The idea
 
 One operator — `text MEANS 'a natural-language condition'` — and the planner
 builds the cheapest plan that still answers the question. You declare intent
 and an accuracy target; the funnel is derived, never hand-written.
 
-- **Cheap-then-verify** — pre-filter on free signals (structured columns, a
+* **Cheap-then-verify** — pre-filter on free signals (structured columns, a
   semantic index), spend the LLM only on survivors, under a declared recall
   target.
-- **Field-level caching** — pay once per `(type, field, value, model, prompt
+* **Field-level caching** — pay once per `(type, field, value, model, prompt
   version)`, shared across every query that ever asks again.
-- **Agg split** — quantitative rollups run in SQL; the model touches only free text.
-- **Field pushdown** — generate only the fields the query uses: finer cache
+* **Agg split** — quantitative rollups run in SQL; the model touches only free text.
+* **Field pushdown** — generate only the fields the query uses: finer cache
   keys, per-field routing (`BOOL` to a small model, `TEXT` to a strong one).
 
 Net effect: a semantic query over ~20k documents costs tens of model calls —
 not tens of thousands reading everything.
 
----
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
 
-## Walk-through (design target)
-
-This section is the design the roadmap builds toward; what runs today is under
-[Getting started](#getting-started).
-
-*"Which meetings in the last 6 months discussed launching offline sync in
-Atlas?"* — 18,400 transcripts, ad-hoc question, no pipeline.
-
-```sql
--- meetings(meeting_id, title, held_at, attendees, transcript) — your existing table
-CREATE SEMANTIC INDEX ON meetings(transcript);
-
-SELECT meeting_id, title, held_at
-FROM meetings
-WHERE held_at >= now() - INTERVAL '6 months'
-  AND transcript MEANS 'discussed the launch of offline sync in Atlas'
-WITH RECALL 0.9;
-```
-
-The index chunks each transcript (~512-token slices), embeds every chunk, and
-stays fresh incrementally. It's optional — without it the planner warns the
-plan has no cheap stage. `MEANS` is ground truth: *a model reading the full
-transcript would say yes*; everything cheaper is an approximation managed
-under your recall target. `EXPLAIN` shows the derived funnel:
-
-```text
-SemFilter: MEANS('discussed the launch of offline sync in Atlas')   recall ≥ 0.90
-├─ held_at filter        18,400 → 3,100 rows    $0     plain SQL, runs first
-├─ semantic index scan    3,100 →    47 rows    $0     threshold set by calibration
-└─ verify (small model)      47 calls         ~$0.04   reads top-3 chunks per meeting
-```
-
-**47 model calls, not 18,400 — none reading a whole transcript.** Because:
-
-- To the optimizer, `MEANS` is simply a very expensive predicate; the free
-  date filter runs first. Predicate ordering is just predicate ordering.
-- The chunk vectors that pre-filter 3,100 → 47 also pick which three chunks
-  the verify model reads.
-- The index scan has false negatives, so `WITH RECALL` calibrates: sample
-  date-surviving rows, get ground-truth labels, set the threshold so ≥90% of
-  true matches survive (the cascade technique pioneered by LOTUS). Omit the
-  clause and thresholds are best-effort — `EXPLAIN` says so.
-
-Follow-ups reuse cached verdicts — the filter below costs zero new calls; the
-model runs only to extract from the ~12 survivors:
-
-```sql
-SELECT held_at,
-       EXTRACT(decisions TEXT[] 'concrete decisions made' FROM transcript) AS decisions
-FROM meetings
-WHERE transcript MEANS 'discussed the launch of offline sync in Atlas';
-```
-
-Recurring questions become macros; next month's variant reuses every embedding
-for free:
-
-```sql
-CREATE SEMANTIC PREDICATE discussed_launch(t, feature, product) AS
-  t MEANS 'discussed the launch of {feature} in {product}';
-```
-
-### Know the bill
-
-`EXPLAIN` prices every stage — calls and dollars — before a token is spent,
-from cached history or a sampled slice. Estimates are estimates, so queries
-take a hard cap:
-
-```sql
-SELECT ... BUDGET 1.00 USD;   -- stop at the cap; partial rows + a warning
-```
-
-### Typed extraction
-
-A **semantic type** names a recurring extraction: field names, types, one doc
-line each. semcast synthesizes the prompt, constrains decoding, and turns as
-much of a downstream aggregate as possible into plain SQL.
-
-```sql
-CREATE SEMANTIC TYPE MeetingFacts AS (
-  products  TEXT[]   'product names discussed in this meeting',
-  decisions TEXT[]   'concrete decisions that were made',
-  TOGETHER (                               -- co-generated: a stage needs its evidence
-    launch_stage ONEOF(none, idea, planned, scheduled, shipped)
-                       'the furthest launch stage discussed',
-    stage_quote  TEXT  'the transcript line that shows that stage'
-  )
-);
-
-SELECT CAST(transcript AS MeetingFacts).launch_stage FROM meetings WHERE ...;
-```
-
-| Field type | Meaning |
-|------------|---------|
-| `TEXT` | prose; stays with the model |
-| `INT`, `REAL` | aggregate in SQL — no LLM at rollup |
-| `REAL CHECK (a..b)` | validated at decode time |
-| `BOOL` | becomes a plain predicate |
-| `ONEOF(a, b, c)` | closed category; `GROUP BY`-able |
-| `LEVEL(a, b, c)` | ordered low→high; comparable, rankable |
-| `T[]` | list of any above |
-| `<AnotherType>` | nested semantic type |
-
-Fields are independent by default — that's what enables pushdown. `TOGETHER`
-groups are generated in one shot, never pruned apart.
-
-### Operators
-
-| Kind | Signature | Example |
-|------|-----------|---------|
-| **Predicate** | `text → bool` | `transcript MEANS 'discussed a launch'` |
-| **Map** | `text → typed fields` | `EXTRACT(...)`, `CAST(... AS MeetingFacts)` |
-| **Aggregate** | `set<text> → summary` | `sem_summary(transcript, 'recurring blockers')` |
-| **Join** | `text × text → bool` | `ON (c.notes, v.description) MEANS 'the same company'` |
-
-All plan the same way: cheap stage, calibrated threshold, verify, cache. Joins
-block on vector proximity first — never O(n×m) model calls. For shortcuts the
-planner can't guess, `CHEAP USING <expr>` pins one on a named predicate:
-
-```sql
-CREATE SEMANTIC PREDICATE discussed_launch(t, feature, product) AS
-  t MEANS 'discussed the launch of {feature} in {product}'
-  CHEAP USING attendees @> ARRAY['launch-committee'];
-```
-
----
-
-## Execution semantics
-
-LLMs break two database assumptions — determinism, and evaluation that doesn't
-fail halfway. semcast answers explicitly:
-
-- **Full-provenance cache keys** — `(type version, field, input value, model,
-  prompt version)`. Editing one field's doc line invalidates exactly that field.
-- **First evaluation wins** — re-running a query is deterministic even though
-  the model isn't.
-- **Rows fail, queries don't** — a row that errors after retries yields `NULL`
-  plus an error column. The cache doubles as a checkpoint for resumed jobs.
-
-## Architecture
-
-| Piece | DataFusion hook | Status |
-|-------|-----------------|--------|
-| `MEANS` logical operator | `UserDefinedLogicalNodeCore` → `LogicalPlan::Extension` | ✅ `SemFilter` |
-| Infix `text MEANS '...'` syntax | custom sqlparser `Dialect` | ✅ via `semcast::sql` |
-| `means()` → `SemFilter` rewrite | `OptimizerRule` | ✅ |
-| Verify stage + call estimate | `ExecutionPlan` via `ExtensionPlanner` | ✅ `VerifyExec` |
-| Async batched model calls | `tokio` + `reqwest` | ✅ Ollama, Anthropic |
-| Verdict cache | provenance-keyed, in-memory | ✅ |
-| `CREATE SEMANTIC INDEX` syntax | parser extension | ✅ (`TYPE` / `PREDICATE` planned) |
-| Semantic index + pre-filter stage | [Lance](https://lancedb.github.io/lance/) (Arrow-native) | ✅ `IndexScanExec` |
-| `WITH RECALL` calibration | sampled labels at first poll of the scan | ✅ |
-| Field pushdown, agg split | `OptimizerRule` / `PhysicalOptimizerRule` | planned |
-
-## Where this bites
+### Where this bites
 
 Large corpus, expensive per-document review, ad-hoc questions — index and
 cache compound across queries.
 
-- **eDiscovery / legal review** — a recall target is defensibility, not a nicety.
-- **Contract analytics** — extract typed fields once, `SUM` exposure in SQL.
-- **Literature screening** — `is_survey BOOL`, `audience LEVEL`, filter.
-- **Support-ticket mining** — classify once, trend forever; new questions
+* **eDiscovery / legal review** — a recall target is defensibility, not a nicety.
+* **Contract analytics** — extract typed fields once, `SUM` exposure in SQL.
+* **Literature screening** — `is_survey BOOL`, `audience LEVEL`, filter.
+* **Support-ticket mining** — classify once, trend forever; new questions
   re-slice the cache.
-- **Entity resolution** — semantic join without n×m model calls.
+* **Entity resolution** — semantic join without n×m model calls.
 
-## Getting started
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
+
+### Built With
+
+* [![Rust][Rust-badge]][Rust-url]
+* [![Apache DataFusion][DataFusion-badge]][DataFusion-url]
+* [![Lance][Lance-badge]][Lance-url]
+* [![Tokio][Tokio-badge]][Tokio-url]
+
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
+
+<!-- GETTING STARTED -->
+## Getting Started
+
+### Prerequisites
+
+Building needs `protoc` (a Lance requirement):
+
+```sh
+brew install protobuf
+```
+
+Pick a provider:
+
+* **Ollama** (local, free) — `ollama pull gemma4:31b`, plus `nomic-embed-text`
+  for the semantic index.
+* **Anthropic** — `export ANTHROPIC_API_KEY=...`; defaults to Haiku, the right
+  tier for one-word verify calls. No embeddings, so bring an Ollama embedder in
+  `IndexOptions` to index.
+
+### Installation
 
 Not on crates.io yet — depend on it from git:
 
@@ -209,13 +147,20 @@ datafusion = "54"
 tokio      = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
-Building needs `protoc` (Lance requirement): `brew install protobuf`.
+Or clone and try it with no setup:
 
-Pick a provider: **Ollama** (local, free — `ollama pull gemma4:31b`, plus
-`nomic-embed-text` for the semantic index) or **Anthropic**
-(`export ANTHROPIC_API_KEY=...`; defaults to Haiku, the right tier for
-one-word verify calls — no embeddings, so bring an Ollama embedder in
-`IndexOptions` to index).
+```sh
+git clone https://github.com/robintiman/semcast && cd semcast
+cargo run --example meetings                       # deterministic mock model
+cargo test                                         # full suite, no network
+cargo test --test live_ollama -- --ignored         # end-to-end against local Ollama
+                                                   # (gemma4:31b + nomic-embed-text)
+```
+
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
+
+<!-- USAGE EXAMPLES -->
+## Usage
 
 ```rust
 use std::sync::Arc;
@@ -274,16 +219,6 @@ VerifyExec: MEANS('discussed the launch of offline sync in Atlas') model=ollama/
   IndexScanExec: MEANS('discussed the launch of offline sync in Atlas') embed_model=ollama/gemma4:31b floor=calibrated(recall≥0.90, sample≤64) top-3 chunks
 ```
 
-Try it with no setup:
-
-```sh
-git clone https://github.com/robintiman/semcast && cd semcast
-cargo run --example meetings                       # deterministic mock model
-cargo test                                         # full suite, no network
-cargo test --test live_ollama -- --ignored         # end-to-end against local Ollama
-                                                   # (gemma4:31b + nomic-embed-text)
-```
-
 ### Serve it
 
 semcast is meant to be run as a service — any Postgres simple-protocol
@@ -328,28 +263,84 @@ COPY mem TO 'out/meetings.parquet' STORED AS PARQUET;
 Paths resolve on the server, and any client can read any file the process
 can. Object storage (s3) is on the roadmap.
 
-## Status
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
 
-Early / experimental. Order of attack:
+<!-- EXECUTION SEMANTICS -->
+## Execution semantics
 
-1. ~~`MEANS` logical operator + verify-only physical plan~~ **done**
-2. ~~`CREATE SEMANTIC INDEX` on Lance + the index pre-filter stage~~ **done**
-3. ~~`WITH RECALL` — sampled threshold calibration~~ **done**
-4. ~~Semantic types — `CREATE SEMANTIC TYPE`, `EXTRACT`/`CAST`, constrained
-   decoding, field pushdown; the fields that make per-field caching possible~~
-   **done**; nested types, `CREATE SEMANTIC PREDICATE`, and `LEVEL` ordering
-   still open
-5. Field-level cache with provenance keys — **in-memory done**; persistent,
-   cross-session cache on disk
-6. Eval harness: labeled corpus, reporting **calls saved and recall** against
-   the LLM-on-every-row baseline — so the headline claim stays falsifiable
-7. ~~pgwire server — semcast as a service; funnel progress streamed as
-   NOTICE messages mid-query~~ **done** for the simple protocol (`psql`);
-   extended protocol (DBeaver, Grafana, JDBC) still open
-8. ~~Ingestion — `CREATE EXTERNAL TABLE` over Parquet/CSV on disk~~ **done**
-   for local files (path-literal `SELECT`, `CREATE EXTERNAL TABLE`, CTAS,
-   `COPY TO`); object storage (s3) still open
+LLMs break two database assumptions — determinism, and evaluation that doesn't
+fail halfway. semcast answers explicitly:
 
+* **Full-provenance cache keys** — `(type version, field, input value, model,
+  prompt version)`. Editing one field's doc line invalidates exactly that field.
+* **First evaluation wins** — re-running a query is deterministic even though
+  the model isn't.
+* **Rows fail, queries don't** — a row that errors after retries yields `NULL`
+  plus an error column. The cache doubles as a checkpoint for resumed jobs.
+
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
+
+<!-- CONTRIBUTING -->
+## Contributing
+
+Contributions are what make the open source community such an amazing place to
+learn, inspire, and create. Any contributions you make are **greatly
+appreciated**.
+
+If you have a suggestion that would make this better, please fork the repo and
+create a pull request. You can also simply open an issue with the tag
+"enhancement".
+
+1. Fork the Project
+2. Create your Feature Branch (`git checkout -b feature/AmazingFeature`)
+3. Commit your Changes (`git commit -m 'Add some AmazingFeature'`)
+4. Push to the Branch (`git push origin feature/AmazingFeature`)
+5. Open a Pull Request
+
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
+
+<!-- LICENSE -->
 ## License
 
-Apache-2.0
+Distributed under the Apache-2.0 License. See `LICENSE` for more information.
+
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
+
+<!-- CONTACT -->
+## Contact
+
+Robin Timan — robintiman@gmail.com
+
+Project Link: [https://github.com/robintiman/semcast](https://github.com/robintiman/semcast)
+
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
+
+<!-- ACKNOWLEDGMENTS -->
+## Acknowledgments
+
+* [LOTUS](https://github.com/lotus-data/lotus)
+* [Apache DataFusion](https://datafusion.apache.org/)
+* [Lance](https://lancedb.github.io/lance/)
+* [Best-README-Template](https://github.com/othneildrew/Best-README-Template)
+
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
+
+<!-- MARKDOWN LINKS & IMAGES -->
+[contributors-shield]: https://img.shields.io/github/contributors/robintiman/semcast.svg?style=for-the-badge
+[contributors-url]: https://github.com/robintiman/semcast/graphs/contributors
+[forks-shield]: https://img.shields.io/github/forks/robintiman/semcast.svg?style=for-the-badge
+[forks-url]: https://github.com/robintiman/semcast/network/members
+[stars-shield]: https://img.shields.io/github/stars/robintiman/semcast.svg?style=for-the-badge
+[stars-url]: https://github.com/robintiman/semcast/stargazers
+[issues-shield]: https://img.shields.io/github/issues/robintiman/semcast.svg?style=for-the-badge
+[issues-url]: https://github.com/robintiman/semcast/issues
+[license-shield]: https://img.shields.io/github/license/robintiman/semcast.svg?style=for-the-badge
+[license-url]: https://github.com/robintiman/semcast/blob/main/LICENSE
+[Rust-badge]: https://img.shields.io/badge/Rust-000000?style=for-the-badge&logo=rust&logoColor=white
+[Rust-url]: https://www.rust-lang.org/
+[DataFusion-badge]: https://img.shields.io/badge/Apache%20DataFusion-E25A1C?style=for-the-badge&logo=apache&logoColor=white
+[DataFusion-url]: https://datafusion.apache.org/
+[Lance-badge]: https://img.shields.io/badge/Lance-4B8BBE?style=for-the-badge
+[Lance-url]: https://lancedb.github.io/lance/
+[Tokio-badge]: https://img.shields.io/badge/Tokio-463EE0?style=for-the-badge
+[Tokio-url]: https://tokio.rs/
