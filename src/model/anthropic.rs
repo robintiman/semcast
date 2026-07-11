@@ -47,6 +47,11 @@ impl AnthropicProvider {
         Ok(Self::new(api_key, DEFAULT_ANTHROPIC_MODEL))
     }
 
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = model.into();
+        self
+    }
+
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
         self.base_url

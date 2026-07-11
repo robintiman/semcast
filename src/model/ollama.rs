@@ -12,6 +12,7 @@ use super::{Completion, CompletionRequest, Embedding, ModelId, ModelProvider};
 use crate::{Result, SemcastError};
 
 pub const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
+pub const DEFAULT_CHAT_MODEL: &str = "gemma4:e4b";
 pub const DEFAULT_EMBED_MODEL: &str = "nomic-embed-text";
 
 #[derive(Debug, Clone)]
