@@ -225,7 +225,11 @@ impl ExecutionPlan for VerifyExec {
             async move { verifier.verify_batch(batch).await }
         });
         let output = Box::pin(RecordBatchStreamAdapter::new(self.input.schema(), stream));
-        Ok(crate::physical::trace::trace_stage("VerifyExec", partition, output))
+        Ok(crate::physical::trace::trace_stage(
+            "VerifyExec",
+            partition,
+            output,
+        ))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {

@@ -25,5 +25,8 @@ async fn embeds_texts_against_live_voyage() {
     println!("live voyage embedding dimension: {dim}");
     assert!(dim > 0);
     assert_eq!(embeddings[1].len(), dim, "consistent dimension");
-    assert_ne!(embeddings[0], embeddings[1], "distinct texts, distinct vectors");
+    assert_ne!(
+        embeddings[0], embeddings[1],
+        "distinct texts, distinct vectors"
+    );
 }
