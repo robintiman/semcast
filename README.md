@@ -131,13 +131,73 @@ Building needs `protoc` (a Lance requirement):
 brew install protobuf
 ```
 
-Pick a provider:
+semcast makes two kinds of model calls, and you choose a provider for each
+**independently** — any combination works (e.g. Ollama for completion, Voyage
+for embed):
 
-* **Ollama** (local, free) — `ollama pull gemma4:31b`, plus `nomic-embed-text`
-  for the semantic index.
-* **Anthropic** — `export ANTHROPIC_API_KEY=...`; defaults to Haiku, the right
-  tier for one-word verify calls. No embeddings, so bring an Ollama embedder in
-  `IndexOptions` to index.
+#### Completion model — the `MEANS` verify calls
+
+Runs the one-word yes/no verdicts and typed extraction. This is the session
+model, passed to `semcast_context`.
+
+* **Ollama** (local, free) — `ollama pull gemma4:31b`.
+* **Claude** (Anthropic) — `export ANTHROPIC_API_KEY=...`; defaults to Haiku,
+  the right tier for one-word verify calls.
+
+#### Embedding model — the semantic index
+
+Turns chunks into vectors for the cheap pre-filter stage.
+
+* **Ollama** (local, free) — `ollama pull nomic-embed-text`.
+* **Voyage** (hosted) — `export VOYAGE_API_KEY=...`; defaults to `voyage-3`,
+  Anthropic's recommended embedding vendor. (Claude ships no embedding models,
+  so a Claude completion setup pairs with Voyage or Ollama here.)
+
+#### Wiring them together
+
+The provider passed to `semcast_context` handles **completion**. When the
+**embedder** is a different provider, hand it to the index through
+`IndexOptions.embedder` — the SQL `CREATE SEMANTIC INDEX` DDL always embeds with
+the session model, so mixed setups build the index from Rust.
+
+If one Ollama provider does both, the DDL is enough:
+
+```rust
+use std::sync::Arc;
+use semcast::{model::OllamaProvider, semcast_context};
+
+let ctx = semcast_context(Arc::new(
+    OllamaProvider::new("gemma4:31b").with_embed_model("nomic-embed-text"),
+));
+semcast::sql(&ctx, "CREATE SEMANTIC INDEX ON meetings(transcript)").await?;
+```
+
+For a mixed setup — here **Ollama for completion, Voyage for embed** — pass the
+embedder explicitly (swap `OllamaProvider::new(...)` for
+`AnthropicProvider::from_env()?` to verify with Claude instead):
+
+```rust
+use std::sync::Arc;
+use semcast::{IndexOptions, create_semantic_index, semcast_context};
+use semcast::model::{OllamaProvider, VoyageProvider};
+
+let ctx = semcast_context(Arc::new(OllamaProvider::new("gemma4:31b"))); // completion
+// ... register a `meetings` table with a `transcript` column ...
+create_semantic_index(
+    &ctx,
+    "meetings",
+    "transcript",
+    IndexOptions {
+        embedder: Some(Arc::new(VoyageProvider::from_env()?)),          // embed
+        ..Default::default()
+    },
+)
+.await?;
+```
+
+The index records which model produced its vectors, so re-opening it with a
+different embedder (a different Voyage model, or an Ollama one) is a hard error
+rather than silent vector corruption.
 
 ### Installation
 

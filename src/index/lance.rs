@@ -52,7 +52,7 @@ impl std::fmt::Debug for LanceIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LanceIndex")
             .field("uri", &self.uri)
-            .field("embed_model", &self.embedder.id().0)
+            .field("embed_model", &self.embedder.embed_model_id().0)
             .field("dim", &self.dim)
             .finish_non_exhaustive()
     }
@@ -76,10 +76,10 @@ impl LanceIndex {
             .ok_or_else(|| {
                 SemcastError::Index(format!(
                     "embedder {} returned an empty embedding",
-                    embedder.id().0
+                    embedder.embed_model_id().0
                 ))
             })?;
-        let schema = chunk_schema(dim, &embedder.id(), &chunk_config);
+        let schema = chunk_schema(dim, &embedder.embed_model_id(), &chunk_config);
         let empty = RecordBatchIterator::new(
             std::iter::empty::<std::result::Result<RecordBatch, ArrowError>>(),
             Arc::clone(&schema),
@@ -116,11 +116,11 @@ impl LanceIndex {
                 "{uri} is not a semcast index (no embed-model metadata)"
             ))
         })?;
-        if *recorded != embedder.id().0 {
+        if *recorded != embedder.embed_model_id().0 {
             return Err(SemcastError::Index(format!(
                 "index at {uri} was built with embed model {recorded}, \
                  but the session embeds with {}",
-                embedder.id().0
+                embedder.embed_model_id().0
             )));
         }
         let dim = parse_meta(metadata.get(META_EMBED_DIM), uri, META_EMBED_DIM)?;
@@ -136,7 +136,7 @@ impl LanceIndex {
                 META_CHUNK_OVERLAP_TOKENS,
             )?,
         };
-        let schema = chunk_schema(dim, &embedder.id(), &chunk_config);
+        let schema = chunk_schema(dim, &embedder.embed_model_id(), &chunk_config);
         Ok(Self {
             uri: uri.to_owned(),
             embedder,
@@ -159,7 +159,7 @@ impl LanceIndex {
                 if embedding.len() != self.dim {
                     return Err(SemcastError::Index(format!(
                         "embedder {} returned dimension {}, index stores {}",
-                        self.embedder.id().0,
+                        self.embedder.embed_model_id().0,
                         embedding.len(),
                         self.dim
                     )));
@@ -174,7 +174,7 @@ impl LanceIndex {
 #[async_trait]
 impl SemanticIndex for LanceIndex {
     fn embed_model_id(&self) -> ModelId {
-        self.embedder.id()
+        self.embedder.embed_model_id()
     }
 
     fn search_params(&self) -> SearchParams {
@@ -233,7 +233,7 @@ impl SemanticIndex for LanceIndex {
             .ok_or_else(|| {
                 SemcastError::Index(format!(
                     "embedder {} did not return a {}-dimensional query vector",
-                    self.embedder.id().0,
+                    self.embedder.embed_model_id().0,
                     self.dim
                 ))
             })?;

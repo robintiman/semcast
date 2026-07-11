@@ -10,10 +10,12 @@
 mod anthropic;
 mod mock;
 mod ollama;
+mod voyage;
 
 pub use anthropic::AnthropicProvider;
 pub use mock::MockModel;
 pub use ollama::{DEFAULT_EMBED_MODEL, DEFAULT_OLLAMA_URL, OllamaProvider};
+pub use voyage::{DEFAULT_VOYAGE_MODEL, DEFAULT_VOYAGE_URL, VoyageProvider};
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -63,6 +65,19 @@ pub type Embedding = Vec<f32>;
 #[async_trait]
 pub trait ModelProvider: std::fmt::Debug + Send + Sync {
     fn id(&self) -> ModelId;
+
+    /// Provenance key for the semantic index: which model produced the stored
+    /// vectors. Distinct from [`id`](ModelProvider::id), which names the
+    /// *completion* model — a provider that embeds with a different model than
+    /// it completes with (e.g. [`OllamaProvider`], whose `id` is the chat model
+    /// but whose `embed` uses a separate embedding model) must override this so
+    /// the index's corruption guard keys on the embedding model, not the chat
+    /// one. Defaults to `id()`, which is correct for embed-only providers.
+    ///
+    /// [`OllamaProvider`]: crate::model::OllamaProvider
+    fn embed_model_id(&self) -> ModelId {
+        self.id()
+    }
 
     async fn complete(&self, requests: Vec<CompletionRequest>) -> Vec<Result<Completion>>;
 

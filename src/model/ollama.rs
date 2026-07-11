@@ -113,6 +113,13 @@ impl ModelProvider for OllamaProvider {
         ModelId(format!("ollama/{}", self.model))
     }
 
+    /// The embedding model, not the chat model — `embed` uses `embed_model`,
+    /// so this is what the index provenance must record (a `--model` change
+    /// alone must not read as an embedder change, and vice versa).
+    fn embed_model_id(&self) -> ModelId {
+        ModelId(format!("ollama/{}", self.embed_model))
+    }
+
     async fn complete(&self, requests: Vec<CompletionRequest>) -> Vec<Result<Completion>> {
         super::complete_concurrently(requests, |req| self.complete_one(req)).await
     }

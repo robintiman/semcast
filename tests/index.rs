@@ -168,6 +168,88 @@ async fn opening_with_a_different_embedder_errors() {
     );
 }
 
+#[tokio::test]
+async fn opening_with_a_different_embed_model_but_same_completion_model_errors() {
+    // The silent-corruption case the embed_model_id() guard closes: two
+    // sessions share a completion model — identical id() — but embed with
+    // different models (Ollama's `--model` vs `--embed-model`). The old
+    // id()-based guard compared completion models and let this through,
+    // mixing incompatible vectors; keying the guard on embed_model_id()
+    // rejects it.
+    let ctx = meetings_context().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("meetings.transcript.lance");
+
+    // Same completion id(), configurable embed_model_id().
+    #[derive(Debug)]
+    struct FixedEmbed {
+        inner: MockModel,
+        embed_model: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for FixedEmbed {
+        fn id(&self) -> ModelId {
+            ModelId("shared-chat-model".to_owned())
+        }
+        fn embed_model_id(&self) -> ModelId {
+            ModelId(self.embed_model.to_owned())
+        }
+        async fn complete(
+            &self,
+            requests: Vec<semcast::model::CompletionRequest>,
+        ) -> Vec<semcast::Result<semcast::model::Completion>> {
+            self.inner.complete(requests).await
+        }
+        async fn embed(
+            &self,
+            texts: Vec<String>,
+        ) -> semcast::Result<Vec<semcast::model::Embedding>> {
+            self.inner.embed(texts).await
+        }
+    }
+
+    // Build with embed model A.
+    create_semantic_index(
+        &ctx,
+        "meetings",
+        "transcript",
+        IndexOptions {
+            path: Some(path.clone()),
+            embedder: Some(Arc::new(FixedEmbed {
+                inner: MockModel::default(),
+                embed_model: "embed-A",
+            })),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    // Open with the SAME completion model but a DIFFERENT embed model. The
+    // dimensions match (both use the mock's byte histogram), so only the
+    // model-provenance guard can catch this — not the dimension checks.
+    let err = LanceIndex::open(
+        path.to_str().unwrap(),
+        Arc::new(FixedEmbed {
+            inner: MockModel::default(),
+            embed_model: "embed-B",
+        }),
+        SearchParams::default(),
+    )
+    .await
+    .unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains("built with embed model embed-A"),
+        "records the embedding model, not the chat model: {message}"
+    );
+    assert!(
+        message.contains("embed-B"),
+        "names the session embed model: {message}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The funnel: IndexScanExec pruning + chunk-based verify.
 //
