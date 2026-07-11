@@ -34,8 +34,6 @@
     <li>
       <a href="#about-the-project">About The Project</a>
       <ul>
-        <li><a href="#the-idea">The idea</a></li>
-        <li><a href="#where-this-bites">Where this bites</a></li>
         <li><a href="#built-with">Built With</a></li>
       </ul>
     </li>
@@ -64,56 +62,15 @@
 <!-- ABOUT THE PROJECT -->
 ## About The Project
 
-LLM calls today live in the application layer (Marvin, BAML) or behind opaque
-SQL functions (FlockMTL, `ai_query`, Cortex) — invisible to the query
-optimizer, so it can't make them cheaper. **semcast puts the model call inside
-the planner as a first-class operator** DataFusion can prune, reorder, and
-cache.
+Semcast brings native LLM calls to SQL. It makes the language model a
+first-class part of the query through semantic typing and predicate filtering. 
 
-Closest relative: [LOTUS](https://github.com/lotus-data/lotus), which pioneered
-semantic operators with accuracy guarantees as a Python dataframe library.
-semcast bets the same ideas belong *inside a SQL planner*, where they compose
-with ordinary relations, indexes, and every other optimizer rule for free.
-
-<p align="right">(<a href="#readme-top">back to top</a>)</p>
-
-### The idea
-
-One operator — `text MEANS 'a natural-language condition'` — and the planner
-builds the cheapest plan that still answers the question. You declare intent
-and an accuracy target; the funnel is derived, never hand-written.
-
-* **Cheap-then-verify** — pre-filter on free signals (structured columns, a
-  semantic index), spend the LLM only on survivors, under a declared recall
-  target.
-* **Field-level caching** — pay once per `(type, field, value, model, prompt
-  version)`, shared across every query that ever asks again.
-* **Agg split** — quantitative rollups run in SQL; the model touches only free text.
-* **Field pushdown** — generate only the fields the query uses: finer cache
-  keys, per-field routing (`BOOL` to a small model, `TEXT` to a strong one).
-
-Net effect: a semantic query over ~20k documents costs tens of model calls —
-not tens of thousands reading everything.
-
-<p align="right">(<a href="#readme-top">back to top</a>)</p>
-
-### Where this bites
-
-Large corpus, expensive per-document review, ad-hoc questions — index and
-cache compound across queries.
-
-* **eDiscovery / legal review** — a recall target is defensibility, not a nicety.
-* **Contract analytics** — extract typed fields once, `SUM` exposure in SQL.
-* **Literature screening** — `is_survey BOOL`, `audience LEVEL`, filter.
-* **Support-ticket mining** — classify once, trend forever; new questions
-  re-slice the cache.
-* **Entity resolution** — semantic join without n×m model calls.
+The LLM lives inside the query planner, so the model call is prunable, reorderable, and cacheable like any other operator.
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
 ### Built With
 
-* [![Rust][Rust-badge]][Rust-url]
 * [![Apache DataFusion][DataFusion-badge]][DataFusion-url]
 * [![Lance][Lance-badge]][Lance-url]
 * [![Tokio][Tokio-badge]][Tokio-url]
@@ -123,17 +80,15 @@ cache compound across queries.
 <!-- GETTING STARTED -->
 ## Getting Started
 
+To get a local copy up and running, follow these steps.
+
 ### Prerequisites
 
-Building needs `protoc` (a Lance requirement):
-
-```sh
-brew install protobuf
-```
+Building needs a [Rust toolchain](https://www.rust-lang.org/tools/install).
 
 Pick a provider:
 
-* **Ollama** (local, free) — `ollama pull gemma4:31b`, plus `nomic-embed-text`
+* **Ollama** (local, free) — `ollama pull gemma4:e4b`, plus `nomic-embed-text`
   for the semantic index.
 * **Anthropic** — `export ANTHROPIC_API_KEY=...`; defaults to Haiku, the right
   tier for one-word verify calls. No embeddings, so bring an Ollama embedder in
@@ -157,7 +112,7 @@ git clone https://github.com/robintiman/semcast && cd semcast
 cargo run --example meetings                       # deterministic mock model
 cargo test                                         # full suite, no network
 cargo test --test live_ollama -- --ignored         # end-to-end against local Ollama
-                                                   # (gemma4:31b + nomic-embed-text)
+                                                   # (gemma4:e4b + nomic-embed-text)
 ```
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
@@ -172,7 +127,7 @@ use semcast::{model::OllamaProvider, semcast_context};
 
 #[tokio::main]
 async fn main() -> datafusion::error::Result<()> {
-    let ctx = semcast_context(Arc::new(OllamaProvider::new("gemma4:31b")));
+    let ctx = semcast_context(Arc::new(OllamaProvider::new("gemma4:e4b")));
     ctx.register_csv("meetings", "meetings.csv", Default::default()).await?;
 
     // Optional but what makes it cheap: prunes candidates by vector
@@ -218,8 +173,8 @@ the floor so ≥90% of the sample's true matches survive. Without the clause
 thresholds are best-effort, and `EXPLAIN` says which you're getting:
 
 ```text
-VerifyExec: MEANS('discussed the launch of offline sync in Atlas') model=ollama/gemma4:31b reads top-3 chunks per doc   ~3 model calls
-  IndexScanExec: MEANS('discussed the launch of offline sync in Atlas') embed_model=ollama/gemma4:31b floor=calibrated(recall≥0.90, sample≤64) top-3 chunks
+VerifyExec: MEANS('discussed the launch of offline sync in Atlas') model=ollama/gemma4:e4b reads top-3 chunks per doc   ~3 model calls
+  IndexScanExec: MEANS('discussed the launch of offline sync in Atlas') embed_model=ollama/gemma4:e4b floor=calibrated(recall≥0.90, sample≤64) top-3 chunks
 ```
 
 ### Serve it
@@ -230,7 +185,6 @@ the roadmap):
 
 ```sh
 cargo run --features server -- serve               # Ollama provider
-cargo run --features server -- serve --mock sync   # no model needed
 psql -h 127.0.0.1 -p 5433
 ```
 
@@ -240,12 +194,12 @@ Funnel progress streams back as NOTICE messages while the model runs:
 semcast=> SELECT meeting_id FROM meetings
           WHERE transcript MEANS 'offline sync' WITH RECALL 0.9;
 NOTICE:  funnel: IndexScanExec: MEANS('offline sync') embed_model=ollama/nomic-embed-text floor=calibrated(recall≥0.90, sample≤64) top-3 chunks
-NOTICE:  funnel: VerifyExec: MEANS('offline sync') model=ollama/gemma4:31b reads top-3 chunks per doc   ≤47 model calls
+NOTICE:  funnel: VerifyExec: MEANS('offline sync') model=ollama/gemma4:e4b reads top-3 chunks per doc   ≤47 model calls
 NOTICE:  funnel done — index scan: 47 hits, 3053 pruned; verify: 47 model calls, 12 cache hits, 35 dropped
 ```
 
 `semcast serve --help` lists the knobs: `--port` (5433), `--model`,
-`--embed-model`, `--ollama-url`, `--index-dir`, `--mock`.
+`--embed-model`, `--ollama-url`, `--index-dir`.
 
 ### Load data
 

@@ -9,7 +9,7 @@
 //!
 //! Run with: `cargo run --example complaints`
 //!
-//! Needs a running Ollama with both models pulled: gemma4:31b answers `MEANS`
+//! Needs a running Ollama with both models pulled: gemma4:e4b answers `MEANS`
 //! and constrained extraction, nomic-embed-text builds the semantic index. The
 //! full funnel runs: cheap filter → a calibrated index pre-filter under
 //! `WITH RECALL 0.9` → chunk-fed verify.

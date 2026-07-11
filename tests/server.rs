@@ -201,7 +201,7 @@ async fn errors_abort_the_rest_of_a_multi_statement_string() {
 #[tokio::test]
 #[ignore = "requires a running Ollama server with a pulled model"]
 async fn live_ollama_means_query_over_the_wire() {
-    let model = std::env::var("SEMCAST_OLLAMA_MODEL").unwrap_or_else(|_| "gemma4:31b".to_owned());
+    let model = std::env::var("SEMCAST_OLLAMA_MODEL").unwrap_or_else(|_| "gemma4:e4b".to_owned());
     let (client, notices) = connect(Arc::new(semcast::model::OllamaProvider::new(model))).await;
 
     client

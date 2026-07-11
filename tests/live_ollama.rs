@@ -1,7 +1,7 @@
 //! Live end-to-end tests against a local Ollama server. Ignored by default:
 //!
 //! ```sh
-//! ollama pull gemma4:31b        # or export SEMCAST_OLLAMA_MODEL=<model>
+//! ollama pull gemma4:e4b        # or export SEMCAST_OLLAMA_MODEL=<model>
 //! ollama pull nomic-embed-text  # embeddings, for the index test
 //! cargo test --test live_ollama -- --ignored --nocapture
 //! ```
@@ -14,7 +14,7 @@ use semcast::{IndexOptions, create_semantic_index, semcast_context};
 #[tokio::test]
 #[ignore = "requires a running Ollama server with a pulled model"]
 async fn means_filter_against_live_ollama() {
-    let model = std::env::var("SEMCAST_OLLAMA_MODEL").unwrap_or_else(|_| "gemma4:31b".to_owned());
+    let model = std::env::var("SEMCAST_OLLAMA_MODEL").unwrap_or_else(|_| "gemma4:e4b".to_owned());
     let ctx = semcast_context(Arc::new(OllamaProvider::new(model)));
 
     ctx.sql(
@@ -55,9 +55,9 @@ async fn means_filter_against_live_ollama() {
 /// Real embeddings end-to-end: build a Lance index with nomic-embed-text,
 /// plan the funnel, and verify the right row survives it.
 #[tokio::test]
-#[ignore = "requires a running Ollama server with gemma4:31b and nomic-embed-text pulled"]
+#[ignore = "requires a running Ollama server with gemma4:e4b and nomic-embed-text pulled"]
 async fn semantic_index_funnel_against_live_ollama() {
-    let model = std::env::var("SEMCAST_OLLAMA_MODEL").unwrap_or_else(|_| "gemma4:31b".to_owned());
+    let model = std::env::var("SEMCAST_OLLAMA_MODEL").unwrap_or_else(|_| "gemma4:e4b".to_owned());
     let ctx = semcast_context(Arc::new(OllamaProvider::new(model)));
 
     ctx.sql(
@@ -114,9 +114,9 @@ async fn semantic_index_funnel_against_live_ollama() {
 /// `WITH RECALL` end-to-end: the scan labels a sample with the live model
 /// and calibrates its floor before pruning.
 #[tokio::test]
-#[ignore = "requires a running Ollama server with gemma4:31b and nomic-embed-text pulled"]
+#[ignore = "requires a running Ollama server with gemma4:e4b and nomic-embed-text pulled"]
 async fn calibrated_funnel_against_live_ollama() {
-    let model = std::env::var("SEMCAST_OLLAMA_MODEL").unwrap_or_else(|_| "gemma4:31b".to_owned());
+    let model = std::env::var("SEMCAST_OLLAMA_MODEL").unwrap_or_else(|_| "gemma4:e4b".to_owned());
     let ctx = semcast_context(Arc::new(OllamaProvider::new(model)));
 
     ctx.sql(

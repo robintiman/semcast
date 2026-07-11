@@ -199,7 +199,7 @@ mod tests {
     #[test]
     fn parses_chat_response() {
         let json = r#"{
-            "model": "gemma4:31b",
+            "model": "gemma4:e4b",
             "created_at": "2026-07-06T10:00:00Z",
             "message": {"role": "assistant", "content": "yes"},
             "done": true,
@@ -222,7 +222,7 @@ mod tests {
 
     fn chat_request<'a>(format: Option<&'a serde_json::Value>) -> ChatRequest<'a> {
         ChatRequest {
-            model: "gemma4:31b",
+            model: "gemma4:e4b",
             messages: vec![],
             stream: false,
             think: false,
