@@ -560,3 +560,45 @@ async fn builder_index_root_hosts_ddl_created_indexes() {
         "Lance dataset lands under the builder's index root",
     );
 }
+
+#[tokio::test]
+async fn builder_embedder_serves_ddl_created_indexes() {
+    let model = Arc::new(MockModel::answering_yes_to(["sync"]));
+    let embedder = Arc::new(MockModel::default());
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = semcast::SemcastContextBuilder::new(Arc::clone(&model) as Arc<dyn ModelProvider>)
+        .with_embedder(Arc::clone(&embedder) as Arc<dyn ModelProvider>)
+        .with_index_root(dir.path())
+        .build();
+    ctx.sql(
+        "CREATE TABLE meetings AS
+         SELECT * FROM (VALUES (1, 'sync')) AS t(meeting_id, transcript)",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    semcast::sql(&ctx, "CREATE SEMANTIC INDEX ON meetings(transcript)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(matching_ids(&ctx, "SELECT meeting_id FROM meetings WHERE transcript MEANS 'sync'").await, vec![1]);
+
+    assert!(
+        embedder.embed_calls() > 0,
+        "indexing and search embed through the builder's embedder",
+    );
+    assert_eq!(
+        model.embed_calls(),
+        0,
+        "the session model only verifies, it never embeds",
+    );
+    assert!(
+        model.completion_calls() > 0,
+        "verify calls stay on the session model",
+    );
+}
