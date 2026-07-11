@@ -4,9 +4,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use semcast::SemcastContextBuilder;
-use semcast::model::{ModelProvider, OllamaProvider};
+use semcast::model::{ModelProvider, OllamaProvider, VoyageProvider};
 use semcast::server::{QueryEngine, serve};
 
 #[derive(Parser)]
@@ -41,9 +41,22 @@ struct ServeArgs {
     embed_model: String,
     #[arg(long, default_value = semcast::model::DEFAULT_OLLAMA_URL)]
     ollama_url: String,
+    /// Which provider embeds text for semantic indexes. `voyage` needs
+    /// VOYAGE_API_KEY exported; completions stay on Ollama.
+    #[arg(long, value_enum, default_value_t = EmbedProvider::Ollama)]
+    embed_provider: EmbedProvider,
+    /// Voyage embedding model (with `--embed-provider voyage`).
+    #[arg(long, default_value = semcast::model::DEFAULT_VOYAGE_MODEL)]
+    voyage_model: String,
     /// Where semantic indexes are stored; temp dir if unset.
     #[arg(long)]
     index_dir: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum EmbedProvider {
+    Ollama,
+    Voyage,
 }
 
 #[tokio::main]
@@ -60,6 +73,14 @@ async fn main() -> std::io::Result<()> {
     );
 
     let mut builder = SemcastContextBuilder::new(model).with_information_schema(true);
+    // A missing VOYAGE_API_KEY fails here, before the listener binds — not
+    // lazily at the first CREATE SEMANTIC INDEX.
+    if let EmbedProvider::Voyage = args.embed_provider {
+        let voyage = VoyageProvider::from_env()
+            .map_err(|e| std::io::Error::other(e.to_string()))?
+            .with_model(&args.voyage_model);
+        builder = builder.with_embedder(Arc::new(voyage));
+    }
     if let Some(dir) = &args.index_dir {
         builder = builder.with_index_root(dir);
     }

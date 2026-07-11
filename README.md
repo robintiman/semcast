@@ -62,8 +62,7 @@
 <!-- ABOUT THE PROJECT -->
 ## About The Project
 
-Semcast brings native LLM calls to SQL. It makes the language model a
-first-class part of the query through semantic typing and predicate filtering. 
+Semcast is a query engine built with support for semantic typing and filtering.
 
 The LLM lives inside the query planner, so the model call is prunable, reorderable, and cacheable like any other operator.
 
@@ -84,15 +83,16 @@ To get a local copy up and running, follow these steps.
 
 ### Prerequisites
 
-Building needs a [Rust toolchain](https://www.rust-lang.org/tools/install).
-
 Pick a provider:
 
 * **Ollama** (local, free) — `ollama pull gemma4:e4b`, plus `nomic-embed-text`
   for the semantic index.
 * **Anthropic** — `export ANTHROPIC_API_KEY=...`; defaults to Haiku, the right
-  tier for one-word verify calls. No embeddings, so bring an Ollama embedder in
-  `IndexOptions` to index.
+  tier for one-word verify calls. No embeddings, so bring an Ollama or Voyage
+  embedder to index.
+* **Voyage** (embeddings only) — `export VOYAGE_API_KEY=...`; hosted embeddings
+  for the semantic index, paired with an Ollama or Anthropic model for verify
+  calls.
 
 ### Installation
 
@@ -199,7 +199,11 @@ NOTICE:  funnel done — index scan: 47 hits, 3053 pruned; verify: 47 model call
 ```
 
 `semcast serve --help` lists the knobs: `--port` (5433), `--model`,
-`--embed-model`, `--ollama-url`, `--index-dir`.
+`--embed-model`, `--ollama-url`, `--embed-provider` (`ollama` or `voyage`,
+which needs `VOYAGE_API_KEY`), `--voyage-model`, `--index-dir`. Indexes record
+which embedder built them, so switching `--embed-provider` against an existing
+`--index-dir` refuses to open the old indexes rather than search them with
+mismatched vectors.
 
 ### Load data
 

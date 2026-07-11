@@ -3,9 +3,11 @@
 //! is exactly right for one-word yes/no verify calls.
 //!
 //! No embeddings — Anthropic doesn't offer embedding models, so the semantic
-//! index needs a different provider (e.g. [`OllamaProvider`]) for that half.
+//! index needs a different provider ([`OllamaProvider`] or [`VoyageProvider`])
+//! for that half.
 //!
 //! [`OllamaProvider`]: super::OllamaProvider
+//! [`VoyageProvider`]: super::VoyageProvider
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -160,8 +162,8 @@ impl ModelProvider for AnthropicProvider {
 
     async fn embed(&self, _texts: Vec<String>) -> Result<Vec<Embedding>> {
         Err(SemcastError::Model(
-            "the Anthropic API has no embedding models; use OllamaProvider for the \
-             semantic index"
+            "the Anthropic API has no embedding models; use OllamaProvider or \
+             VoyageProvider for the semantic index"
                 .to_owned(),
         ))
     }

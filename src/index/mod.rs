@@ -112,8 +112,9 @@ pub trait SemanticIndex: std::fmt::Debug + Send + Sync {
 /// temp-dir Lance dataset using the session's model as embedder.
 #[derive(Debug, Clone, Default)]
 pub struct IndexOptions {
-    /// Embedding provider; defaults to the session model. Bring an Ollama
-    /// provider here when the session model can't embed (Anthropic).
+    /// Embedding provider; defaults to the runtime's embedder — the session
+    /// model, unless the context builder set one (e.g. Voyage, or Ollama
+    /// when the session model can't embed).
     pub embedder: Option<Arc<dyn ModelProvider>>,
     /// Where the Lance dataset lives; defaults under the runtime's index root.
     pub path: Option<PathBuf>,
@@ -133,7 +134,7 @@ pub async fn create_semantic_index(
     let runtime = runtime(ctx)?;
     let embedder = options
         .embedder
-        .unwrap_or_else(|| Arc::clone(&runtime.model));
+        .unwrap_or_else(|| Arc::clone(runtime.embedder()));
     let texts = read_column_texts(ctx, table, column).await?;
     let path = options
         .path

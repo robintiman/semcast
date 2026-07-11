@@ -134,6 +134,7 @@ pub fn semcast_context_with_cache(
 /// SQL client can read any local file the process can.
 pub struct SemcastContextBuilder {
     model: Arc<dyn ModelProvider>,
+    embedder: Option<Arc<dyn ModelProvider>>,
     cache: Arc<dyn SemanticCache>,
     index_root: Option<std::path::PathBuf>,
     information_schema: bool,
@@ -143,10 +144,19 @@ impl SemcastContextBuilder {
     pub fn new(model: Arc<dyn ModelProvider>) -> Self {
         Self {
             model,
+            embedder: None,
             cache: Arc::new(InMemoryCache::default()),
             index_root: None,
             information_schema: false,
         }
+    }
+
+    /// Embed semantic indexes (and their queries) through `embedder` instead
+    /// of the session model — for a dedicated embedding provider (Voyage), or
+    /// when the session model can't embed (Anthropic).
+    pub fn with_embedder(mut self, embedder: Arc<dyn ModelProvider>) -> Self {
+        self.embedder = Some(embedder);
+        self
     }
 
     pub fn with_cache(mut self, cache: Arc<dyn SemanticCache>) -> Self {
@@ -171,6 +181,9 @@ impl SemcastContextBuilder {
         let types = Arc::new(crate::types::registry::TypeRegistry::default());
         let mut runtime =
             SemcastRuntime::new(Arc::clone(&self.model)).with_type_registry(Arc::clone(&types));
+        if let Some(embedder) = self.embedder {
+            runtime = runtime.with_embedder(embedder);
+        }
         if let Some(root) = self.index_root {
             runtime = runtime.with_index_root(root);
         }

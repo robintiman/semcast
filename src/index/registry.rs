@@ -14,8 +14,12 @@ use super::SemanticIndex;
 
 #[derive(Debug)]
 pub struct SemcastRuntime {
-    /// The session's model — verify calls and the default embedder.
+    /// The session's model — verify calls.
     pub model: Arc<dyn ModelProvider>,
+    /// What `create_semantic_index` embeds with when `IndexOptions.embedder`
+    /// is unset. The session model itself unless the builder brought a
+    /// dedicated one (Voyage, or Ollama next to an Anthropic session model).
+    embedder: Arc<dyn ModelProvider>,
     index_root: PathBuf,
     /// Registered indexes keyed by `(table, column)`. Resolution is exact:
     /// a same-named column on a different table never borrows an index.
@@ -28,11 +32,23 @@ pub struct SemcastRuntime {
 impl SemcastRuntime {
     pub fn new(model: Arc<dyn ModelProvider>) -> Self {
         Self {
+            embedder: Arc::clone(&model),
             model,
             index_root: std::env::temp_dir().join("semcast-indexes"),
             indexes: Mutex::new(HashMap::new()),
             types: Arc::new(TypeRegistry::default()),
         }
+    }
+
+    /// Embed through `embedder` instead of the session model.
+    pub fn with_embedder(mut self, embedder: Arc<dyn ModelProvider>) -> Self {
+        self.embedder = embedder;
+        self
+    }
+
+    /// The session's default embedding provider.
+    pub fn embedder(&self) -> &Arc<dyn ModelProvider> {
+        &self.embedder
     }
 
     /// Share the type registry with a caller-provided `Arc` — the builder

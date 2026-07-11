@@ -5,15 +5,18 @@
 //! handing a different provider to the planner. [`MockModel`] is deterministic
 //! and free — the eval harness (roadmap step 5) baseline; [`OllamaProvider`]
 //! runs local models (and embeddings, for the index); [`AnthropicProvider`]
-//! is the hosted option for verify-quality answers.
+//! is the hosted option for verify-quality answers; [`VoyageProvider`] is the
+//! hosted option for embeddings (its inverse: no completions).
 
 mod anthropic;
 mod mock;
 mod ollama;
+mod voyage;
 
 pub use anthropic::AnthropicProvider;
 pub use mock::MockModel;
 pub use ollama::{DEFAULT_EMBED_MODEL, DEFAULT_OLLAMA_URL, OllamaProvider};
+pub use voyage::{DEFAULT_VOYAGE_MODEL, DEFAULT_VOYAGE_URL, VoyageProvider};
 
 use async_trait::async_trait;
 use futures::StreamExt;
