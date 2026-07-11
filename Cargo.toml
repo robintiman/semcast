@@ -9,17 +9,14 @@ repository = "https://github.com/robintiman/semcast"
 keywords = ["datafusion", "llm", "sql", "semantic"]
 categories = ["database"]
 
-[features]
-server = ["dep:pgwire", "dep:clap"]
-
 [dependencies]
 async-trait = "0.1.89"
-clap = { version = "4.6", features = ["derive"], optional = true }
+clap = { version = "4.6", features = ["derive"] }
 datafusion = "54"
 futures = "0.3.32"
 lance = { version = "8", default-features = false }
 lance-linalg = "8"
-pgwire = { version = "0.40.4", optional = true }
+pgwire = "0.40.4"
 reqwest = { version = "0.13.4", features = ["json"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
@@ -31,15 +28,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [dev-dependencies]
 tempfile = "3.27.0"
 tokio-postgres = "0.7"
-
-[[bin]]
-name = "semcast"
-path = "src/bin/semcast.rs"
-required-features = ["server"]
-
-[[test]]
-name = "server"
-required-features = ["server"]
 
 # The profile that 'dist' will build with
 [profile.dist]

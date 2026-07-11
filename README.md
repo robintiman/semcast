@@ -117,22 +117,11 @@ psql -h 127.0.0.1 -p 5433
 `semcast serve --help` lists the knobs: `--port` (5433), `--model`,
 `--embed-model`, `--ollama-url`, `--index-dir`.
 
-#### Use as a library
-
-Not on crates.io yet — depend on it from git:
-
-```toml
-[dependencies]
-semcast    = { git = "https://github.com/robintiman/semcast" }
-datafusion = "54"
-tokio      = { version = "1", features = ["rt-multi-thread", "macros"] }
-```
-
-Or clone and try it with no setup:
+#### Build from source
 
 ```sh
 git clone https://github.com/robintiman/semcast && cd semcast
-cargo run --example meetings                       # deterministic mock model
+cargo run -- serve                                 # build and start the server
 cargo test                                         # full suite, no network
 cargo test --test live_ollama -- --ignored         # end-to-end against local Ollama
                                                    # (gemma4:e4b + nomic-embed-text)
@@ -143,51 +132,35 @@ cargo test --test live_ollama -- --ignored         # end-to-end against local Ol
 <!-- USAGE EXAMPLES -->
 ## Usage
 
-```rust
-use std::sync::Arc;
-use semcast::{model::OllamaProvider, semcast_context};
-// or: semcast::model::AnthropicProvider::from_env()?
+Start the server, connect with any Postgres client, and query with plain
+SQL plus the `MEANS` predicate:
 
-#[tokio::main]
-async fn main() -> datafusion::error::Result<()> {
-    let ctx = semcast_context(Arc::new(OllamaProvider::new("gemma4:e4b")));
-    ctx.register_csv("meetings", "meetings.csv", Default::default()).await?;
+```sql
+CREATE EXTERNAL TABLE meetings STORED AS CSV LOCATION 'meetings.csv';
 
-    // Optional but what makes it cheap: prunes candidates by vector
-    // similarity so the model reads chunks of survivors, not every row.
-    semcast::sql(&ctx, "CREATE SEMANTIC INDEX ON meetings(transcript)").await?;
+-- Optional but what makes it cheap: prunes candidates by vector
+-- similarity so the model reads chunks of survivors, not every row.
+CREATE SEMANTIC INDEX ON meetings(transcript);
 
-    semcast::sql(
-        &ctx,
-        "SELECT meeting_id, title FROM meetings
-         WHERE held_at >= CAST('2026-01-01' AS TIMESTAMP)
-           AND transcript MEANS 'discussed the launch of offline sync in Atlas'",
-    )
-    .await?
-    .show()
-    .await?;
-
-    Ok(())
-}
+SELECT meeting_id, title FROM meetings
+WHERE held_at >= CAST('2026-01-01' AS TIMESTAMP)
+  AND transcript MEANS 'discussed the launch of offline sync in Atlas';
 ```
 
-Infix `MEANS` and trailing `WITH RECALL` need `semcast::sql` (DataFusion's
-`ctx.sql` can't take a custom dialect); through `ctx.sql`, write
-`means(text, 'condition', 0.9)` — the optional third argument is the recall
-target. Either way `MEANS` is allowed in top-level `AND` conjuncts of `WHERE`
-only; anything else (`OR`, `NOT`, the `SELECT` list) fails at plan time
-rather than silently costing a call per row.
+`MEANS` is allowed in top-level `AND` conjuncts of `WHERE` only; anything
+else (`OR`, `NOT`, the `SELECT` list) fails at plan time rather than
+silently costing a call per row.
 
 What runs today: `MEANS` rewrites to a `SemFilter` above your free
 predicates (so they run first), survivors are verified with batched async
 calls, and verdicts are cached by provenance — reruns and narrower
-follow-ups cost zero new calls. With an index (the DDL above, or
-`create_semantic_index(...)` from Rust), the planner adds the cheap stage:
-chunks are embedded once into a Lance dataset, one embedding call per query
-prunes non-candidates by vector similarity, and the verify model reads each
-survivor's top-3 chunks instead of the whole document. Rows the index has
-never seen pass through to full-text verify — never silently dropped;
-`refresh_semantic_index` picks them up.
+follow-ups cost zero new calls. With an index (the DDL above), the planner
+adds the cheap stage: chunks are embedded once into a Lance dataset, one
+embedding call per query prunes non-candidates by vector similarity, and
+the verify model reads each survivor's top-3 chunks instead of the whole
+document. Rows the index has never seen pass through to full-text verify —
+never silently dropped; re-running `CREATE SEMANTIC INDEX` rebuilds the
+index and picks them up.
 
 Add `WITH RECALL 0.9` and the pruning threshold is calibrated instead of
 guessed: the scan labels a sample of surviving rows (≤64 full-text calls,
@@ -208,7 +181,7 @@ the roadmap):
 
 ```sh
 semcast serve                                      # prebuilt binary, Ollama provider
-cargo run --features server -- serve               # or from a checkout
+cargo run -- serve                                 # or from a checkout
 psql -h 127.0.0.1 -p 5433
 ```
 

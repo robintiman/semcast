@@ -27,7 +27,6 @@ pub mod logical;
 pub mod model;
 pub mod optimizer;
 pub mod physical;
-#[cfg(feature = "server")]
 pub mod server;
 pub mod sql;
 pub mod telemetry;
