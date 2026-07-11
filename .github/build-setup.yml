@@ -1,0 +1,6 @@
+# Steps injected by dist into its release build jobs (see github-build-setup
+# in dist-workspace.toml). lance's prost-build needs a system protoc.
+- name: Install protoc
+  uses: arduino/setup-protoc@v3
+  with:
+    repo-token: ${{ secrets.GITHUB_TOKEN }}

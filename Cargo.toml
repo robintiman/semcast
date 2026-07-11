@@ -2,6 +2,7 @@
 name = "semcast"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 description = "Planner-integrated semantic operators for Apache DataFusion"
 license = "Apache-2.0"
 repository = "https://github.com/robintiman/semcast"
@@ -39,3 +40,8 @@ required-features = ["server"]
 [[test]]
 name = "server"
 required-features = ["server"]
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

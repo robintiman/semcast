@@ -96,6 +96,29 @@ Pick a provider:
 
 ### Installation
 
+#### Run the server (prebuilt binary)
+
+Grab a prebuilt `semcast` binary (Linux x86_64, macOS Apple Silicon) — no
+Rust toolchain needed:
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/robintiman/semcast/releases/latest/download/semcast-installer.sh | sh
+```
+
+Or download a tarball from the
+[latest release](https://github.com/robintiman/semcast/releases/latest).
+Then start the server and connect with any Postgres client:
+
+```sh
+semcast serve                                      # Ollama provider by default
+psql -h 127.0.0.1 -p 5433
+```
+
+`semcast serve --help` lists the knobs: `--port` (5433), `--model`,
+`--embed-model`, `--ollama-url`, `--index-dir`.
+
+#### Use as a library
+
 Not on crates.io yet — depend on it from git:
 
 ```toml
@@ -184,7 +207,8 @@ client connects (`psql` works; DBeaver needs the extended protocol, still on
 the roadmap):
 
 ```sh
-cargo run --features server -- serve               # Ollama provider
+semcast serve                                      # prebuilt binary, Ollama provider
+cargo run --features server -- serve               # or from a checkout
 psql -h 127.0.0.1 -p 5433
 ```
 
