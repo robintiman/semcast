@@ -11,8 +11,6 @@ ci = "github"
 installers = ["shell"]
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]
-# Features to pass to cargo build
-features = ["server"]
 # Extra steps injected into build jobs (installs protoc for lance/prost-build)
 github-build-setup = "../build-setup.yml"
 # Path that installers should place binaries in
