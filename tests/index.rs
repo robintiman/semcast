@@ -586,7 +586,14 @@ async fn builder_embedder_serves_ddl_created_indexes() {
         .collect()
         .await
         .unwrap();
-    assert_eq!(matching_ids(&ctx, "SELECT meeting_id FROM meetings WHERE transcript MEANS 'sync'").await, vec![1]);
+    assert_eq!(
+        matching_ids(
+            &ctx,
+            "SELECT meeting_id FROM meetings WHERE transcript MEANS 'sync'"
+        )
+        .await,
+        vec![1]
+    );
 
     assert!(
         embedder.embed_calls() > 0,
