@@ -85,14 +85,15 @@ To get a local copy up and running, follow these steps.
 
 Pick a provider:
 
+* **Anthropic** (default for completions) — `export ANTHROPIC_API_KEY=...`;
+  defaults to Haiku, the right tier for one-word verify calls. No embeddings,
+  so bring an Ollama or Voyage embedder to index.
+* **Voyage** (default for embeddings) — `export VOYAGE_API_KEY=...`; hosted
+  embeddings for the semantic index, paired with an Ollama or Anthropic model
+  for verify calls.
 * **Ollama** (local, free) — `ollama pull gemma4:e4b`, plus `nomic-embed-text`
-  for the semantic index.
-* **Anthropic** — `export ANTHROPIC_API_KEY=...`; defaults to Haiku, the right
-  tier for one-word verify calls. No embeddings, so bring an Ollama or Voyage
-  embedder to index.
-* **Voyage** (embeddings only) — `export VOYAGE_API_KEY=...`; hosted embeddings
-  for the semantic index, paired with an Ollama or Anthropic model for verify
-  calls.
+  for the semantic index. Select with `--provider ollama --embed-provider
+  ollama`.
 
 ### Installation
 
@@ -110,12 +111,13 @@ Or download a tarball from the
 Then start the server and connect with any Postgres client:
 
 ```sh
-semcast serve                                      # Ollama provider by default
+semcast serve                                      # Anthropic + Voyage by default
+semcast serve --provider ollama --embed-provider ollama    # fully local
 psql -h 127.0.0.1 -p 5433
 ```
 
-`semcast serve --help` lists the knobs: `--port` (5433), `--model`,
-`--embed-model`, `--ollama-url`, `--index-dir`.
+`semcast serve --help` lists the knobs: `--port` (5433), `--provider`,
+`--model`, `--embed-provider`, `--embed-model`, `--ollama-url`, `--index-dir`.
 
 #### Build from source
 
@@ -195,9 +197,11 @@ NOTICE:  funnel: VerifyExec: MEANS('offline sync') model=ollama/gemma4:e4b reads
 NOTICE:  funnel done — index scan: 47 hits, 3053 pruned; verify: 47 model calls, 12 cache hits, 35 dropped
 ```
 
-`semcast serve --help` lists the knobs: `--port` (5433), `--model`,
-`--embed-model`, `--ollama-url`, `--embed-provider` (`ollama` or `voyage`,
-which needs `VOYAGE_API_KEY`), `--voyage-model`, `--index-dir`. Indexes record
+`semcast serve --help` lists the knobs: `--port` (5433), `--provider`
+(`anthropic` by default, which needs `ANTHROPIC_API_KEY`, or `ollama`),
+`--model`, `--embed-model`, `--ollama-url`, `--embed-provider` (`voyage` by
+default, which needs `VOYAGE_API_KEY`, or `ollama`), `--voyage-model`,
+`--index-dir`. Indexes record
 which embedder built them, so switching `--embed-provider` against an existing
 `--index-dir` refuses to open the old indexes rather than search them with
 mismatched vectors.
