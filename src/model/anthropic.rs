@@ -68,23 +68,14 @@ impl AnthropicProvider {
             input = %request.input,
             "llm request"
         );
-        let response = self
-            .client
-            .post(format!("{}/v1/messages", self.base_url))
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", ANTHROPIC_VERSION)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| SemcastError::Model(format!("anthropic request failed: {e}")))?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let detail = response.text().await.unwrap_or_default();
-            return Err(SemcastError::Model(format!(
-                "anthropic returned {status}: {detail}"
-            )));
-        }
+        let response = super::send_with_retry("anthropic", || {
+            self.client
+                .post(format!("{}/v1/messages", self.base_url))
+                .header("x-api-key", &self.api_key)
+                .header("anthropic-version", ANTHROPIC_VERSION)
+                .json(&body)
+        })
+        .await?;
 
         let message: MessagesResponse = response
             .json()

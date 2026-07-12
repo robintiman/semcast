@@ -21,6 +21,12 @@ pub const DEFAULT_VOYAGE_URL: &str = "https://api.voyageai.com";
 pub const DEFAULT_VOYAGE_MODEL: &str = "voyage-4-large";
 /// Voyage caps `input` at 1000 texts per request.
 const MAX_BATCH: usize = 1000;
+/// Texts per embed request the index should aim for. Sized against Voyage's
+/// 120K-token/request cap for `voyage-4-large`: at ~512-token chunks that is
+/// ~234 texts, so 128 keeps clear headroom while roughly halving the request
+/// count versus the index's default of 64. The hard 1000-text API cap is still
+/// enforced by `MAX_BATCH` in `embed`.
+const EMBED_TEXTS_PER_REQUEST: usize = 128;
 
 pub struct VoyageProvider {
     base_url: String,
@@ -63,25 +69,16 @@ impl VoyageProvider {
     }
 
     async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Embedding>> {
-        let response = self
-            .client
-            .post(format!("{}/v1/embeddings", self.base_url))
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .json(&EmbedRequest {
-                input: texts,
-                model: &self.model,
-            })
-            .send()
-            .await
-            .map_err(|e| SemcastError::Model(format!("voyage embed request failed: {e}")))?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let detail = response.text().await.unwrap_or_default();
-            return Err(SemcastError::Model(format!(
-                "voyage returned {status}: {detail}"
-            )));
-        }
+        let response = super::send_with_retry("voyage", || {
+            self.client
+                .post(format!("{}/v1/embeddings", self.base_url))
+                .header("Authorization", format!("Bearer {}", self.api_key))
+                .json(&EmbedRequest {
+                    input: texts,
+                    model: &self.model,
+                })
+        })
+        .await?;
 
         let embed: EmbedResponse = response
             .json()
@@ -122,6 +119,10 @@ impl std::fmt::Debug for VoyageProvider {
 impl ModelProvider for VoyageProvider {
     fn id(&self) -> ModelId {
         ModelId(format!("voyage/{}", self.model))
+    }
+
+    fn embed_batch_size(&self) -> usize {
+        EMBED_TEXTS_PER_REQUEST
     }
 
     async fn complete(&self, requests: Vec<CompletionRequest>) -> Vec<Result<Completion>> {
