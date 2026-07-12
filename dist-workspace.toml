@@ -17,3 +17,8 @@ github-build-setup = "../build-setup.yml"
 install-path = "CARGO_HOME"
 # Whether to install an updater program
 install-updater = false
+
+# Override runners: dist 0.28.7 defaults aarch64-apple-darwin to the retired
+# macos-13 image, which leaves the job queued forever. Pin to macos-14 (Apple Silicon).
+[dist.github-custom-runners]
+aarch64-apple-darwin = "macos-14"
