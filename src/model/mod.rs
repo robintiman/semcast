@@ -114,10 +114,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// one. On success the 2xx [`Response`] is returned for the caller to parse;
 /// fatal statuses (4xx other than 429/408/425) and exhausted retries surface as
 /// `SemcastError::Model`. `label` names the provider in log lines and errors.
-async fn send_with_retry(
-    label: &str,
-    build: impl Fn() -> RequestBuilder,
-) -> Result<Response> {
+async fn send_with_retry(label: &str, build: impl Fn() -> RequestBuilder) -> Result<Response> {
     let mut attempt = 0;
     loop {
         match build().send().await {
@@ -170,7 +167,10 @@ async fn send_with_retry(
 /// Retryable = rate limits, request-timeout/too-early, and 5xx. Everything
 /// else (400/401/403/404/422 …) is a client error that retrying won't fix.
 fn is_retryable(status: StatusCode) -> bool {
-    matches!(status.as_u16(), 408 | 425 | 429 | 500 | 502 | 503 | 504 | 529)
+    matches!(
+        status.as_u16(),
+        408 | 425 | 429 | 500 | 502 | 503 | 504 | 529
+    )
 }
 
 /// The `Retry-After` delay a response asks for, if any.
@@ -236,10 +236,16 @@ mod tests {
     #[test]
     fn parse_retry_after_reads_integer_seconds_only() {
         assert_eq!(parse_retry_after(Some("2")), Some(Duration::from_secs(2)));
-        assert_eq!(parse_retry_after(Some("  5 ")), Some(Duration::from_secs(5)));
+        assert_eq!(
+            parse_retry_after(Some("  5 ")),
+            Some(Duration::from_secs(5))
+        );
         assert_eq!(parse_retry_after(Some("0")), Some(Duration::from_secs(0)));
         // HTTP-date form is not integer seconds → fall back to backoff.
-        assert_eq!(parse_retry_after(Some("Wed, 21 Oct 2026 07:28:00 GMT")), None);
+        assert_eq!(
+            parse_retry_after(Some("Wed, 21 Oct 2026 07:28:00 GMT")),
+            None
+        );
         assert_eq!(parse_retry_after(Some("")), None);
         assert_eq!(parse_retry_after(None), None);
     }
@@ -250,7 +256,10 @@ mod tests {
         // exponential floor, so it never fires near-instantly at high attempts.
         for attempt in 0..8 {
             let delay = backoff(attempt);
-            assert!(delay <= MAX_BACKOFF, "attempt {attempt}: {delay:?} over cap");
+            assert!(
+                delay <= MAX_BACKOFF,
+                "attempt {attempt}: {delay:?} over cap"
+            );
         }
         // The lower bound (half the capped exponential) climbs with attempts
         // until it saturates at MAX_BACKOFF/2.
