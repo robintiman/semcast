@@ -79,15 +79,12 @@ impl OllamaProvider {
             input = %request.input,
             "llm request"
         );
-        let response = self
-            .client
-            .post(format!("{}/api/chat", self.base_url))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| SemcastError::Model(format!("ollama request failed: {e}")))?
-            .error_for_status()
-            .map_err(|e| SemcastError::Model(format!("ollama returned an error: {e}")))?;
+        let response = super::send_with_retry("ollama", || {
+            self.client
+                .post(format!("{}/api/chat", self.base_url))
+                .json(&body)
+        })
+        .await?;
         let chat: ChatResponse = response
             .json()
             .await
@@ -119,18 +116,15 @@ impl ModelProvider for OllamaProvider {
     }
 
     async fn embed(&self, texts: Vec<String>) -> Result<Vec<Embedding>> {
-        let response = self
-            .client
-            .post(format!("{}/api/embed", self.base_url))
-            .json(&EmbedRequest {
-                model: &self.embed_model,
-                input: &texts,
-            })
-            .send()
-            .await
-            .map_err(|e| SemcastError::Model(format!("ollama embed request failed: {e}")))?
-            .error_for_status()
-            .map_err(|e| SemcastError::Model(format!("ollama embed returned an error: {e}")))?;
+        let response = super::send_with_retry("ollama", || {
+            self.client
+                .post(format!("{}/api/embed", self.base_url))
+                .json(&EmbedRequest {
+                    model: &self.embed_model,
+                    input: &texts,
+                })
+        })
+        .await?;
         let embed: EmbedResponse = response
             .json()
             .await

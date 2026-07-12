@@ -30,10 +30,6 @@ const META_EMBED_DIM: &str = "semcast.embed_dim";
 const META_CHUNK_MAX_TOKENS: &str = "semcast.chunk_max_tokens";
 const META_CHUNK_OVERLAP_TOKENS: &str = "semcast.chunk_overlap_tokens";
 
-/// Chunk texts per `ModelProvider::embed` call, so huge corpora don't build
-/// one giant request body.
-const EMBED_BATCH: usize = 64;
-
 /// Embedded once at creation to learn the vector dimension before any
 /// document arrives.
 const DIM_PROBE: &str = "semcast embedding dimension probe";
@@ -150,7 +146,7 @@ impl LanceIndex {
 
     async fn embed_chunks(&self, chunks: &[(u64, u32, String)]) -> Result<Vec<Embedding>> {
         let mut vectors = Vec::with_capacity(chunks.len());
-        for batch in chunks.chunks(EMBED_BATCH) {
+        for batch in chunks.chunks(self.embedder.embed_batch_size().max(1)) {
             let embedded = self
                 .embedder
                 .embed(batch.iter().map(|(_, _, text)| text.clone()).collect())
