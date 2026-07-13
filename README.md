@@ -47,6 +47,11 @@
     <li>
       <a href="#usage">Usage</a>
       <ul>
+        <li><a href="#means--semantic-filter">MEANS — semantic filter</a></li>
+        <li><a href="#create-semantic-index">CREATE SEMANTIC INDEX</a></li>
+        <li><a href="#with-recall">WITH RECALL</a></li>
+        <li><a href="#create-semantic-type">CREATE SEMANTIC TYPE</a></li>
+        <li><a href="#typed-extraction">Typed extraction</a></li>
         <li><a href="#serve-it">Serve it</a></li>
         <li><a href="#load-data">Load data</a></li>
       </ul>
@@ -134,60 +139,133 @@ cargo test --test live_ollama -- --ignored         # end-to-end against local Ol
 <!-- USAGE EXAMPLES -->
 ## Usage
 
-Start the server, connect with any Postgres client, and query with plain
-SQL plus the `MEANS` predicate:
+Everything below is what semcast adds on top of SQL. Standard SQL — joins,
+aggregates, window functions, `CREATE EXTERNAL TABLE`, `COPY` — is
+DataFusion's; see the
+[DataFusion SQL reference](https://datafusion.apache.org/user-guide/sql/index.html).
+
+### MEANS — semantic filter
 
 ```sql
-CREATE EXTERNAL TABLE meetings STORED AS CSV LOCATION 'meetings.csv';
-
--- Optional but what makes it cheap: prunes candidates by vector
--- similarity so the model reads chunks of survivors, not every row.
-CREATE SEMANTIC INDEX ON meetings(transcript);
-
 SELECT meeting_id, title FROM meetings
 WHERE held_at >= CAST('2026-01-01' AS TIMESTAMP)
   AND transcript MEANS 'discussed the launch of offline sync in Atlas';
 ```
 
-`MEANS` is allowed in top-level `AND` conjuncts of `WHERE` only; anything
-else (`OR`, `NOT`, the `SELECT` list) fails at plan time rather than
-silently costing a call per row.
+`text MEANS 'condition'` keeps rows where the model judges the text
+matches the condition.
 
-What runs today: `MEANS` rewrites to a `SemFilter` above your free
-predicates (so they run first), survivors are verified with batched async
-calls, and verdicts are cached by provenance — reruns and narrower
-follow-ups cost zero new calls. With an index (the DDL above), the planner
-adds the cheap stage: chunks are embedded once into a Lance dataset, one
-embedding call per query prunes non-candidates by vector similarity, and
-the verify model reads each survivor's top-3 chunks instead of the whole
-document. Rows the index has never seen pass through to full-text verify —
-never silently dropped; re-running `CREATE SEMANTIC INDEX` rebuilds the
-index and picks them up.
+* Allowed only as a top-level `AND` conjunct of `WHERE`, with a
+  string-literal condition. Anything else — `OR`, `NOT`, the `SELECT`
+  list, a computed condition — fails at plan time rather than silently
+  costing a call per row.
+* Free predicates run first; survivors are verified with batched async
+  calls; verdicts are cached by provenance, so reruns and narrower
+  follow-ups cost zero new calls.
+* `MEANS` is effectively reserved — quote `"means"` to use it as an
+  identifier.
 
-Add `WITH RECALL 0.9` and the pruning threshold is calibrated instead of
-guessed: the scan labels a sample of surviving rows (≤64 full-text calls,
-shared with the verdict cache, so repeat questions relabel for free) and sets
-the floor so ≥90% of the sample's true matches survive. Without the clause
-thresholds are best-effort, and `EXPLAIN` says which you're getting:
+### CREATE SEMANTIC INDEX
+
+```sql
+CREATE SEMANTIC INDEX ON meetings(transcript);
+```
+
+Optional, but what makes `MEANS` cheap. Chunks are embedded once into a
+Lance dataset; at query time one embedding call prunes non-candidates by
+vector similarity, and the verify model reads each survivor's top-3 chunks
+instead of the whole document. Rows the index has never seen pass through
+to full-text verify — never silently dropped; re-run the statement to
+rebuild and pick them up.
+
+### WITH RECALL
+
+```sql
+SELECT meeting_id FROM meetings
+WHERE transcript MEANS 'offline sync' WITH RECALL 0.9;
+```
+
+Trailing statement clause, target in (0, 1]. Calibrates the index pruning
+threshold instead of guessing: the scan labels a sample of surviving rows
+(≤64 full-text calls, shared with the verdict cache) and sets the floor so
+≥90% of the sample's true matches survive. Without it thresholds are
+best-effort, and `EXPLAIN` says which you're getting:
 
 ```text
-VerifyExec: MEANS('discussed the launch of offline sync in Atlas') model=ollama/gemma4:e4b reads top-3 chunks per doc   ~3 model calls
-  IndexScanExec: MEANS('discussed the launch of offline sync in Atlas') embed_model=ollama/gemma4:e4b floor=calibrated(recall≥0.90, sample≤64) top-3 chunks
+VerifyExec: MEANS('offline sync') model=ollama/gemma4:e4b reads top-3 chunks per doc   ~3 model calls
+  IndexScanExec: MEANS('offline sync') embed_model=ollama/nomic-embed-text floor=calibrated(recall≥0.90, sample≤64) top-3 chunks
 ```
+
+### CREATE SEMANTIC TYPE
+
+```sql
+CREATE SEMANTIC TYPE MeetingFacts AS (
+    products  TEXT[]  'product names discussed in this meeting',
+    decisions TEXT[]  'concrete decisions that were made',
+    TOGETHER (
+        launch_stage ONEOF(none, idea, planned, scheduled, shipped)
+                     'the furthest launch stage discussed',
+        stage_quote  TEXT 'the transcript line that shows that stage'
+    )
+);
+```
+
+A named extraction spec. Each field is a name, a type, and a one-line doc
+string — semcast synthesizes the prompt and the constrained-decoding
+schema from these; you never write a prompt.
+
+| Field type | Meaning |
+| --- | --- |
+| `TEXT` | free-form text |
+| `INT`, `REAL` | numbers — aggregate in SQL, no LLM at rollup |
+| `REAL CHECK (a..b)` | bounded number, validated at decode time |
+| `BOOL` | true/false — a plain predicate |
+| `ONEOF(a, b, c)` | closed category; `GROUP BY`-able |
+| `LEVEL(a, b, c)` | ordered category, declared low→high |
+| `T[]` | list of any of the above |
+
+`TOGETHER (...)` groups fields that are extracted in one model call and
+cached as a unit — the planner never prunes one member without the others.
+Ungrouped fields are independent, which is what enables field pushdown.
+
+Editing one field's doc line invalidates exactly that field's cache
+entries; sibling fields stay cached.
+
+### Typed extraction
+
+```sql
+-- one field
+SELECT meeting_id, CAST(transcript AS MeetingFacts).launch_stage FROM meetings;
+
+-- the whole struct
+SELECT CAST(transcript AS MeetingFacts) AS facts FROM meetings;
+
+-- one-off field, no CREATE needed
+SELECT EXTRACT(products TEXT[] 'product names discussed' FROM transcript)
+FROM meetings;
+```
+
+* `SELECT` list only. To filter or group on an extracted field, wrap it in
+  a subquery:
+
+  ```sql
+  SELECT stage, count(*) FROM (
+      SELECT CAST(transcript AS MeetingFacts).launch_stage AS stage FROM meetings
+  ) GROUP BY stage;
+  ```
+
+* Field pushdown: only the fields the query references (plus their
+  `TOGETHER` siblings) are sent to the model.
+* One field access deep — `CAST(x AS T).field[1]` needs a subquery.
+* `NULL` source → `NULL` field, no model call.
+* Composes with `MEANS`: extraction runs on filter survivors only.
 
 ### Serve it
 
-semcast is meant to be run as a service — any Postgres simple-protocol
-client connects (`psql` works; DBeaver needs the extended protocol, still on
-the roadmap):
-
-```sh
-semcast serve                                      # prebuilt binary, Ollama provider
-cargo run -- serve                                 # or from a checkout
-psql -h 127.0.0.1 -p 5433
-```
-
-Funnel progress streams back as NOTICE messages while the model runs:
+Any Postgres simple-protocol client connects (`psql` works; DBeaver needs
+the extended protocol, still on the roadmap). See
+[Installation](#installation) for the server flags. Funnel progress
+streams back as NOTICE messages while the model runs:
 
 ```text
 semcast=> SELECT meeting_id FROM meetings
@@ -197,33 +275,24 @@ NOTICE:  funnel: VerifyExec: MEANS('offline sync') model=ollama/gemma4:e4b reads
 NOTICE:  funnel done — index scan: 47 hits, 3053 pruned; verify: 47 model calls, 12 cache hits, 35 dropped
 ```
 
-`semcast serve --help` lists the knobs: `--port` (5433), `--provider`
-(`anthropic` by default, which needs `ANTHROPIC_API_KEY`, or `ollama`),
-`--model`, `--embed-model`, `--ollama-url`, `--embed-provider` (`voyage` by
-default, which needs `VOYAGE_API_KEY`, or `ollama`), `--voyage-model`,
-`--index-dir`. Indexes record
-which embedder built them, so switching `--embed-provider` against an existing
-`--index-dir` refuses to open the old indexes rather than search them with
-mismatched vectors.
+Indexes record which embedder built them, so switching `--embed-provider`
+against an existing `--index-dir` refuses to open the old indexes rather
+than search them with mismatched vectors.
 
 ### Load data
 
 Local Parquet and CSV, DuckDB-style — query files by path (globs work),
-mount them as tables, or materialize into memory:
+mount them with `CREATE EXTERNAL TABLE`, or materialize into memory:
 
 ```sql
 SELECT * FROM 'data/meetings.parquet';
-SELECT count(*) FROM 'data/part-*.parquet';
-
-CREATE EXTERNAL TABLE meetings STORED AS CSV LOCATION 'data/meetings.csv'
-  OPTIONS ('format.delimiter' ';');            -- header on by default
-
-CREATE TABLE mem AS SELECT * FROM 'data/meetings.csv';
-COPY mem TO 'out/meetings.parquet' STORED AS PARQUET;
+CREATE EXTERNAL TABLE meetings STORED AS CSV LOCATION 'data/meetings.csv';
 ```
 
-Paths resolve on the server, and any client can read any file the process
-can. Object storage (s3) is on the roadmap.
+Syntax is DataFusion's — see its
+[DDL](https://datafusion.apache.org/user-guide/sql/ddl.html) docs. Paths
+resolve on the server, and any client can read any file the process can.
+Object storage (s3) is on the roadmap.
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
