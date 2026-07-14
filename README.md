@@ -36,9 +36,6 @@ Semcast is a semantic SQL query engine served over the Postgres wire
 protocol. It adds meaning to SQL: filter text by what it says, extract
 typed fields from it, index it by similarity.
 
-The LLM lives inside the query planner, so a model call is an operator —
-prunable, reorderable, and cacheable like any other.
-
 ## Getting Started
 
 ### Prerequisites
