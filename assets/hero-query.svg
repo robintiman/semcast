@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 836 132" width="720" role="img" aria-label="SELECT * FROM meetings WHERE transcript MEANS 'discussed the launch of feature X';">
+  <style>
+    .kw  { fill: #6E7A8A; font-weight: 600; }
+    .id  { fill: #131C18; font-weight: 500; }
+    .op  { fill: #0C917B; font-weight: 700; }
+    .str { fill: #B26B3E; font-weight: 500; }
+    .pn  { fill: #9AA8A0; font-weight: 500; }
+  </style>
+  <rect x="0.5" y="0.5" width="835" height="131" rx="14" fill="#F5F8F6" stroke="#E2E9E5"/>
+  <!-- operator highlight pill behind MEANS -->
+  <rect x="248.4" y="74" width="74" height="26" rx="7" fill="#0FA98F" fill-opacity="0.11" stroke="#0FA98F" stroke-opacity="0.28"/>
+  <g font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="22">
+    <text y="56">
+      <tspan class="kw" x="28">SELECT</tspan><tspan class="pn" x="120.4">*</tspan><tspan class="kw" x="146.8">FROM</tspan><tspan class="id" x="212.8">meetings</tspan>
+    </text>
+    <text y="92">
+      <tspan class="kw" x="28">WHERE</tspan><tspan class="id" x="107.2">transcript</tspan><tspan class="op" x="252.4">MEANS</tspan><tspan class="str" x="331.6">'discussed the launch of feature X'</tspan><tspan class="pn" x="793.6">;</tspan>
+    </text>
+  </g>
+</svg>

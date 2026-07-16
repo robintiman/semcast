@@ -1,10 +1,3 @@
-<!-- PROJECT SHIELDS -->
-[![Contributors][contributors-shield]][contributors-url]
-[![Forks][forks-shield]][forks-url]
-[![Stargazers][stars-shield]][stars-url]
-[![Issues][issues-shield]][issues-url]
-[![Apache-2.0 License][license-shield]][license-url]
-
 <!-- PROJECT LOGO -->
 <br />
 <div align="center">
@@ -14,10 +7,12 @@
   </picture>
 </div>
 
-```sql
-SELECT * FROM reviews
-WHERE review MEANS 'disappointed after an update'; 
-```
+<div align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/hero-query-dark.svg">
+    <img alt="SELECT * FROM meetings WHERE transcript MEANS 'discussed the launch of feature X';" src="assets/hero-query.svg" width="720">
+  </picture>
+</div>
 
 <div align="center">
   <p align="center">
