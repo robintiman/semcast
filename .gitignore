@@ -1,4 +1,5 @@
 /target
 .idea/
-/data/
+/data/*
+!/data/cfpb_complaints.csv
 /DESIGN.md
