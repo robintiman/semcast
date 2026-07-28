@@ -241,12 +241,25 @@ COPY launches TO 'out/launches.parquet' STORED AS PARQUET;
 - [x] pgwire server (simple protocol) with funnel progress as NOTICE messages
 - [x] Ingestion — Parquet/CSV on disk: path-literal `SELECT`, `CREATE EXTERNAL TABLE`, CTAS, `COPY TO`
 - [ ] Persistent, cross-session verdict cache
+- [ ] Run artifacts — a query returns rows; the evidence lands beside it. Per-run
+      table of calls, cost and funnel counts, plus a per-row table of verdict,
+      margin and the chunk that decided it, joinable back to the result
 - [ ] Eval harness — calls saved and recall vs. the LLM-on-every-row baseline
 - [ ] Extended protocol (DBeaver, Grafana, JDBC)
 - [ ] Object storage (s3)
-- [ ] Classify / rank / cluster — semantic `CASE`, `ORDER BY … RELEVANCE TO … LIMIT k`, `GROUP BY MEANING OF`, `SEMANTIC DISTINCT`
+- [ ] Classify / rank / cluster — semantic `CASE`, `GROUP BY MEANING OF`,
+      `SEMANTIC DISTINCT`, and `ORDER BY … RELEVANCE TO … LIMIT k` as a two-stage
+      funnel: index similarity picks the candidates, a rerank pass orders them
+- [ ] Semantic join — `JOIN … ON a MEANS MATCH b` for entity resolution and
+      schema mapping. Needs `means()` to accept a second column instead of only a
+      literal, and an index-blocked candidate stage so it isn't a cross product
+- [ ] Incremental semantic index — `REFRESH SEMANTIC INDEX`, reindexing only
+      rows whose text changed, so an index survives the next load instead of
+      being rebuilt from scratch
 - [ ] `CREATE SEMANTIC PREDICATE` — reusable templates with `CHEAP USING` shortcuts
-- [ ] Nested semantic types, `LEVEL` ordering semantics
+- [ ] Nested semantic types — lists of structs, so one document extracts to N
+      correlated rows (line items on an invoice, products in a catalog page)
+      instead of parallel `T[]` fields; `LEVEL` ordering semantics
 - [ ] `BUDGET` — hard cost caps per query
 
 Want something moved up? [Open an issue](https://github.com/robintiman/semcast/issues).
