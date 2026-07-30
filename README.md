@@ -232,6 +232,38 @@ CREATE TABLE launches AS
 COPY launches TO 'out/launches.parquet' STORED AS PARQUET;
 ```
 
+**dbt**
+
+Stock `dbt-postgres` — no adapter to install. Set `dbname: datafusion`, the
+catalog dbt qualifies every relation with:
+
+```yaml
+semcast:
+  outputs:
+    dev:
+      type: postgres
+      host: 127.0.0.1
+      port: 5433
+      dbname: datafusion   # semcast's catalog name
+      schema: public
+      user: any
+      password: ""
+```
+
+`MEANS` goes straight in a model:
+
+```sql
+select meeting_id, title
+from {{ ref('meetings') }}
+where transcript MEANS 'discussed launching offline sync in Atlas'
+```
+
+Working: `run`, `test`, `seed`, `snapshot`, table/view/ephemeral/incremental
+(`append`). Not yet: `docs generate` (needs the full `pg_catalog`), the
+`delete+insert` and `merge` incremental strategies (DataFusion drops subquery
+predicates in `DELETE`/`UPDATE`, so semcast refuses them rather than rewrite
+every row). Tables live in server memory — restarting drops them.
+
 ## Roadmap
 
 - [x] `MEANS` — planner-integrated semantic predicate with batched verify
@@ -240,6 +272,7 @@ COPY launches TO 'out/launches.parquet' STORED AS PARQUET;
 - [x] Semantic types — `CREATE SEMANTIC TYPE`, `CAST`/`EXTRACT`, constrained decoding, field pushdown
 - [x] pgwire server (simple protocol) with funnel progress as NOTICE messages
 - [x] Ingestion — Parquet/CSV on disk: path-literal `SELECT`, `CREATE EXTERNAL TABLE`, CTAS, `COPY TO`
+- [x] dbt — stock `dbt-postgres` against the `pg_catalog` shim: `run`, `test`, `seed`, `snapshot`
 - [ ] Persistent, cross-session verdict cache
 - [ ] Run artifacts — a query returns rows; the evidence lands beside it. Per-run
       table of calls, cost and funnel counts, plus a per-row table of verdict,

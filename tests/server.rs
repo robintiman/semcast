@@ -21,7 +21,10 @@ async fn connect(
         .with_information_schema(true)
         .build();
     std::mem::forget(index_root); // keep Lance datasets alive for the test
-    let engine = Arc::new(QueryEngine::new(Arc::new(ctx)));
+    let ctx = Arc::new(ctx);
+    // The served surface includes the shim, so tests get it too.
+    semcast::server::pg_catalog::install(&ctx).await.unwrap();
+    let engine = Arc::new(QueryEngine::new(ctx));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -231,4 +234,99 @@ async fn live_ollama_means_query_over_the_wire() {
             .any(|n| n.contains("model calls")),
         "progress notices arrive from a live model",
     );
+}
+
+/// Replay of dbt's table materialization, statement for statement: stage the
+/// model under a temp name, park the live relation as a backup, swap the
+/// staged one in, drop the backup. dbt then re-reads `pg_tables` to refresh
+/// its relation cache.
+#[tokio::test]
+async fn a_dbt_table_materialization_round_trips() {
+    let (client, _) = connect(Arc::new(MockModel::default())).await;
+
+    client
+        .simple_query("CREATE SCHEMA IF NOT EXISTS analytics")
+        .await
+        .unwrap();
+    client
+        .simple_query(
+            r#"CREATE TABLE "datafusion"."analytics"."model" AS (SELECT 1 AS id, 'first' AS name)"#,
+        )
+        .await
+        .unwrap();
+
+    // Second run: the relation already exists, so dbt takes the rename path.
+    for statement in [
+        r#"CREATE TABLE "datafusion"."analytics"."model__dbt_tmp" AS (SELECT 2 AS id, 'second' AS name)"#,
+        r#"ALTER TABLE "datafusion"."analytics"."model" RENAME TO "model__dbt_backup""#,
+        r#"ALTER TABLE "datafusion"."analytics"."model__dbt_tmp" RENAME TO "model""#,
+        r#"DROP TABLE IF EXISTS "datafusion"."analytics"."model__dbt_backup" CASCADE"#,
+    ] {
+        client.simple_query(statement).await.unwrap();
+    }
+
+    let rows = client
+        .simple_query(r#"SELECT name FROM "datafusion"."analytics"."model""#)
+        .await
+        .unwrap();
+    assert_eq!(single_column(&rows), vec!["second"]);
+
+    let tables = client
+        .simple_query("SELECT tablename FROM pg_tables WHERE schemaname ILIKE 'analytics'")
+        .await
+        .unwrap();
+    assert_eq!(
+        single_column(&tables),
+        vec!["model"],
+        "the staging and backup relations are gone from the catalog",
+    );
+}
+
+/// dbt's `delete+insert` incremental strategy emits a subquery predicate that
+/// DataFusion plans without the predicate — every row goes. The server must
+/// refuse it rather than empty the model.
+#[tokio::test]
+async fn a_delete_that_would_empty_the_table_is_refused_over_the_wire() {
+    let (client, _) = connect(Arc::new(MockModel::default())).await;
+
+    for setup in [
+        "CREATE TABLE target AS SELECT * FROM (VALUES (1),(2),(3)) AS v(id)",
+        "CREATE TABLE staging AS SELECT * FROM (VALUES (1)) AS v(id)",
+    ] {
+        client.simple_query(setup).await.unwrap();
+    }
+
+    let error = client
+        .simple_query("DELETE FROM target WHERE (id) IN (SELECT DISTINCT id FROM staging)")
+        .await
+        .expect_err("the delete is refused");
+    let db_error = error.as_db_error().expect("server-side error");
+    assert!(
+        db_error.message().contains("subquery"),
+        "the error names the cause, got: {}",
+        db_error.message(),
+    );
+
+    let rows = client
+        .simple_query("SELECT id FROM target ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(single_column(&rows), vec!["1", "2", "3"]);
+}
+
+/// dbt's relation-dependency walk casts to `regclass`, which DataFusion has
+/// no type for; the server answers it with the right shape and no rows.
+#[tokio::test]
+async fn the_relation_dependency_walk_answers_empty() {
+    let (client, _) = connect(Arc::new(MockModel::default())).await;
+
+    let rows = client
+        .simple_query(
+            "select distinct dependent_namespace.nspname as dependent_schema
+             from pg_class as dependent_class
+             join pg_depend as d on d.classid = 'pg_rewrite'::regclass",
+        )
+        .await
+        .unwrap();
+    assert!(single_column(&rows).is_empty());
 }

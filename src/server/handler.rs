@@ -84,6 +84,11 @@ impl SimpleQueryHandler for SemcastHandler {
                         concat!("16.6 (semcast ", env!("CARGO_PKG_VERSION"), ")"),
                     )?);
                 }
+                Route::CannedRelationDependencies => {
+                    responses.push(encode::empty_response(
+                        &super::pg_catalog::RELATION_DEPENDENCY_COLUMNS,
+                    )?);
+                }
                 Route::Engine => match self.run_statement(client, statement).await? {
                     Ok(response) => responses.push(response),
                     // Postgres aborts the rest of a multi-statement string
@@ -155,7 +160,10 @@ fn notice(line: &str) -> NoticeResponse {
 fn user_error(statement: &str, error: &crate::SemcastError) -> ErrorInfo {
     let lower = statement.to_ascii_lowercase();
     let message = if lower.contains("pg_catalog") || lower.contains("from pg_") {
-        "pg_catalog introspection is not supported yet (psql \\d commands won't work)".to_owned()
+        "pg_catalog introspection is only shimmed as far as dbt needs it — unqualified \
+         pg_namespace, pg_tables, pg_views, pg_matviews and pg_proc. The rest (psql \\d, \
+         dbt docs generate) is not supported yet"
+            .to_owned()
     } else {
         error.to_string()
     };

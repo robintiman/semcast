@@ -10,11 +10,13 @@
 //!
 //! [`SemFilterNode`]: crate::logical::SemFilterNode
 
+pub mod compat;
 pub mod ddl;
 pub mod dialect;
 pub mod extract_udf;
 pub mod means_udf;
 pub mod recall;
+pub mod rename;
 pub mod typed;
 
 pub use dialect::SemcastDialect;
