@@ -113,6 +113,33 @@ WHERE transcript MEANS 'discussed offline sync'
 WITH RECALL 0.9;
 ```
 
+#### `RELEVANCE TO`
+
+```sql
+ORDER BY <text_column> RELEVANCE TO '<natural-language query>' LIMIT <k>
+relevance(<text_column>, '<natural-language query>')   -- the score, as a value
+```
+
+Orders rows by how well the text answers the query, best first. Two stages:
+the index picks 4× `k` candidates by similarity, then one model call each
+scores them 0–1. Cost tracks `k`, not the table.
+
+`LIMIT` and a semantic index are both required — without either, ranking is
+one model call per row of the whole table. The result is an approximate
+top-`k`: a row the index didn't surface as a candidate can't win.
+
+```sql
+SELECT meeting_id, title FROM meetings
+ORDER BY transcript RELEVANCE TO 'offline sync' LIMIT 10;
+
+SELECT meeting_id, relevance(transcript, 'offline sync') AS score
+FROM meetings ORDER BY score DESC LIMIT 10;
+```
+
+The two forms are the same plan; `relevance()` also makes the score a value
+you can select. A bare `ORDER BY relevance(...)` sorts best-first — write
+`ASC` for worst-first.
+
 #### `CREATE SEMANTIC INDEX`
 
 ```sql
@@ -288,9 +315,12 @@ jobs stay queryable across restarts. One statement per `SUBMIT`.
 - [ ] Eval harness — calls saved and recall vs. the LLM-on-every-row baseline
 - [ ] Extended protocol (DBeaver, Grafana, JDBC)
 - [ ] Object storage (s3)
-- [ ] Classify / rank / cluster — semantic `CASE`, `GROUP BY MEANING OF`,
-      `SEMANTIC DISTINCT`, and `ORDER BY … RELEVANCE TO … LIMIT k` as a two-stage
-      funnel: index similarity picks the candidates, a rerank pass orders them
+- [x] Rank — `ORDER BY … RELEVANCE TO … LIMIT k` and `relevance()` as a
+      two-stage funnel: index similarity picks the candidates, a rerank pass
+      orders them
+- [ ] Classify / cluster — semantic `CASE` (`MEANS` in a `CASE` branch, all
+      branches fused into one call), `GROUP BY MEANING OF … INTO k`, and
+      `SEMANTIC DISTINCT ON`
 - [ ] Semantic join — `JOIN … ON a MEANS MATCH b` for entity resolution and
       schema mapping. Needs `means()` to accept a second column instead of only a
       literal, and an index-blocked candidate stage so it isn't a cross product

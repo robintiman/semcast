@@ -51,11 +51,20 @@ pub struct FunnelCounts {
     pub extract_cache_hits: usize,
     pub extract_rows_failed: usize,
     pub extract_fields_failed: usize,
+    pub has_rank: bool,
+    pub rank_candidate_rows: usize,
+    pub rank_rows_pruned: usize,
+    /// Rows the index has never seen. A rank drops them, so a non-zero count
+    /// means results are missing until the index is refreshed.
+    pub rank_unindexed_rows: usize,
+    pub rank_model_calls: usize,
+    pub rank_cache_hits: usize,
+    pub rank_rows_failed: usize,
 }
 
 impl FunnelCounts {
     pub fn is_semantic(&self) -> bool {
-        self.has_index_scan || self.has_verify || self.has_extract
+        self.has_index_scan || self.has_verify || self.has_extract || self.has_rank
     }
 }
 
@@ -104,6 +113,17 @@ pub fn snapshot(plan: &Arc<dyn ExecutionPlan>) -> FunnelCounts {
                     counts.extract_cache_hits += counter_total(&metrics, "cache_hits");
                     counts.extract_rows_failed += counter_total(&metrics, "rows_failed");
                     counts.extract_fields_failed += counter_total(&metrics, "fields_failed");
+                }
+            }
+            "SemRankExec" => {
+                counts.has_rank = true;
+                if let Some(metrics) = metrics {
+                    counts.rank_candidate_rows += counter_total(&metrics, "candidate_rows");
+                    counts.rank_rows_pruned += counter_total(&metrics, "rows_pruned");
+                    counts.rank_unindexed_rows += counter_total(&metrics, "unindexed_rows");
+                    counts.rank_model_calls += counter_total(&metrics, "model_calls");
+                    counts.rank_cache_hits += counter_total(&metrics, "cache_hits");
+                    counts.rank_rows_failed += counter_total(&metrics, "rows_failed");
                 }
             }
             _ => unreachable!("semcast_nodes returns only semcast operators"),
@@ -159,6 +179,25 @@ pub fn render(counts: &FunnelCounts) -> String {
             counts.extract_fields_failed,
         ));
     }
+    if counts.has_rank {
+        parts.push(format!(
+            "rank: {} candidates, {} pruned, {} model calls, {} cache hits, {} rows failed",
+            counts.rank_candidate_rows,
+            counts.rank_rows_pruned,
+            counts.rank_model_calls,
+            counts.rank_cache_hits,
+            counts.rank_rows_failed,
+        ));
+        // Dropped rows are invisible in the result, so they get their own
+        // line rather than a number buried in the funnel.
+        if counts.rank_unindexed_rows > 0 {
+            parts.push(format!(
+                "rank: {} rows are not in the semantic index and were skipped — \
+                 REFRESH SEMANTIC INDEX to include them",
+                counts.rank_unindexed_rows,
+            ));
+        }
+    }
     parts.join("; ")
 }
 
@@ -171,7 +210,7 @@ fn semcast_nodes(plan: &Arc<dyn ExecutionPlan>) -> Vec<Arc<dyn ExecutionPlan>> {
 fn collect(plan: &Arc<dyn ExecutionPlan>, out: &mut Vec<Arc<dyn ExecutionPlan>>) {
     if matches!(
         plan.name(),
-        "IndexScanExec" | "VerifyExec" | "SemExtractExec"
+        "IndexScanExec" | "VerifyExec" | "SemExtractExec" | "SemRankExec"
     ) {
         out.push(Arc::clone(plan));
     }
