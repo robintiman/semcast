@@ -34,8 +34,9 @@ struct ServeArgs {
     #[arg(long, default_value_t = 5433)]
     port: u16,
     /// Which provider runs completions (MEANS verify, extraction).
-    /// `anthropic` needs ANTHROPIC_API_KEY exported.
-    #[arg(long, value_enum, default_value_t = CompletionProvider::Anthropic)]
+    /// `ollama` (the default) runs locally; `anthropic` needs
+    /// ANTHROPIC_API_KEY exported.
+    #[arg(long, value_enum, default_value_t = CompletionProvider::Ollama)]
     provider: CompletionProvider,
     /// Chat model used to verify MEANS predicates. Defaults per provider:
     /// claude-haiku-4-5 for `anthropic`, gemma4:e4b for `ollama`.
@@ -47,9 +48,9 @@ struct ServeArgs {
     embed_model: String,
     #[arg(long, default_value = semcast::model::DEFAULT_OLLAMA_URL)]
     ollama_url: String,
-    /// Which provider embeds text for semantic indexes. `voyage` needs
-    /// VOYAGE_API_KEY exported.
-    #[arg(long, value_enum, default_value_t = EmbedProvider::Voyage)]
+    /// Which provider embeds text for semantic indexes. `ollama` (the
+    /// default) runs locally; `voyage` needs VOYAGE_API_KEY exported.
+    #[arg(long, value_enum, default_value_t = EmbedProvider::Ollama)]
     embed_provider: EmbedProvider,
     /// Voyage embedding model (with `--embed-provider voyage`).
     #[arg(long, default_value = semcast::model::DEFAULT_VOYAGE_MODEL)]
