@@ -20,6 +20,12 @@ struct Server {
 
 /// Serve a fresh jobs-enabled context on an ephemeral port.
 async fn connect(model: Arc<dyn ModelProvider>) -> Server {
+    connect_with_slots(model, 4).await
+}
+
+/// [`connect`] with the concurrency ceiling as a parameter, for tests about
+/// what happens to a job that is still waiting for a slot.
+async fn connect_with_slots(model: Arc<dyn ModelProvider>, max_concurrent: usize) -> Server {
     let index_root = tempfile::tempdir().unwrap();
     let jobs_root = tempfile::tempdir().unwrap();
     let ctx = Arc::new(
@@ -28,7 +34,7 @@ async fn connect(model: Arc<dyn ModelProvider>) -> Server {
             .with_information_schema(true)
             .build(),
     );
-    let registry = Arc::new(JobRegistry::new(jobs_root.path(), 4).unwrap());
+    let registry = Arc::new(JobRegistry::new(jobs_root.path(), max_concurrent).unwrap());
     jobs::register(&ctx, &registry).unwrap();
     // Keep Lance datasets and job artifacts alive for the whole test.
     std::mem::forget(index_root);
@@ -300,6 +306,51 @@ async fn cancel_job_stops_a_running_job() {
     // Cancelling twice is an error, not a silent no-op.
     let err = error_message(&server, &format!("CANCEL JOB '{id}'")).await;
     assert!(err.contains("already finished"), "got: {err}");
+}
+
+#[tokio::test]
+async fn cancelling_a_queued_job_keeps_it_from_ever_running() {
+    // One slot, so the second job is still waiting when it is cancelled.
+    let model = Arc::new(
+        MockModel::answering_yes_to(["offline sync"]).with_latency(Duration::from_millis(600)),
+    );
+    let server = connect_with_slots(Arc::clone(&model) as Arc<dyn ModelProvider>, 1).await;
+    server.seed().await;
+
+    let query = "SELECT meeting_id FROM meetings WHERE transcript MEANS 'offline sync'";
+    let running = server.submit(query).await;
+    assert_eq!(server.wait_until_started(&running).await, "running");
+    let queued = server.submit(query).await;
+    assert_eq!(server.status(&queued).await, "queued", "the slot is taken");
+
+    server.query(&format!("CANCEL JOB '{queued}'")).await;
+    assert_eq!(server.status(&queued).await, "cancelled");
+
+    // The slot frees here. The cancelled job must not pick it up: it was
+    // cancelled precisely so it would never spend a model call.
+    assert_eq!(
+        server.wait_for(&running, Duration::from_secs(10)).await,
+        "succeeded"
+    );
+    let spent = model.completion_calls();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        model.completion_calls(),
+        spent,
+        "the cancelled job took the free slot and spent model calls anyway",
+    );
+
+    let messages = server
+        .query(&format!(
+            "SELECT status, started_at FROM semcast_jobs WHERE job_id = '{queued}'"
+        ))
+        .await;
+    assert_eq!(column(&messages, 0), vec!["cancelled"]);
+    assert_eq!(
+        column(&messages, 1),
+        vec![""],
+        "it never started, so it has no start time",
+    );
 }
 
 #[tokio::test]

@@ -198,8 +198,8 @@ impl JobRegistry {
         self.root.join(id)
     }
 
-    /// Register a job and create its directory. The caller spawns the work and
-    /// hands back the [`AbortHandle`] via [`Self::attach`].
+    /// Register a job and create its directory. The caller starts the work
+    /// through [`Self::spawn_attached`].
     pub fn create(&self, sql: &str) -> std::io::Result<String> {
         let submitted_at_ms = now_ms();
         let seq = self.counter.fetch_add(1, Ordering::Relaxed);
@@ -218,26 +218,53 @@ impl JobRegistry {
         Ok(id)
     }
 
-    pub fn attach(&self, id: &str, abort: AbortHandle) {
-        if let Some(entry) = self.jobs.lock().unwrap().get_mut(id) {
+    /// Start the job's task and store its [`AbortHandle`], both under the
+    /// registry lock.
+    ///
+    /// The lock is what makes cancellation reliable: the task's first act is
+    /// [`Self::start`], which needs the same lock, so it cannot begin work —
+    /// and a concurrent [`Self::cancel`] cannot observe a handle-less record —
+    /// until the handle is stored. Spawning outside the lock leaves a window
+    /// where a cancel reports success and the job runs on, spending the model
+    /// calls the cancel was meant to stop.
+    pub fn spawn_attached(&self, id: &str, spawn: impl FnOnce() -> AbortHandle) {
+        let mut jobs = self.jobs.lock().unwrap();
+        let abort = spawn();
+        if let Some(entry) = jobs.get_mut(id) {
             entry.abort = Some(abort);
         }
     }
 
-    /// Mutate a record and flush it to disk. Flush failures are logged, not
-    /// propagated — losing a status file must not kill a running job.
-    pub fn update(&self, id: &str, mutate: impl FnOnce(&mut JobRecord)) {
-        let record = {
-            let mut jobs = self.jobs.lock().unwrap();
-            let Some(entry) = jobs.get_mut(id) else {
-                return;
-            };
-            mutate(&mut entry.record);
-            entry.record.clone()
+    /// Move a job to `running`, or refuse if it is already terminal — it was
+    /// cancelled while it waited for a slot. Returns whether to do the work.
+    pub fn start(&self, id: &str) -> bool {
+        let mut jobs = self.jobs.lock().unwrap();
+        let Some(entry) = jobs.get_mut(id) else {
+            return false;
         };
-        if let Err(error) = write_record(&self.dir(id), &record) {
-            tracing::warn!("semcast: could not persist job {id}: {error}");
+        if entry.record.status.is_terminal() {
+            return false;
         }
+        entry.record.status = JobStatus::Running;
+        entry.record.started_at_ms = Some(now_ms());
+        persist(&self.root.join(id), &entry.record);
+        true
+    }
+
+    /// Mutate a record and flush it to disk.
+    ///
+    /// The flush happens under the same lock as the mutation. Cloning the
+    /// record and writing it afterwards would let two updaters for one job —
+    /// a [`Self::cancel`] racing the progress drain — interleave inside the
+    /// write, or land out of order and persist a status that has already been
+    /// superseded.
+    pub fn update(&self, id: &str, mutate: impl FnOnce(&mut JobRecord)) {
+        let mut jobs = self.jobs.lock().unwrap();
+        let Some(entry) = jobs.get_mut(id) else {
+            return;
+        };
+        mutate(&mut entry.record);
+        persist(&self.root.join(id), &entry.record);
     }
 
     pub fn get(&self, id: &str) -> Option<JobRecord> {
@@ -284,9 +311,9 @@ impl JobRegistry {
             entry.record.finished_at_ms = Some(now_ms());
             // Whatever Parquet was written is missing its footer.
             entry.record.result_path = None;
+            persist(&self.root.join(id), &entry.record);
             entry.abort.take()
         };
-        self.update(id, |_| {});
         if let Some(abort) = abort {
             abort.abort();
         }
@@ -294,10 +321,20 @@ impl JobRegistry {
     }
 }
 
+/// Flush a record whose lock the caller holds. Failures are logged, not
+/// propagated — losing a status file must not kill a running job.
+fn persist(dir: &Path, record: &JobRecord) {
+    if let Err(error) = write_record(dir, record) {
+        tracing::warn!("semcast: could not persist job {}: {error}", record.id);
+    }
+}
+
 fn write_record(dir: &Path, record: &JobRecord) -> std::io::Result<()> {
     // Write-then-rename: a crash mid-write must not leave a half-parsed
-    // job.json that recovery then skips.
-    let tmp = dir.join("job.json.tmp");
+    // job.json that recovery then skips. The temp name carries the pid so
+    // that two processes sharing a jobs dir cannot scribble over each
+    // other's half-written file.
+    let tmp = dir.join(format!("job.json.{}.tmp", std::process::id()));
     let json = serde_json::to_vec_pretty(record)?;
     std::fs::write(&tmp, json)?;
     std::fs::rename(tmp, dir.join(RECORD_FILE))
@@ -400,6 +437,71 @@ mod tests {
                 .contains("already finished"),
             "a finished job cannot be cancelled",
         );
+    }
+
+    #[test]
+    fn a_cancelled_job_never_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = JobRegistry::new(dir.path(), 2).unwrap();
+        let id = registry.create("SELECT 1").unwrap();
+
+        // Cancelled before its task reached a slot: nothing must run, or the
+        // job spends the model calls the cancel was meant to stop.
+        registry.cancel(&id).unwrap();
+        assert!(!registry.start(&id), "a cancelled job refuses to start");
+        assert_eq!(registry.get(&id).unwrap().status, JobStatus::Cancelled);
+
+        assert!(!registry.start("nope"), "so does a job that does not exist");
+    }
+
+    #[test]
+    fn start_moves_a_queued_job_to_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = JobRegistry::new(dir.path(), 2).unwrap();
+        let id = registry.create("SELECT 1").unwrap();
+
+        assert!(registry.start(&id));
+        let record = registry.get(&id).unwrap();
+        assert_eq!(record.status, JobStatus::Running);
+        assert!(record.started_at_ms.is_some());
+    }
+
+    #[test]
+    fn concurrent_updates_persist_a_readable_record() {
+        // The progress drain and a `cancel` update one job at the same
+        // instant. Cloning the record and writing it after the lock is
+        // released loses this race two ways: the two writes interleave into a
+        // half-written job.json, or the drain's older clone lands last and
+        // persists `running` over `cancelled`. Both are reproducible within a
+        // few dozen attempts, so the margin here is deliberate.
+        let dir = tempfile::tempdir().unwrap();
+        let registry = JobRegistry::new(dir.path(), 2).unwrap();
+        let sql = "SELECT 'x'".repeat(2_000);
+
+        for attempt in 0..300 {
+            let id = registry.create(&sql).unwrap();
+            registry.start(&id);
+            let gate = std::sync::Barrier::new(2);
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    gate.wait();
+                    registry.update(&id, |r| r.progress = Some("last tick".to_owned()));
+                });
+                scope.spawn(|| {
+                    gate.wait();
+                    registry.cancel(&id).unwrap();
+                });
+            });
+
+            let text = std::fs::read_to_string(dir.path().join(&id).join(RECORD_FILE)).unwrap();
+            let on_disk: JobRecord = serde_json::from_str(&text)
+                .unwrap_or_else(|e| panic!("attempt {attempt}: job.json parses: {e}"));
+            assert_eq!(
+                on_disk.status,
+                JobStatus::Cancelled,
+                "attempt {attempt}: a stale write won",
+            );
+        }
     }
 
     #[test]

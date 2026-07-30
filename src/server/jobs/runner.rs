@@ -4,7 +4,9 @@
 //! [`QueryEngine::execute_into`] with a Parquet target, mirrors progress into
 //! the record, and writes a terminal status. Cancellation aborts the task
 //! outright, so [`JobRegistry::cancel`] — not this module — writes the
-//! `cancelled` status before it pulls the trigger.
+//! `cancelled` status before it pulls the trigger. An abort cannot land on a
+//! job that has not been polled yet, so the task also refuses to start a job
+//! that is already terminal.
 
 use std::sync::Arc;
 
@@ -34,8 +36,13 @@ impl QueryEngine {
 
         let engine = Arc::clone(self);
         let registry = Arc::clone(jobs);
-        let task = tokio::spawn(run(engine, registry, id.clone(), sql.to_owned()));
-        jobs.attach(&id, task.abort_handle());
+        let sql = sql.to_owned();
+        let spawned = id.clone();
+        // The spawn happens under the registry lock so the abort handle is in
+        // place before the task can start or a cancel can look for it.
+        jobs.spawn_attached(&id, || {
+            tokio::spawn(run(engine, registry, spawned, sql)).abort_handle()
+        });
         Ok(id)
     }
 }
@@ -47,10 +54,12 @@ async fn run(engine: Arc<QueryEngine>, jobs: Arc<JobRegistry>, id: String, sql: 
         Ok(permit) => permit,
         Err(_) => return, // registry shutting down
     };
-    jobs.update(&id, |record| {
-        record.status = JobStatus::Running;
-        record.started_at_ms = Some(now_ms());
-    });
+    // A cancel that landed while this job queued has already written its
+    // terminal status; running anyway would spend the model calls the cancel
+    // was meant to stop.
+    if !jobs.start(&id) {
+        return;
+    }
 
     let dir = jobs.dir(&id);
     let (events, progress) = mpsc::channel::<ProgressEvent>(PROGRESS_BUFFER);
