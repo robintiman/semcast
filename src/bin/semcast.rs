@@ -63,7 +63,9 @@ struct ServeArgs {
     #[arg(long)]
     jobs_dir: Option<PathBuf>,
     /// How many submitted jobs run at once; the rest wait in `queued`.
-    /// Every running job is spending model calls, hence the ceiling.
+    /// They share one model backend, so set this to what the provider
+    /// serves concurrently — against a single local model, more jobs is
+    /// slower, not faster.
     #[arg(long, default_value_t = 4)]
     max_concurrent_jobs: usize,
 }

@@ -4,8 +4,8 @@
 //!
 //! Semantic queries run for minutes to hours — one model call per surviving
 //! row, or a whole-corpus embed for `CREATE SEMANTIC INDEX`. Holding a TCP
-//! connection open for that long means a dropped link throws away work that
-//! has already been paid for in model calls.
+//! connection open for that long means a dropped link throws away every model
+//! call the run has made so far.
 //!
 //! This module is state only: it never holds a `SessionContext`. That is what
 //! keeps the dependencies acyclic — the context needs the registry (to expose
@@ -149,8 +149,9 @@ impl JobRegistry {
 
     /// Load jobs left on disk by an earlier process. Anything still queued or
     /// running was killed by the restart: mark it `interrupted` rather than
-    /// re-running it, because a resubmit spends real money on model calls and
-    /// that is the operator's call to make.
+    /// re-running it. A job can be a CTAS or `CREATE SEMANTIC INDEX` that
+    /// already partly applied, so resuming is not idempotent — and silently
+    /// starting hours of work at boot is the operator's call to make.
     pub fn recover(&self) -> std::io::Result<usize> {
         let mut recovered = 0;
         let mut interrupted = 0;

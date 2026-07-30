@@ -48,7 +48,7 @@ impl QueryEngine {
 }
 
 async fn run(engine: Arc<QueryEngine>, jobs: Arc<JobRegistry>, id: String, sql: String) {
-    // Queued until a slot frees: every running job is spending money, so the
+    // Queued until a slot frees: running jobs share one model backend, so the
     // ceiling is deliberate rather than "however many were submitted".
     let _permit = match jobs.permits().acquire().await {
         Ok(permit) => permit,
