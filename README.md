@@ -37,13 +37,13 @@ typed fields from it, index it by similarity.
 
 Pick a provider:
 
-* **Anthropic** (default for completions) — `export ANTHROPIC_API_KEY=...`;
-  defaults to Haiku, the right tier for one-word verify calls. No embeddings,
-  so pair with Ollama or Voyage to index.
-* **Voyage** (default for embeddings) — `export VOYAGE_API_KEY=...`; hosted
-  embeddings for the semantic index.
-* **Ollama** (local, free) — `ollama pull gemma4:e4b` plus `nomic-embed-text`.
-  Select with `--provider ollama --embed-provider ollama`.
+* **Ollama** (default, local, free) — `ollama pull gemma4:e4b` plus
+  `nomic-embed-text`. Completions and embeddings, no API key.
+* **Anthropic** — `export ANTHROPIC_API_KEY=...`; defaults to Haiku, the right
+  tier for one-word verify calls. No embeddings, so pair with Ollama or Voyage
+  to index. Select with `--provider anthropic`.
+* **Voyage** — `export VOYAGE_API_KEY=...`; hosted embeddings for the semantic
+  index. Select with `--embed-provider voyage`.
 
 ### Installation
 
@@ -58,8 +58,8 @@ Or download a tarball from the
 Then start the server and connect with any Postgres client:
 
 ```sh
-semcast serve                                             # Anthropic + Voyage
-semcast serve --provider ollama --embed-provider ollama   # fully local
+semcast serve                                                 # fully local (Ollama)
+semcast serve --provider anthropic --embed-provider voyage    # hosted
 psql -h 127.0.0.1 -p 5433
 ```
 
