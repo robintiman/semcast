@@ -122,7 +122,11 @@ async fn main() -> std::io::Result<()> {
     if let Some(dir) = &args.index_dir {
         builder = builder.with_index_root(dir);
     }
-    let engine = Arc::new(QueryEngine::new(Arc::new(builder.build())));
+    let ctx = Arc::new(builder.build());
+    semcast::server::pg_catalog::install(&ctx)
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let engine = Arc::new(QueryEngine::new(ctx));
 
     let listener = tokio::net::TcpListener::bind((args.host.as_str(), args.port)).await?;
     tracing::info!(

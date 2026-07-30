@@ -105,7 +105,15 @@ pub async fn sql(ctx: &SessionContext, query: &str) -> Result<DataFrame> {
             .into()),
         };
     }
+    // DataFusion has no `ALTER TABLE .. RENAME`; semcast rebinds the provider.
+    if let Some(rename) = sql::rename::parse_rename(query) {
+        sql::rename::apply_rename(ctx, &rename).await?;
+        let no_rows = LogicalPlanBuilder::empty(false).build()?;
+        return Ok(DataFrame::new(ctx.state(), no_rows));
+    }
     let (mut statement, recall) = sql::recall::parse_statement_with_recall(query)?;
+    sql::compat::demote_temporary_tables(&mut statement);
+    sql::compat::reject_dml_with_subquery(&statement)?;
     // Desugar `CAST(col AS SemanticType)[.field]` into the marker UDFs before
     // planning — DataFusion can't plan the field access itself.
     if let Some(runtime) = ctx.state().config().get_extension::<SemcastRuntime>() {

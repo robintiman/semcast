@@ -6,6 +6,7 @@
 pub mod encode;
 pub mod engine;
 pub mod handler;
+pub mod pg_catalog;
 pub mod progress;
 pub mod router;
 

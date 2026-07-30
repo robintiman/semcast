@@ -14,6 +14,10 @@ pub enum Route {
     CannedTransactionIsolation,
     /// One-row `SHOW server_version` answer.
     CannedServerVersion,
+    /// Zero-row answer to dbt's `pg_depend` relation-dependency walk, which
+    /// needs SQL types DataFusion doesn't have. See
+    /// [`crate::server::pg_catalog::is_relation_dependency_query`].
+    CannedRelationDependencies,
     /// Everything real: `semcast::sql` via the query engine.
     Engine,
 }
@@ -113,6 +117,9 @@ fn skip_block_comment(bytes: &[u8], open: usize) -> usize {
 }
 
 pub fn classify(statement: &str) -> Route {
+    if super::pg_catalog::is_relation_dependency_query(statement) {
+        return Route::CannedRelationDependencies;
+    }
     let lower = statement.to_ascii_lowercase();
     let mut words = lower.split_whitespace();
     match words.next() {

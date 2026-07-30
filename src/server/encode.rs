@@ -85,6 +85,26 @@ pub fn canned_response(column: &str, value: &str) -> PgWireResult<Response> {
     )))
 }
 
+/// Zero rows with the given text columns — for catalog queries the shim
+/// answers without the engine.
+pub fn empty_response(columns: &[&str]) -> PgWireResult<Response> {
+    let fields = Arc::new(
+        columns
+            .iter()
+            .map(|name| {
+                FieldInfo::new(
+                    (*name).to_owned(),
+                    None,
+                    None,
+                    Type::TEXT,
+                    FieldFormat::Text,
+                )
+            })
+            .collect::<Vec<_>>(),
+    );
+    Ok(Response::Query(QueryResponse::new(fields, stream::empty())))
+}
+
 fn encode_batch(
     batch: &RecordBatch,
     fields: &Arc<Vec<FieldInfo>>,
