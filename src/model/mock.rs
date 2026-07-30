@@ -2,6 +2,7 @@
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -25,6 +26,8 @@ pub struct MockModel {
     inputs: Mutex<Vec<String>>,
     schemas: Mutex<Vec<Option<Value>>>,
     embed_calls: AtomicUsize,
+    /// Artificial per-call delay; see [`MockModel::with_latency`].
+    latency: Option<Duration>,
 }
 
 impl std::fmt::Debug for MockModel {
@@ -99,6 +102,14 @@ impl MockModel {
     pub fn embed_calls(&self) -> usize {
         self.embed_calls.load(Ordering::Relaxed)
     }
+
+    /// Sleep this long in every `complete` call. Real providers take seconds
+    /// per batch; tests that need to observe a query *while it runs* — batch
+    /// job progress, cancellation — need a mock that isn't instantaneous.
+    pub fn with_latency(mut self, latency: Duration) -> Self {
+        self.latency = Some(latency);
+        self
+    }
 }
 
 #[async_trait]
@@ -108,6 +119,9 @@ impl ModelProvider for MockModel {
     }
 
     async fn complete(&self, requests: Vec<CompletionRequest>) -> Vec<Result<Completion>> {
+        if let Some(latency) = self.latency {
+            tokio::time::sleep(latency).await;
+        }
         self.calls.fetch_add(requests.len(), Ordering::Relaxed);
         {
             let mut inputs = self.inputs.lock().expect("inputs poisoned");

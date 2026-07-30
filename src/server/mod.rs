@@ -6,6 +6,7 @@
 pub mod encode;
 pub mod engine;
 pub mod handler;
+pub mod jobs;
 pub mod progress;
 pub mod router;
 
@@ -15,6 +16,7 @@ use tokio::net::TcpListener;
 
 pub use engine::QueryEngine;
 pub use handler::SemcastServer;
+pub use jobs::{JobRecord, JobRegistry, JobStatus};
 
 /// Accept connections forever, one task per client. Takes a bound listener
 /// so callers (and tests) control the address.

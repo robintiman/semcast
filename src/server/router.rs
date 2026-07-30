@@ -4,16 +4,24 @@
 //! reject — and the context is shared across connections, so `SET` must not
 //! reach it anyway.
 
+use super::jobs;
+
 /// Where a statement goes. `Canned*` variants answer client handshake
 /// probes without touching the engine.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Route {
+pub enum Route<'a> {
     /// No-op accepted for client compatibility; respond with this command tag.
     NoOp(&'static str),
     /// One-row `SHOW transaction_isolation` answer.
     CannedTransactionIsolation,
     /// One-row `SHOW server_version` answer.
     CannedServerVersion,
+    /// `SUBMIT <statement>` — run detached, carrying the statement verbatim.
+    Submit(&'a str),
+    /// `CANCEL JOB '<id>'`.
+    CancelJob(String),
+    /// A malformed job statement; the message goes straight to the client.
+    JobError(String),
     /// Everything real: `semcast::sql` via the query engine.
     Engine,
 }
@@ -112,7 +120,18 @@ fn skip_block_comment(bytes: &[u8], open: usize) -> usize {
     i
 }
 
-pub fn classify(statement: &str) -> Route {
+pub fn classify(statement: &str) -> Route<'_> {
+    // Job statements are matched on the original text: `SUBMIT` passes its
+    // payload through untouched, so it must not see a lowercased copy.
+    if let Some(job_sql) = jobs::parse::parse_submit(statement) {
+        return Route::Submit(job_sql);
+    }
+    match jobs::parse::parse_cancel_job(statement) {
+        Ok(Some(id)) => return Route::CancelJob(id),
+        Ok(None) => {}
+        Err(message) => return Route::JobError(message),
+    }
+
     let lower = statement.to_ascii_lowercase();
     let mut words = lower.split_whitespace();
     match words.next() {
