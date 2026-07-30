@@ -232,6 +232,46 @@ CREATE TABLE launches AS
 COPY launches TO 'out/launches.parquet' STORED AS PARQUET;
 ```
 
+**Run it as a batch job**
+
+A `MEANS` predicate is one model call per surviving row, and
+`CREATE SEMANTIC INDEX` embeds a whole corpus — runs that take minutes to
+hours. `SUBMIT` detaches the work from the connection, so a dropped link
+doesn't throw away model calls already made:
+
+```sql
+SUBMIT SELECT meeting_id, title FROM meetings
+       WHERE transcript MEANS 'discussed the launch of offline sync in Atlas'
+       WITH RECALL 0.9;
+```
+```
+         job_id
+-------------------------
+ job_1753711331000_0000
+```
+
+Disconnect, come back later, and poll with ordinary SQL — `semcast_jobs` is a
+real table, so it filters, sorts, and joins like any other:
+
+```sql
+SELECT status, rows, model_calls, progress
+FROM semcast_jobs
+WHERE job_id = 'job_1753711331000_0000';
+
+SELECT * FROM job_result('job_1753711331000_0000');
+```
+
+Results are Parquet under `--jobs-dir`, so they outlive the process and never
+have to fit in memory. `--max-concurrent-jobs` (4 by default) caps how many
+run at once; the rest wait in `queued`. Set it to what your provider serves
+concurrently — against a single local model, more jobs is slower, not faster.
+`CANCEL JOB '<id>'` stops one.
+
+A restart marks any job that was still in flight as `interrupted` rather than
+re-running it: a job can be a CTAS or `CREATE SEMANTIC INDEX` that already
+partly applied, so resuming is not idempotent and stays your call. Finished
+jobs stay queryable across restarts. One statement per `SUBMIT`.
+
 ## Roadmap
 
 - [x] `MEANS` — planner-integrated semantic predicate with batched verify
@@ -240,6 +280,7 @@ COPY launches TO 'out/launches.parquet' STORED AS PARQUET;
 - [x] Semantic types — `CREATE SEMANTIC TYPE`, `CAST`/`EXTRACT`, constrained decoding, field pushdown
 - [x] pgwire server (simple protocol) with funnel progress as NOTICE messages
 - [x] Ingestion — Parquet/CSV on disk: path-literal `SELECT`, `CREATE EXTERNAL TABLE`, CTAS, `COPY TO`
+- [x] Batch jobs — `SUBMIT` a statement, poll `semcast_jobs`, read `job_result()`
 - [ ] Persistent, cross-session verdict cache
 - [ ] Run artifacts — a query returns rows; the evidence lands beside it. Per-run
       table of calls, cost and funnel counts, plus a per-row table of verdict,

@@ -6,10 +6,36 @@ use std::sync::Arc;
 
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::metrics::MetricsSet;
+use serde::{Deserialize, Serialize};
+
+/// What the engine emits while a statement runs. The counts travel
+/// unrendered so a batch job can store them as columns; the pgwire handler
+/// renders them back to the NOTICE text a connected client expects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProgressEvent {
+    /// One line of the up-front plan summary.
+    Plan(String),
+    /// Counters moved since the last tick.
+    Funnel(FunnelCounts),
+    /// Final totals, once the stream is drained.
+    Done(FunnelCounts),
+}
+
+impl ProgressEvent {
+    /// The NOTICE line this event renders to.
+    pub fn line(&self) -> String {
+        match self {
+            ProgressEvent::Plan(line) => line.clone(),
+            ProgressEvent::Funnel(counts) => render(counts),
+            ProgressEvent::Done(counts) => format!("funnel done — {}", render(counts)),
+        }
+    }
+}
 
 /// Live counter totals across all partitions of both semcast operators.
 /// `has_*` distinguishes "operator absent" from "nothing counted yet".
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct FunnelCounts {
     pub has_index_scan: bool,
     pub index_hits: usize,
@@ -86,28 +112,25 @@ pub fn snapshot(plan: &Arc<dyn ExecutionPlan>) -> FunnelCounts {
     counts
 }
 
-/// A progress line if the counters moved since `last`, else `None`.
+/// A progress event if the counters moved since `last`, else `None`.
 pub fn snapshot_if_changed(
     plan: &Arc<dyn ExecutionPlan>,
     last: &mut FunnelCounts,
-) -> Option<String> {
+) -> Option<ProgressEvent> {
     let now = snapshot(plan);
     if now == *last || !now.is_semantic() {
         return None;
     }
-    let line = render(&now);
-    *last = now;
-    Some(line)
+    *last = now.clone();
+    Some(ProgressEvent::Funnel(now))
 }
 
-pub fn final_totals(plan: &Arc<dyn ExecutionPlan>) -> Option<String> {
+pub fn final_totals(plan: &Arc<dyn ExecutionPlan>) -> Option<ProgressEvent> {
     let counts = snapshot(plan);
-    counts
-        .is_semantic()
-        .then(|| format!("funnel done — {}", render(&counts)))
+    counts.is_semantic().then_some(ProgressEvent::Done(counts))
 }
 
-fn render(counts: &FunnelCounts) -> String {
+pub fn render(counts: &FunnelCounts) -> String {
     let mut parts = Vec::new();
     if counts.has_index_scan {
         parts.push(format!(

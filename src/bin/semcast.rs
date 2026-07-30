@@ -7,7 +7,7 @@ use std::sync::Arc;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use semcast::SemcastContextBuilder;
 use semcast::model::{AnthropicProvider, ModelProvider, OllamaProvider, VoyageProvider};
-use semcast::server::{QueryEngine, serve};
+use semcast::server::{JobRegistry, QueryEngine, jobs, serve};
 
 #[derive(Parser)]
 #[command(
@@ -58,6 +58,17 @@ struct ServeArgs {
     /// Where semantic indexes are stored; temp dir if unset.
     #[arg(long)]
     index_dir: Option<PathBuf>,
+    /// Where batch job state and results are stored; temp dir if unset.
+    /// Jobs submitted with `SUBMIT` survive the connection that started
+    /// them, and finished jobs stay queryable across restarts.
+    #[arg(long)]
+    jobs_dir: Option<PathBuf>,
+    /// How many submitted jobs run at once; the rest wait in `queued`.
+    /// They share one model backend, so set this to what the provider
+    /// serves concurrently — against a single local model, more jobs is
+    /// slower, not faster.
+    #[arg(long, default_value_t = 4)]
+    max_concurrent_jobs: usize,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -123,7 +134,24 @@ async fn main() -> std::io::Result<()> {
     if let Some(dir) = &args.index_dir {
         builder = builder.with_index_root(dir);
     }
-    let engine = Arc::new(QueryEngine::new(Arc::new(builder.build())));
+    let ctx = Arc::new(builder.build());
+
+    // Jobs must be registered on the built context: `enable_url_table()`
+    // rebuilds it, so anything registered inside the builder would be lost.
+    let jobs_dir = args
+        .jobs_dir
+        .clone()
+        .unwrap_or_else(|| std::env::temp_dir().join("semcast-jobs"));
+    let jobs = Arc::new(JobRegistry::new(&jobs_dir, args.max_concurrent_jobs)?);
+    let recovered = jobs.recover()?;
+    jobs::register(&ctx, &jobs).map_err(|e| std::io::Error::other(e.to_string()))?;
+    tracing::info!(
+        "semcast: batch jobs in {} ({recovered} recovered, {} at a time)",
+        jobs_dir.display(),
+        args.max_concurrent_jobs,
+    );
+
+    let engine = Arc::new(QueryEngine::new(ctx).with_jobs(jobs));
 
     let listener = tokio::net::TcpListener::bind((args.host.as_str(), args.port)).await?;
     tracing::info!(

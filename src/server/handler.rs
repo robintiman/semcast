@@ -19,6 +19,7 @@ use tokio::sync::mpsc;
 
 use super::encode;
 use super::engine::{QueryEngine, StatementOutcome};
+use super::progress::ProgressEvent;
 use super::router::{self, Route};
 
 pub struct SemcastHandler {
@@ -84,6 +85,24 @@ impl SimpleQueryHandler for SemcastHandler {
                         concat!("16.6 (semcast ", env!("CARGO_PKG_VERSION"), ")"),
                     )?);
                 }
+                Route::Submit(job_sql) => match self.submit(job_sql) {
+                    Ok(response) => responses.push(response),
+                    Err(error) => {
+                        responses.push(Response::Error(error));
+                        break;
+                    }
+                },
+                Route::CancelJob(id) => match self.cancel_job(&id) {
+                    Ok(response) => responses.push(response),
+                    Err(error) => {
+                        responses.push(Response::Error(error));
+                        break;
+                    }
+                },
+                Route::JobError(message) => {
+                    responses.push(Response::Error(error_info(message)));
+                    break;
+                }
                 Route::Engine => match self.run_statement(client, statement).await? {
                     Ok(response) => responses.push(response),
                     // Postgres aborts the rest of a multi-statement string
@@ -116,26 +135,26 @@ impl SemcastHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let (events, mut progress) = mpsc::channel::<String>(16);
+        let (events, mut progress) = mpsc::channel::<ProgressEvent>(16);
         let mut execution = std::pin::pin!(self.engine.execute_statement(statement, events));
         let outcome = loop {
             tokio::select! {
                 biased;
                 outcome = &mut execution => break outcome,
-                line = progress.recv() => {
-                    if let Some(line) = line {
+                event = progress.recv() => {
+                    if let Some(event) = event {
                         // `send`, not `feed`: flush immediately so progress
                         // shows while the model runs.
                         client
-                            .send(PgWireBackendMessage::NoticeResponse(notice(&line)))
+                            .send(PgWireBackendMessage::NoticeResponse(notice(&event.line())))
                             .await?;
                     }
                 }
             }
         };
-        while let Ok(line) = progress.try_recv() {
+        while let Ok(event) = progress.try_recv() {
             client
-                .send(PgWireBackendMessage::NoticeResponse(notice(&line)))
+                .send(PgWireBackendMessage::NoticeResponse(notice(&event.line())))
                 .await?;
         }
         match outcome {
@@ -143,9 +162,41 @@ impl SemcastHandler {
                 Ok(Ok(encode::rows_response(&schema, &batches)?))
             }
             Ok(StatementOutcome::Command { tag }) => Ok(Ok(Response::Execution(Tag::new(&tag)))),
+            // The interactive path always targets memory.
+            Ok(StatementOutcome::Written { .. }) => {
+                unreachable!("interactive statements buffer in memory")
+            }
             Err(error) => Ok(Err(user_error(statement, &error))),
         }
     }
+
+    /// `SUBMIT <statement>` — register the job, spawn it, hand back its id
+    /// without waiting for any of the work.
+    fn submit(&self, statement: &str) -> Result<Response, Box<ErrorInfo>> {
+        match self.engine.submit(statement) {
+            Ok(id) => encode::canned_response("job_id", &id).map_err(|e| error_info(e.to_string())),
+            Err(error) => Err(Box::new(user_error(statement, &error))),
+        }
+    }
+
+    fn cancel_job(&self, id: &str) -> Result<Response, Box<ErrorInfo>> {
+        let jobs = self
+            .engine
+            .jobs()
+            .ok_or_else(|| error_info("batch jobs are not enabled on this server"))?;
+        match jobs.cancel(id) {
+            Ok(()) => Ok(Response::Execution(Tag::new("CANCEL JOB"))),
+            Err(message) => Err(error_info(message)),
+        }
+    }
+}
+
+fn error_info(message: impl Into<String>) -> Box<ErrorInfo> {
+    Box::new(ErrorInfo::new(
+        "ERROR".to_owned(),
+        "XX000".to_owned(),
+        message.into(),
+    ))
 }
 
 fn notice(line: &str) -> NoticeResponse {

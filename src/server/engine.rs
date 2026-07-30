@@ -1,26 +1,41 @@
 //! Statement execution decoupled from the wire protocol: takes SQL text,
-//! returns buffered results, streams progress lines over a channel. The
-//! extended-protocol handler can reuse this unchanged later.
+//! sends the results to a [`ResultTarget`], streams progress over a channel.
+//! The extended-protocol handler can reuse this unchanged later.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::error::DataFusionError;
 use datafusion::execution::context::SessionContext;
+use datafusion::parquet::arrow::AsyncArrowWriter;
 use datafusion::physical_plan::execute_stream;
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
 use crate::Result;
 
-use super::progress;
+use super::jobs::JobRegistry;
+use super::progress::{self, ProgressEvent};
 
 /// How often live funnel counters are checked for a progress NOTICE.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
 
 pub struct QueryEngine {
     ctx: Arc<SessionContext>,
+    jobs: Option<Arc<JobRegistry>>,
+}
+
+/// Where a statement's rows should go.
+pub enum ResultTarget {
+    /// Buffer in memory — the interactive path, which has to hand the rows
+    /// straight back to the connection.
+    Memory,
+    /// Stream to a Parquet file. Batch jobs use this so a result set never
+    /// has to fit in RAM and outlives the connection that asked for it.
+    Parquet(PathBuf),
 }
 
 pub enum StatementOutcome {
@@ -31,62 +46,154 @@ pub enum StatementOutcome {
     Command {
         tag: String,
     },
+    Written {
+        path: PathBuf,
+        rows: u64,
+    },
 }
 
 impl QueryEngine {
     pub fn new(ctx: Arc<SessionContext>) -> Self {
-        Self { ctx }
+        Self { ctx, jobs: None }
     }
 
-    /// Execute one already-split statement. Progress lines land on
-    /// `events` while the query runs; send failures are ignored so a
-    /// disinterested receiver never blocks execution.
+    /// Enable `SUBMIT` / `CANCEL JOB` against `jobs`.
+    pub fn with_jobs(mut self, jobs: Arc<JobRegistry>) -> Self {
+        self.jobs = Some(jobs);
+        self
+    }
+
+    pub fn jobs(&self) -> Option<&Arc<JobRegistry>> {
+        self.jobs.as_ref()
+    }
+
+    /// Execute one already-split statement, buffering its rows. Progress
+    /// events land on `events` while the query runs; send failures are
+    /// ignored so a disinterested receiver never blocks execution.
     pub async fn execute_statement(
         &self,
         sql: &str,
-        events: mpsc::Sender<String>,
+        events: mpsc::Sender<ProgressEvent>,
+    ) -> Result<StatementOutcome> {
+        self.execute_into(sql, events, ResultTarget::Memory).await
+    }
+
+    /// [`Self::execute_statement`] with the destination as a parameter.
+    pub async fn execute_into(
+        &self,
+        sql: &str,
+        events: mpsc::Sender<ProgressEvent>,
+        target: ResultTarget,
     ) -> Result<StatementOutcome> {
         // DDL and CTAS execute eagerly in here; their DataFrame is empty.
         let df = crate::sql(&self.ctx, sql).await?;
         let plan = df.create_physical_plan().await?;
 
         for line in progress::funnel_summary(&plan) {
-            let _ = events.send(line).await;
+            let _ = events.send(ProgressEvent::Plan(line)).await;
         }
         let semantic = progress::snapshot(&plan).is_semantic();
+
+        // A statement with no result shape is a command; it still has to be
+        // driven to completion, but it must not produce a result file.
+        let schema = plan.schema();
+        let mut sink = if schema.fields().is_empty() {
+            Sink::Discard
+        } else {
+            Sink::new(&schema, target).await?
+        };
 
         let mut stream = execute_stream(Arc::clone(&plan), self.ctx.task_ctx())?;
         let mut tick = tokio::time::interval(PROGRESS_INTERVAL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         tick.tick().await; // the first tick is immediate — skip it
         let mut last = progress::FunnelCounts::default();
-        let mut batches = Vec::new();
         loop {
             tokio::select! {
                 batch = stream.next() => match batch {
-                    Some(batch) => batches.push(batch?),
+                    Some(batch) => sink.push(batch?).await?,
                     None => break,
                 },
                 _ = tick.tick(), if semantic => {
-                    if let Some(line) = progress::snapshot_if_changed(&plan, &mut last) {
-                        let _ = events.send(line).await;
+                    if let Some(event) = progress::snapshot_if_changed(&plan, &mut last) {
+                        let _ = events.send(event).await;
                     }
                 }
             }
         }
-        if let Some(line) = progress::final_totals(&plan) {
-            let _ = events.send(line).await;
+        if let Some(event) = progress::final_totals(&plan) {
+            let _ = events.send(event).await;
         }
 
-        let schema = plan.schema();
-        if schema.fields().is_empty() {
-            Ok(StatementOutcome::Command {
-                tag: command_tag(sql),
-            })
-        } else {
-            Ok(StatementOutcome::Rows { schema, batches })
+        sink.finish(schema, sql).await
+    }
+}
+
+/// The open destination for one statement's rows.
+enum Sink {
+    /// No result shape — drive the stream, keep nothing.
+    Discard,
+    Memory(Vec<RecordBatch>),
+    Parquet {
+        writer: Box<AsyncArrowWriter<tokio::fs::File>>,
+        path: PathBuf,
+        rows: u64,
+    },
+}
+
+impl Sink {
+    async fn new(schema: &SchemaRef, target: ResultTarget) -> Result<Self> {
+        match target {
+            ResultTarget::Memory => Ok(Sink::Memory(Vec::new())),
+            ResultTarget::Parquet(path) => {
+                let file = tokio::fs::File::create(&path).await.map_err(io_error)?;
+                let writer = AsyncArrowWriter::try_new(file, Arc::clone(schema), None)
+                    .map_err(parquet_error)?;
+                Ok(Sink::Parquet {
+                    writer: Box::new(writer),
+                    path,
+                    rows: 0,
+                })
+            }
         }
     }
+
+    async fn push(&mut self, batch: RecordBatch) -> Result<()> {
+        match self {
+            Sink::Discard => {}
+            Sink::Memory(batches) => batches.push(batch),
+            Sink::Parquet { writer, rows, .. } => {
+                *rows += batch.num_rows() as u64;
+                writer.write(&batch).await.map_err(parquet_error)?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn finish(self, schema: SchemaRef, sql: &str) -> Result<StatementOutcome> {
+        match self {
+            Sink::Discard => Ok(StatementOutcome::Command {
+                tag: command_tag(sql),
+            }),
+            Sink::Memory(batches) => Ok(StatementOutcome::Rows { schema, batches }),
+            Sink::Parquet {
+                writer, path, rows, ..
+            } => {
+                // Closing writes the footer — without it the file is not a
+                // readable Parquet file at all.
+                writer.close().await.map_err(parquet_error)?;
+                Ok(StatementOutcome::Written { path, rows })
+            }
+        }
+    }
+}
+
+fn io_error(error: std::io::Error) -> crate::SemcastError {
+    DataFusionError::External(Box::new(error)).into()
+}
+
+fn parquet_error(error: datafusion::parquet::errors::ParquetError) -> crate::SemcastError {
+    DataFusionError::External(Box::new(error)).into()
 }
 
 /// Command tag for statements without a result shape, from the leading
@@ -146,8 +253,8 @@ mod tests {
         assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
 
         let mut events = Vec::new();
-        while let Ok(line) = rx.try_recv() {
-            events.push(line);
+        while let Ok(event) = rx.try_recv() {
+            events.push(event.line());
         }
         assert!(
             events.iter().any(|l| l.starts_with("funnel: VerifyExec")),
