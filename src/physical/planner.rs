@@ -19,11 +19,11 @@ use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, Phy
 use crate::cache::SemanticCache;
 use crate::index::SemanticIndex;
 use crate::index::registry::SemcastRuntime;
-use crate::logical::{SemExtractNode, SemFilterNode, SemRankNode};
+use crate::logical::{SemClassifyNode, SemExtractNode, SemFilterNode, SemRankNode};
 use crate::model::ModelProvider;
 use crate::optimizer::calibrate::DEFAULT_CALIBRATION_SAMPLE;
 use crate::physical::index_scan::{CalibrationConfig, ChunkEvidence, IndexScanExec};
-use crate::physical::{SemExtractExec, SemRankExec, VerifyExec};
+use crate::physical::{SemClassifyExec, SemExtractExec, SemRankExec, VerifyExec};
 
 /// The default DataFusion planner plus semcast extension planning.
 #[derive(Debug)]
@@ -128,6 +128,27 @@ impl ExtensionPlanner for SemcastExtensionPlanner {
                 Arc::clone(&self.model),
                 Arc::clone(&self.cache),
             ))));
+        }
+        if let Some(classify) = node.as_any().downcast_ref::<SemClassifyNode>() {
+            let schema = logical_inputs[0].schema();
+            let text = planner.create_physical_expr(&classify.text, schema, session_state)?;
+            let guard = classify
+                .guard
+                .as_ref()
+                .map(|guard| planner.create_physical_expr(guard, schema, session_state))
+                .transpose()?;
+            let column_names = (0..classify.conditions.len())
+                .map(|branch| crate::logical::sem_classify::branch_column_name(classify.id, branch))
+                .collect();
+            return Ok(Some(Arc::new(SemClassifyExec::new(
+                Arc::clone(&physical_inputs[0]),
+                text,
+                classify.conditions.clone(),
+                guard,
+                column_names,
+                Arc::clone(&self.model),
+                Arc::clone(&self.cache),
+            )?)));
         }
         if let Some(rank) = node.as_any().downcast_ref::<SemRankNode>() {
             let text = planner.create_physical_expr(

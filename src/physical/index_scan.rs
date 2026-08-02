@@ -40,7 +40,9 @@ use crate::cache::{CachedValue, SemanticCache};
 use crate::index::{SearchParams, SemanticIndex, doc_hash};
 use crate::model::{CompletionRequest, ModelProvider};
 use crate::optimizer::calibrate::{SampledScores, calibrate_threshold};
-use crate::physical::verify::{means_cache_key, parse_verdict, synthesize_means_prompt};
+use crate::physical::verify::{
+    MEANS_PROMPT_VERSION, means_cache_key, parse_verdict, synthesize_means_prompt,
+};
 
 /// What one index search learned, shared from the scan to the verify stage.
 #[derive(Debug)]
@@ -479,10 +481,12 @@ impl Scanner {
         let mut misses = Vec::new();
         let mut requests = Vec::new();
         for text in sample {
-            match calibration
-                .cache
-                .get(&means_cache_key(&self.condition, text, &model_id))
-            {
+            match calibration.cache.get(&means_cache_key(
+                &self.condition,
+                text,
+                &model_id,
+                MEANS_PROMPT_VERSION,
+            )) {
                 Some(CachedValue::Value(verdict)) => labels.push((text.clone(), verdict == "yes")),
                 _ => {
                     misses.push(text);
@@ -502,7 +506,7 @@ impl Scanner {
         for (text, completion) in misses.into_iter().zip(&completions) {
             if let Ok(Some(matched)) = completion.as_ref().map(|c| parse_verdict(&c.text)) {
                 calibration.cache.put(
-                    means_cache_key(&self.condition, text, &model_id),
+                    means_cache_key(&self.condition, text, &model_id, MEANS_PROMPT_VERSION),
                     CachedValue::Value(if matched { "yes" } else { "no" }.to_owned()),
                 );
                 labels.push((text.clone(), matched));

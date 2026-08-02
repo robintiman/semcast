@@ -1,7 +1,14 @@
-//! Rewrites `Filter(means(text, 'condition'))` into a [`SemFilterNode`]
-//! extension — the first half of roadmap step 1.
+//! Rewrites `means(text, 'condition')` into the extension node its position
+//! calls for: a [`SemFilterNode`] in a `WHERE`, a [`SemClassifyNode`] in a
+//! `SELECT` list.
+//!
+//! One rule owns both because one rule has to own *where `means()` may
+//! appear* — split across two, they would have to agree on which one reports
+//! the error for every other position. The classify machinery itself lives in
+//! [`crate::optimizer::classify`].
 //!
 //! [`SemFilterNode`]: crate::logical::SemFilterNode
+//! [`SemClassifyNode`]: crate::logical::SemClassifyNode
 
 use std::sync::Arc;
 
@@ -21,12 +28,23 @@ use crate::sql::means_udf::MEANS_UDF_NAME;
 /// optimizer will keep pushing down — predicate ordering is just predicate
 /// ordering), and stacks a `SemFilter` extension node on top.
 ///
-/// MVP restriction: `means()` is only supported as a top-level `AND` conjunct
-/// of a `WHERE` clause with a string-literal condition. Anywhere else —
-/// under `OR`/`NOT`, in a `SELECT` list, a non-literal condition — is a
-/// plan-time error rather than a silent model call per row.
+/// In a `Projection` the same marker becomes a `SemClassify` node instead:
+/// filtering drops rows, labelling keeps them, so the two positions want
+/// different operators.
+///
+/// Restriction: `means()` is supported as a top-level `AND` conjunct of a
+/// `WHERE` clause, or anywhere in a `SELECT` list. Elsewhere — under
+/// `OR`/`NOT` in a `WHERE`, in a `GROUP BY`, with a non-literal condition —
+/// is a plan-time error rather than a silent model call per row.
 #[derive(Debug, Default)]
 pub struct MeansRewriteRule;
+
+/// Both legal positions, named in every rejection so the error says where the
+/// marker *can* go rather than only where it cannot.
+const LEGAL_POSITIONS: &str = "means() is supported as a top-level AND conjunct of a WHERE \
+     clause (to filter) or in a SELECT list (to label); it cannot appear under \
+     OR or NOT in a WHERE, nor in a GROUP BY, HAVING, or JOIN condition — wrap \
+     it in a subquery to group or filter on a label";
 
 impl OptimizerRule for MeansRewriteRule {
     fn name(&self) -> &str {
@@ -46,14 +64,15 @@ impl OptimizerRule for MeansRewriteRule {
         plan: LogicalPlan,
         _config: &dyn OptimizerConfig,
     ) -> Result<Transformed<LogicalPlan>> {
+        // A MEANS in a SELECT list labels rows rather than dropping them.
+        if let LogicalPlan::Projection(projection) = plan {
+            return crate::optimizer::classify::rewrite_projection(projection);
+        }
+
         let LogicalPlan::Filter(filter) = plan else {
             for expr in plan.expressions() {
                 if contains_means(&expr)? {
-                    return plan_err!(
-                        "means() is only supported as a top-level AND conjunct of a \
-                         WHERE clause (found it in a {} node)",
-                        plan.display()
-                    );
+                    return plan_err!("{LEGAL_POSITIONS} (found it in a {} node)", plan.display());
                 }
             }
             return Ok(Transformed::no(plan));
@@ -66,19 +85,13 @@ impl OptimizerRule for MeansRewriteRule {
 
         if semantic.is_empty() {
             if contains_means(&filter.predicate)? {
-                return plan_err!(
-                    "means() is only supported as a top-level AND conjunct of a WHERE \
-                     clause; it cannot appear under OR, NOT, or inside another expression"
-                );
+                return plan_err!("{LEGAL_POSITIONS}");
             }
             return Ok(Transformed::no(LogicalPlan::Filter(filter)));
         }
         for expr in &free {
             if contains_means(expr)? {
-                return plan_err!(
-                    "means() is only supported as a top-level AND conjunct of a WHERE \
-                     clause; it cannot appear under OR, NOT, or inside another expression"
-                );
+                return plan_err!("{LEGAL_POSITIONS}");
             }
         }
 
@@ -126,16 +139,16 @@ pub fn apply_recall(plan: LogicalPlan, recall: f64) -> Result<LogicalPlan> {
     Ok(transformed.data)
 }
 
-fn is_means_call(expr: &Expr) -> bool {
+pub(crate) fn is_means_call(expr: &Expr) -> bool {
     matches!(expr, Expr::ScalarFunction(f) if f.func.name() == MEANS_UDF_NAME)
 }
 
-fn contains_means(expr: &Expr) -> Result<bool> {
+pub(crate) fn contains_means(expr: &Expr) -> Result<bool> {
     expr.exists(|e| Ok(is_means_call(e)))
 }
 
 /// Pull `(text_expr, condition, recall)` out of a validated `means(..)` call.
-fn destructure_means(expr: Expr) -> Result<(Expr, String, Option<f64>)> {
+pub(crate) fn destructure_means(expr: Expr) -> Result<(Expr, String, Option<f64>)> {
     let Expr::ScalarFunction(ScalarFunction { args, .. }) = expr else {
         unreachable!("caller checked is_means_call");
     };

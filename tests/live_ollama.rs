@@ -247,3 +247,66 @@ async fn rank_against_live_ollama() {
         "the offline-sync meeting must rank first"
     );
 }
+
+/// Classify end-to-end: a three-branch `CASE` costs one real model call per
+/// row, and each row lands in the branch it belongs to.
+#[tokio::test]
+#[ignore = "requires a running Ollama server with gemma4:e4b and nomic-embed-text pulled"]
+async fn classify_against_live_ollama() {
+    let model = std::env::var("SEMCAST_OLLAMA_MODEL").unwrap_or_else(|_| "gemma4:e4b".to_owned());
+    let ctx = semcast_context(Arc::new(OllamaProvider::new(model)));
+
+    ctx.sql(
+        "CREATE TABLE tickets AS
+         SELECT * FROM (VALUES
+             (1, 'this is completely unacceptable, I demand a refund immediately'),
+             (2, 'what does the enterprise plan cost per seat per month?'),
+             (3, 'thanks for your help, that answered my question')
+         ) AS t(id, body)",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    let df = semcast::sql(
+        &ctx,
+        "SELECT id, CASE WHEN body MEANS 'the customer is angry or upset' THEN 'escalate'
+                         WHEN body MEANS 'asks about pricing or cost'     THEN 'sales'
+                         ELSE 'other' END AS route
+         FROM tickets",
+    )
+    .await
+    .unwrap();
+
+    let physical = df.clone().create_physical_plan().await.unwrap();
+    let display = datafusion::physical_plan::displayable(physical.as_ref())
+        .indent(true)
+        .to_string();
+    println!("physical plan:\n{display}");
+    assert!(display.contains("SemClassifyExec"), "plan:\n{display}");
+
+    let batches = df.collect().await.unwrap();
+    println!(
+        "live ollama routing:\n{}",
+        datafusion::arrow::util::pretty::pretty_format_batches(&batches).unwrap()
+    );
+
+    let routes: Vec<String> = batches
+        .iter()
+        .flat_map(|b| {
+            let labels = b
+                .column(1)
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::StringArray>()
+                .expect("route is Utf8");
+            (0..b.num_rows())
+                .map(|i| labels.value(i).to_owned())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(routes[0], "escalate");
+    assert_eq!(routes[1], "sales");
+    assert_eq!(routes[2], "other");
+}

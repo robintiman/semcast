@@ -168,15 +168,34 @@ async fn means_under_not_is_a_plan_time_error() {
     assert!(err.to_string().contains("top-level AND conjunct"), "{err}");
 }
 
+/// A SELECT-list `MEANS` is a label, not a filter — it plans a `SemClassify`
+/// rather than the `SemFilter` a `WHERE` gets. See `tests/classify.rs`.
 #[tokio::test]
-async fn means_in_select_list_is_a_plan_time_error() {
+async fn means_in_select_list_plans_a_classify() {
     let ctx = meetings_context().await;
-    let err = semcast::sql(&ctx, "SELECT transcript MEANS 'x' FROM meetings")
+    let plan = semcast::sql(&ctx, "SELECT transcript MEANS 'x' FROM meetings")
         .await
         .unwrap()
         .into_optimized_plan()
-        .unwrap_err();
-    assert!(err.to_string().contains("top-level AND conjunct"), "{err}");
+        .unwrap();
+    let display = format!("{}", plan.display_indent());
+    assert!(display.contains("SemClassify"), "{display}");
+    assert!(!display.contains("SemFilter"), "{display}");
+}
+
+#[tokio::test]
+async fn means_in_a_group_by_is_a_plan_time_error() {
+    let ctx = meetings_context().await;
+    let err = semcast::sql(
+        &ctx,
+        "SELECT count(*) FROM meetings GROUP BY transcript MEANS 'x'",
+    )
+    .await
+    .unwrap()
+    .into_optimized_plan()
+    .unwrap_err();
+    assert!(err.to_string().contains("WHERE"), "{err}");
+    assert!(err.to_string().contains("SELECT list"), "{err}");
 }
 
 #[tokio::test]

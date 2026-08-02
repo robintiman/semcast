@@ -97,6 +97,36 @@ WHERE held_at >= CAST('2026-01-01' AS TIMESTAMP)
   AND transcript MEANS 'discussed the launch of offline sync in Atlas';
 ```
 
+#### `MEANS` in a `SELECT` list
+
+```sql
+<text_column> MEANS '<condition>'                    -- a boolean column
+CASE WHEN <text_column> MEANS '<condition>' THEN ... -- a label
+```
+
+The same operator, used to label rather than to filter. Every condition over
+one column is fused into **one model call per row**, so a three-branch `CASE`
+costs what a one-branch one does. `CASE` semantics are unchanged:
+first-match-wins, `ELSE`, and a failed row falls through instead of failing the
+query.
+
+Ordinary `WHEN` conditions before the first `MEANS` branch run first — rows
+they already claimed cost nothing.
+
+```sql
+SELECT id, CASE WHEN status = 'closed'             THEN 'archived'
+                WHEN body MEANS 'customer is angry' THEN 'escalate'
+                WHEN body MEANS 'asks about pricing' THEN 'sales'
+                ELSE 'other' END AS route
+FROM tickets;
+
+SELECT id, body MEANS 'customer is angry' AS is_angry FROM tickets;
+```
+
+Each column answers exactly what the same `MEANS` answers in a `WHERE`, so
+verdicts are shared: filter first and label after, and the labelling is free.
+No index is used — labelling every row prunes nothing.
+
 #### `WITH RECALL`
 
 ```sql
@@ -318,8 +348,9 @@ jobs stay queryable across restarts. One statement per `SUBMIT`.
 - [x] Rank — `ORDER BY … RELEVANCE TO … LIMIT k` and `relevance()` as a
       two-stage funnel: index similarity picks the candidates, a rerank pass
       orders them
-- [ ] Classify / cluster — semantic `CASE` (`MEANS` in a `CASE` branch, all
-      branches fused into one call), `GROUP BY MEANING OF … INTO k`, and
+- [x] Classify — `MEANS` in a `SELECT` list or a `CASE` branch, all branches
+      fused into one model call per row
+- [ ] Cluster / dedupe — `GROUP BY MEANING OF … INTO k` and
       `SEMANTIC DISTINCT ON`
 - [ ] Semantic join — `JOIN … ON a MEANS MATCH b` for entity resolution and
       schema mapping. Needs `means()` to accept a second column instead of only a
