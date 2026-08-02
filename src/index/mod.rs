@@ -13,6 +13,7 @@
 //! [Lance]: https://lancedb.github.io/lance/
 
 pub mod chunk;
+pub mod dedupe;
 pub mod kmeans;
 pub mod lance;
 pub mod registry;

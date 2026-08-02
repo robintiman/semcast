@@ -17,6 +17,8 @@ pub mod cluster;
 pub mod cluster_udf;
 pub mod ddl;
 pub mod dialect;
+pub mod distinct;
+pub mod distinct_udf;
 pub mod extract_udf;
 pub mod means_udf;
 pub mod rank;

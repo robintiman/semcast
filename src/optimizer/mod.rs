@@ -9,6 +9,7 @@
 pub mod calibrate;
 pub mod classify;
 pub mod cluster;
+pub mod distinct;
 pub mod extract;
 pub mod funnel;
 pub mod rank;

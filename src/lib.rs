@@ -46,6 +46,7 @@ use crate::cache::{InMemoryCache, SemanticCache};
 use crate::index::registry::SemcastRuntime;
 use crate::model::ModelProvider;
 use crate::optimizer::cluster::ClusterRewriteRule;
+use crate::optimizer::distinct::DistinctRewriteRule;
 use crate::optimizer::rank::RelevanceRewriteRule;
 use crate::optimizer::rewrite::MeansRewriteRule;
 use crate::physical::planner::SemcastQueryPlanner;
@@ -107,7 +108,18 @@ pub async fn sql(ctx: &SessionContext, query: &str) -> Result<DataFrame> {
             .into()),
         };
     }
-    let (mut statement, recall) = sql::recall::parse_statement_with_recall(query)?;
+    // `SEMANTIC` qualifies a select modifier, where sqlparser has no dialect
+    // hook — remove the word, then mark what it qualified in the AST.
+    let (query, semantic_distinct) = sql::distinct::strip_semantic_distinct(query);
+    let (mut statement, clauses) = sql::recall::parse_statement_with_recall(&query)?;
+    if semantic_distinct && !sql::distinct::mark_semantic_distinct(&mut statement) {
+        return Err(DataFusionError::Plan(
+            "SEMANTIC only qualifies DISTINCT ON (<column>); a plain SEMANTIC \
+             DISTINCT has no column to compare"
+                .to_owned(),
+        )
+        .into());
+    }
     // Desugar `CAST(col AS SemanticType)[.field]` into the marker UDFs before
     // planning — DataFusion can't plan the field access itself.
     if let Some(runtime) = ctx.state().config().get_extension::<SemcastRuntime>() {
@@ -120,8 +132,11 @@ pub async fn sql(ctx: &SessionContext, query: &str) -> Result<DataFrame> {
     // created yet; bind it before the planner tries to resolve it.
     sql::cluster::bind_meaning_labels(&mut statement);
     let mut plan = ctx.state().statement_to_plan(statement).await?;
-    if let Some(recall) = recall {
+    if let Some(recall) = clauses.recall {
         plan = optimizer::rewrite::apply_recall(plan, recall)?;
+    }
+    if let Some(similarity) = clauses.similarity {
+        plan = optimizer::distinct::apply_similarity(plan, similarity)?;
     }
     Ok(ctx.execute_logical_plan(plan).await?)
 }
@@ -206,12 +221,14 @@ impl SemcastContextBuilder {
             ))
             .with_optimizer_rule(Arc::new(RelevanceRewriteRule))
             .with_optimizer_rule(Arc::new(ClusterRewriteRule))
+            .with_optimizer_rule(Arc::new(DistinctRewriteRule))
             .with_query_planner(Arc::new(SemcastQueryPlanner::new(self.model, self.cache)))
             .build();
         let ctx = SessionContext::new_with_state(state);
         ctx.register_udf(sql::means_udf::means_udf());
         ctx.register_udf(sql::rank_udf::relevance_udf());
         ctx.register_udf(sql::cluster_udf::meaning_of_udf());
+        ctx.register_udf(sql::distinct_udf::semantic_key_udf());
         // Marker UDFs for typed extraction, sharing the runtime's registry so
         // they resolve type fields at plan time.
         for udf in sql::extract_udf::extract_udfs(types) {

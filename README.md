@@ -214,6 +214,36 @@ hasn't seen get a NULL label rather than disappearing. Use `ONEOF` on a
 [semantic type](#create-semantic-type) instead when you already know the
 categories — it's one call per row but needs no index.
 
+#### `SEMANTIC DISTINCT ON`
+
+```sql
+SELECT SEMANTIC DISTINCT ON (<text_column>) ... [WITH SIMILARITY <fraction>]
+```
+
+Collapses rows that say the same thing. The cheapest thing semcast does —
+**no model calls at all**: the index already knows how alike two documents
+are, and "duplicate" is a threshold on that.
+
+`WITH SIMILARITY` sets that threshold, defaulting to `0.9`. Higher is
+stricter. Otherwise this is Postgres's `DISTINCT ON`: one row survives per
+group, and `ORDER BY` decides which.
+
+```sql
+SELECT SEMANTIC DISTINCT ON (body) id, body FROM notes
+WITH SIMILARITY 0.8;
+```
+```
+ id |                     body
+----+----------------------------------------------
+  1 | my refund has still not arrived
+  4 | the product launch slipped to the fourth quarter
+  5 | an outage took the dashboard down for an hour
+```
+
+A semantic index is required. Rows it hasn't seen fall back to exact-match
+dedupe rather than being collapsed on a guess — an index gap leaves
+duplicates in, never data out.
+
 #### `CREATE SEMANTIC TYPE`
 
 ```sql
@@ -385,7 +415,8 @@ jobs stay queryable across restarts. One statement per `SUBMIT`.
       fused into one model call per row
 - [x] Cluster — `GROUP BY MEANING OF … INTO k`, one model call per group,
       auto-`k` by silhouette sweep
-- [ ] Semantic dedupe — `SEMANTIC DISTINCT ON`
+- [x] Semantic dedupe — `SEMANTIC DISTINCT ON … WITH SIMILARITY`, no model
+      calls at all
 - [ ] Semantic join — `JOIN … ON a MEANS MATCH b` for entity resolution and
       schema mapping. Needs `means()` to accept a second column instead of only a
       literal, and an index-blocked candidate stage so it isn't a cross product

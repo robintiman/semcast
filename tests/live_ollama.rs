@@ -391,3 +391,79 @@ async fn cluster_against_live_ollama() {
         "the two themes should split evenly: {counts:?}"
     );
 }
+
+/// Dedupe end-to-end: real embeddings collapse three phrasings of one
+/// complaint, and spend no model calls doing it.
+#[tokio::test]
+#[ignore = "requires a running Ollama server with gemma4:e4b and nomic-embed-text pulled"]
+async fn semantic_distinct_against_live_ollama() {
+    let model = std::env::var("SEMCAST_OLLAMA_MODEL").unwrap_or_else(|_| "gemma4:e4b".to_owned());
+    let ctx = semcast_context(Arc::new(OllamaProvider::new(model)));
+
+    ctx.sql(
+        "CREATE TABLE notes AS
+         SELECT * FROM (VALUES
+             (1, 'my refund has still not arrived'),
+             (2, 'the refund has not arrived yet'),
+             (3, 'still waiting for my refund to arrive'),
+             (4, 'the product launch slipped to the fourth quarter'),
+             (5, 'an outage took the dashboard down for an hour')
+         ) AS t(id, body)",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    create_semantic_index(
+        &ctx,
+        "notes",
+        "body",
+        IndexOptions {
+            path: Some(dir.path().join("notes.body.lance")),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let df = semcast::sql(
+        &ctx,
+        "SELECT SEMANTIC DISTINCT ON (body) id, body FROM notes WITH SIMILARITY 0.8",
+    )
+    .await
+    .unwrap();
+
+    let physical = df.clone().create_physical_plan().await.unwrap();
+    let display = datafusion::physical_plan::displayable(physical.as_ref())
+        .indent(true)
+        .to_string();
+    println!("physical plan:\n{display}");
+    assert!(display.contains("SemDistinctExec"), "plan:\n{display}");
+
+    let batches = df.collect().await.unwrap();
+    println!(
+        "live ollama dedupe:\n{}",
+        datafusion::arrow::util::pretty::pretty_format_batches(&batches).unwrap()
+    );
+
+    let ids: Vec<i64> = batches
+        .iter()
+        .flat_map(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                .expect("id is Int64")
+                .values()
+                .to_vec()
+        })
+        .collect();
+    assert_eq!(
+        ids.len(),
+        3,
+        "three refund phrasings collapse to one, plus two distinct rows: {ids:?}"
+    );
+    assert!(ids.contains(&4) && ids.contains(&5), "{ids:?}");
+}
