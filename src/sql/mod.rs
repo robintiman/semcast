@@ -13,6 +13,8 @@
 //! [`SemFilterNode`]: crate::logical::SemFilterNode
 //! [`SemRankNode`]: crate::logical::SemRankNode
 
+pub mod cluster;
+pub mod cluster_udf;
 pub mod ddl;
 pub mod dialect;
 pub mod extract_udf;

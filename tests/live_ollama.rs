@@ -310,3 +310,84 @@ async fn classify_against_live_ollama() {
     assert_eq!(routes[1], "sales");
     assert_eq!(routes[2], "other");
 }
+
+/// Clustering end-to-end: real embeddings group two obvious themes apart, and
+/// a real model names each group.
+#[tokio::test]
+#[ignore = "requires a running Ollama server with gemma4:e4b and nomic-embed-text pulled"]
+async fn cluster_against_live_ollama() {
+    let model = std::env::var("SEMCAST_OLLAMA_MODEL").unwrap_or_else(|_| "gemma4:e4b".to_owned());
+    let ctx = semcast_context(Arc::new(OllamaProvider::new(model)));
+
+    ctx.sql(
+        "CREATE TABLE notes AS
+         SELECT * FROM (VALUES
+             (1, 'the invoice was wrong and I want a refund for the billing error'),
+             (2, 'billing charged my card twice, please refund the duplicate invoice'),
+             (3, 'the refund for the incorrect invoice has not arrived yet'),
+             (4, 'we agreed to ship offline sync in the third quarter launch'),
+             (5, 'the launch of offline sync is scheduled for the third quarter'),
+             (6, 'offline sync ships at the quarterly product launch as agreed')
+         ) AS t(id, body)",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    create_semantic_index(
+        &ctx,
+        "notes",
+        "body",
+        IndexOptions {
+            path: Some(dir.path().join("notes.body.lance")),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let df = semcast::sql(
+        &ctx,
+        "SELECT topic, count(*) AS n FROM notes GROUP BY MEANING OF body INTO 2 AS topic",
+    )
+    .await
+    .unwrap();
+
+    let physical = df.clone().create_physical_plan().await.unwrap();
+    let display = datafusion::physical_plan::displayable(physical.as_ref())
+        .indent(true)
+        .to_string();
+    println!("physical plan:\n{display}");
+    assert!(display.contains("SemClusterExec"), "plan:\n{display}");
+
+    let batches = df.collect().await.unwrap();
+    println!(
+        "live ollama grouping:\n{}",
+        datafusion::arrow::util::pretty::pretty_format_batches(&batches).unwrap()
+    );
+
+    let counts: Vec<i64> = batches
+        .iter()
+        .flat_map(|b| {
+            b.column(1)
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                .expect("count is Int64")
+                .values()
+                .to_vec()
+        })
+        .collect();
+    assert_eq!(counts.len(), 2, "two themes, two groups");
+    assert_eq!(
+        counts.iter().sum::<i64>(),
+        6,
+        "every row lands in exactly one group"
+    );
+    assert!(
+        counts.iter().all(|&n| n == 3),
+        "the two themes should split evenly: {counts:?}"
+    );
+}

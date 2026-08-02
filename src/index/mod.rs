@@ -13,10 +13,11 @@
 //! [Lance]: https://lancedb.github.io/lance/
 
 pub mod chunk;
+pub mod kmeans;
 pub mod lance;
 pub mod registry;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -27,7 +28,7 @@ use datafusion::arrow::datatypes::DataType;
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::SessionContext;
 
-use crate::model::{ModelId, ModelProvider};
+use crate::model::{Embedding, ModelId, ModelProvider};
 use crate::{Result, SemcastError};
 use chunk::ChunkConfig;
 use registry::SemcastRuntime;
@@ -106,6 +107,15 @@ pub trait SemanticIndex: std::fmt::Debug + Send + Sync {
     /// Chunk hits scoring at least `params.score_floor` against the embedded
     /// query, best first, at most `params.fetch_k`.
     async fn search(&self, query: &str, params: &SearchParams) -> Result<Vec<ChunkHit>>;
+
+    /// One unit vector per indexed document — the mean of its chunk vectors,
+    /// renormalized.
+    ///
+    /// Search answers "which documents are near *this* query"; clustering
+    /// asks which documents are near *each other*, which needs the vectors
+    /// themselves. They are already paid for, so reading them back beats
+    /// re-embedding a corpus.
+    async fn doc_vectors(&self) -> Result<HashMap<u64, Embedding>>;
 }
 
 /// Options for [`create_semantic_index`]. The defaults index into a

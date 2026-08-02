@@ -26,6 +26,9 @@ pub struct MockModel {
     inputs: Mutex<Vec<String>>,
     schemas: Mutex<Vec<Option<Value>>>,
     embed_calls: AtomicUsize,
+    /// Themes for [`MockModel::embedding_by_theme`]; empty means embed by
+    /// byte position instead.
+    themes: Vec<String>,
     /// Artificial per-call delay; see [`MockModel::with_latency`].
     latency: Option<Duration>,
 }
@@ -103,6 +106,23 @@ impl MockModel {
         self.embed_calls.load(Ordering::Relaxed)
     }
 
+    /// Embed by theme rather than by bytes: dimension `i` is set when the
+    /// text contains `themes[i]`.
+    ///
+    /// The default embedding sums bytes by position, which after
+    /// normalization points almost every English sentence the same way — fine
+    /// for "is this document the query?", useless for "are these two
+    /// documents about the same thing". Tests that exercise *geometry*
+    /// (clustering, dedupe) need vectors that actually separate.
+    pub fn embedding_by_theme<I, S>(mut self, themes: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.themes = themes.into_iter().map(Into::into).collect();
+        self
+    }
+
     /// Sleep this long in every `complete` call. Real providers take seconds
     /// per batch; tests that need to observe a query *while it runs* — batch
     /// job progress, cancellation — need a mock that isn't instantaneous.
@@ -152,11 +172,37 @@ impl ModelProvider for MockModel {
 
     async fn embed(&self, texts: Vec<String>) -> Result<Vec<Embedding>> {
         self.embed_calls.fetch_add(1, Ordering::Relaxed);
-        Ok(texts.iter().map(|t| byte_histogram(t)).collect())
+        Ok(texts
+            .iter()
+            .map(|t| {
+                if self.themes.is_empty() {
+                    byte_histogram(t)
+                } else {
+                    theme_vector(t, &self.themes)
+                }
+            })
+            .collect())
     }
 }
 
 const MOCK_EMBEDDING_DIM: usize = 16;
+
+/// One dimension per theme, set when the text mentions it. A text matching
+/// nothing lands on its own axis so it never silently joins a theme.
+fn theme_vector(text: &str, themes: &[String]) -> Embedding {
+    let mut v = vec![0.0_f32; MOCK_EMBEDDING_DIM];
+    let mut matched = false;
+    for (i, theme) in themes.iter().take(MOCK_EMBEDDING_DIM - 1).enumerate() {
+        if text.contains(theme.as_str()) {
+            v[i] = 1.0;
+            matched = true;
+        }
+    }
+    if !matched {
+        v[MOCK_EMBEDDING_DIM - 1] = 1.0;
+    }
+    v
+}
 
 fn byte_histogram(text: &str) -> Embedding {
     let mut v = vec![0.0_f32; MOCK_EMBEDDING_DIM];

@@ -45,6 +45,7 @@ use datafusion::logical_expr::LogicalPlanBuilder;
 use crate::cache::{InMemoryCache, SemanticCache};
 use crate::index::registry::SemcastRuntime;
 use crate::model::ModelProvider;
+use crate::optimizer::cluster::ClusterRewriteRule;
 use crate::optimizer::rank::RelevanceRewriteRule;
 use crate::optimizer::rewrite::MeansRewriteRule;
 use crate::physical::planner::SemcastQueryPlanner;
@@ -115,6 +116,9 @@ pub async fn sql(ctx: &SessionContext, query: &str) -> Result<DataFrame> {
     // A relevance score is best-first; SQL's default is ascending. Fix the
     // direction while it is still `None` — the logical plan has no such thing.
     sql::rank::default_relevance_desc(&mut statement);
+    // `GROUP BY MEANING OF t AS topic` names a column the optimizer has not
+    // created yet; bind it before the planner tries to resolve it.
+    sql::cluster::bind_meaning_labels(&mut statement);
     let mut plan = ctx.state().statement_to_plan(statement).await?;
     if let Some(recall) = recall {
         plan = optimizer::rewrite::apply_recall(plan, recall)?;
@@ -201,11 +205,13 @@ impl SemcastContextBuilder {
                 crate::optimizer::extract::ExtractRewriteRule::new(Arc::clone(&types)),
             ))
             .with_optimizer_rule(Arc::new(RelevanceRewriteRule))
+            .with_optimizer_rule(Arc::new(ClusterRewriteRule))
             .with_query_planner(Arc::new(SemcastQueryPlanner::new(self.model, self.cache)))
             .build();
         let ctx = SessionContext::new_with_state(state);
         ctx.register_udf(sql::means_udf::means_udf());
         ctx.register_udf(sql::rank_udf::relevance_udf());
+        ctx.register_udf(sql::cluster_udf::meaning_of_udf());
         // Marker UDFs for typed extraction, sharing the runtime's registry so
         // they resolve type fields at plan time.
         for udf in sql::extract_udf::extract_udfs(types) {

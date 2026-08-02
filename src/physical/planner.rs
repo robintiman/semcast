@@ -19,11 +19,11 @@ use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, Phy
 use crate::cache::SemanticCache;
 use crate::index::SemanticIndex;
 use crate::index::registry::SemcastRuntime;
-use crate::logical::{SemClassifyNode, SemExtractNode, SemFilterNode, SemRankNode};
+use crate::logical::{SemClassifyNode, SemClusterNode, SemExtractNode, SemFilterNode, SemRankNode};
 use crate::model::ModelProvider;
 use crate::optimizer::calibrate::DEFAULT_CALIBRATION_SAMPLE;
 use crate::physical::index_scan::{CalibrationConfig, ChunkEvidence, IndexScanExec};
-use crate::physical::{SemClassifyExec, SemExtractExec, SemRankExec, VerifyExec};
+use crate::physical::{SemClassifyExec, SemClusterExec, SemExtractExec, SemRankExec, VerifyExec};
 
 /// The default DataFusion planner plus semcast extension planning.
 #[derive(Debug)]
@@ -128,6 +128,35 @@ impl ExtensionPlanner for SemcastExtensionPlanner {
                 Arc::clone(&self.model),
                 Arc::clone(&self.cache),
             ))));
+        }
+        if let Some(cluster) = node.as_any().downcast_ref::<SemClusterNode>() {
+            let schema = logical_inputs[0].schema();
+            let text = planner.create_physical_expr(&cluster.text, schema, session_state)?;
+            // Clustering is the index's vectors or nothing: without them the
+            // only alternative is embedding the corpus mid-query.
+            let column = column_behind_casts(&cluster.text).ok_or_else(|| {
+                DataFusionError::Plan(format!(
+                    "MEANING OF requires a plain indexed column, not a computed \
+                     expression (got `{}`)",
+                    cluster.text
+                ))
+            })?;
+            let (table, field) = qualified_name(column, schema)?;
+            let index = index_for(&table, &field, session_state).ok_or_else(|| {
+                DataFusionError::Plan(format!(
+                    "MEANING OF requires a semantic index on {table}({field}); \
+                     create one with: CREATE SEMANTIC INDEX ON {table}({field});"
+                ))
+            })?;
+            return Ok(Some(Arc::new(SemClusterExec::new(
+                Arc::clone(&physical_inputs[0]),
+                text,
+                cluster.k,
+                crate::logical::sem_cluster::label_column_name(cluster.id),
+                index,
+                Arc::clone(&self.model),
+                Arc::clone(&self.cache),
+            )?)));
         }
         if let Some(classify) = node.as_any().downcast_ref::<SemClassifyNode>() {
             let schema = logical_inputs[0].schema();
