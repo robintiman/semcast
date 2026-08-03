@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::common::DFSchema;
-use datafusion::error::Result;
+use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::QueryPlanner;
 use datafusion::execution::session_state::SessionState;
 use datafusion::logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNode};
@@ -19,11 +19,11 @@ use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, Phy
 use crate::cache::SemanticCache;
 use crate::index::SemanticIndex;
 use crate::index::registry::SemcastRuntime;
-use crate::logical::{SemExtractNode, SemFilterNode};
+use crate::logical::{SemExtractNode, SemFilterNode, SemRankNode};
 use crate::model::ModelProvider;
 use crate::optimizer::calibrate::DEFAULT_CALIBRATION_SAMPLE;
 use crate::physical::index_scan::{CalibrationConfig, ChunkEvidence, IndexScanExec};
-use crate::physical::{SemExtractExec, VerifyExec};
+use crate::physical::{SemExtractExec, SemRankExec, VerifyExec};
 
 /// The default DataFusion planner plus semcast extension planning.
 #[derive(Debug)]
@@ -129,6 +129,42 @@ impl ExtensionPlanner for SemcastExtensionPlanner {
                 Arc::clone(&self.cache),
             ))));
         }
+        if let Some(rank) = node.as_any().downcast_ref::<SemRankNode>() {
+            let text = planner.create_physical_expr(
+                &rank.text,
+                logical_inputs[0].schema(),
+                session_state,
+            )?;
+            // Ranking has no verify-only fallback: without an index there are
+            // no candidates, so "rank" would mean a model call per row of the
+            // whole table. Say so, and name the statement that fixes it.
+            let column = column_behind_casts(&rank.text).ok_or_else(|| {
+                DataFusionError::Plan(format!(
+                    "RELEVANCE TO requires a plain indexed column, not a computed \
+                     expression (got `{}`)",
+                    rank.text
+                ))
+            })?;
+            let (table, field) = qualified_name(column, logical_inputs[0].schema())?;
+            let index = index_for(&table, &field, session_state).ok_or_else(|| {
+                DataFusionError::Plan(format!(
+                    "RELEVANCE TO requires a semantic index on {table}({field}); \
+                     create one with: CREATE SEMANTIC INDEX ON {table}({field});"
+                ))
+            })?;
+            let chunks_per_doc = index.search_params().chunks_per_doc;
+            return Ok(Some(Arc::new(SemRankExec::new(
+                Arc::clone(&physical_inputs[0]),
+                text,
+                rank.query.clone(),
+                rank.candidates(),
+                crate::logical::sem_rank::score_column_name(rank.id),
+                index,
+                chunks_per_doc,
+                Arc::clone(&self.model),
+                Arc::clone(&self.cache),
+            )?)));
+        }
         if let Some(extract) = node.as_any().downcast_ref::<SemExtractNode>() {
             let source = planner.create_physical_expr(
                 &extract.source,
@@ -158,10 +194,38 @@ fn resolve_index(
     session_state: &SessionState,
 ) -> Option<Arc<dyn SemanticIndex>> {
     let column = column_behind_casts(&filter.text)?;
-    let (qualifier, field) = schema.qualified_field_from_column(column).ok()?;
-    let table = qualifier?.table();
-    let runtime = session_state.config().get_extension::<SemcastRuntime>()?;
-    runtime.index_for(table, field.name())
+    let (table, field) = qualified_name(column, schema).ok()?;
+    index_for(&table, &field, session_state)
+}
+
+/// The `(table, column)` a column reference names, as the index registry
+/// keys them.
+fn qualified_name(
+    column: &datafusion::common::Column,
+    schema: &DFSchema,
+) -> Result<(String, String)> {
+    let (qualifier, field) = schema.qualified_field_from_column(column)?;
+    let table = qualifier
+        .ok_or_else(|| {
+            DataFusionError::Plan(format!(
+                "cannot tell which table `{column}` belongs to; qualify it as \
+                 <table>.<column>"
+            ))
+        })?
+        .table()
+        .to_owned();
+    Ok((table, field.name().clone()))
+}
+
+fn index_for(
+    table: &str,
+    column: &str,
+    session_state: &SessionState,
+) -> Option<Arc<dyn SemanticIndex>> {
+    session_state
+        .config()
+        .get_extension::<SemcastRuntime>()?
+        .index_for(table, column)
 }
 
 /// The column a text expression reads, seen through casts and aliases —

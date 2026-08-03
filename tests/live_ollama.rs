@@ -173,3 +173,77 @@ async fn calibrated_funnel_against_live_ollama() {
         "expected exactly the offline-sync meeting to survive the calibrated funnel"
     );
 }
+
+/// `RELEVANCE TO` end-to-end: real embeddings pick the candidates, a real
+/// model scores them, and the best match sorts first.
+#[tokio::test]
+#[ignore = "requires a running Ollama server with gemma4:e4b and nomic-embed-text pulled"]
+async fn rank_against_live_ollama() {
+    let model = std::env::var("SEMCAST_OLLAMA_MODEL").unwrap_or_else(|_| "gemma4:e4b".to_owned());
+    let ctx = semcast_context(Arc::new(OllamaProvider::new(model)));
+
+    ctx.sql(
+        "CREATE TABLE meetings AS
+         SELECT * FROM (VALUES
+             (1, 'we agreed to ship offline sync in the third quarter'),
+             (2, 'status round about the cafeteria menu, nothing else'),
+             (3, 'the quarterly budget review ran long, no engineering topics')
+         ) AS t(meeting_id, transcript)",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    create_semantic_index(
+        &ctx,
+        "meetings",
+        "transcript",
+        IndexOptions {
+            path: Some(dir.path().join("meetings.transcript.lance")),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let df = semcast::sql(
+        &ctx,
+        "SELECT meeting_id, relevance(transcript, 'shipping an offline sync feature') AS score
+         FROM meetings
+         ORDER BY score DESC LIMIT 3",
+    )
+    .await
+    .unwrap();
+
+    let physical = df.clone().create_physical_plan().await.unwrap();
+    let display = datafusion::physical_plan::displayable(physical.as_ref())
+        .indent(true)
+        .to_string();
+    println!("physical plan:\n{display}");
+    assert!(display.contains("SemRankExec"), "plan:\n{display}");
+
+    let batches = df.collect().await.unwrap();
+    println!(
+        "live ollama ranking:\n{}",
+        datafusion::arrow::util::pretty::pretty_format_batches(&batches).unwrap()
+    );
+    let ids: Vec<i64> = batches
+        .iter()
+        .flat_map(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                .expect("meeting_id is Int64")
+                .values()
+                .to_vec()
+        })
+        .collect();
+    assert_eq!(
+        ids.first(),
+        Some(&1),
+        "the offline-sync meeting must rank first"
+    );
+}

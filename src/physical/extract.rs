@@ -391,7 +391,7 @@ impl Extractor {
 
 /// Parse the model's response into a JSON object, tolerating a Markdown code
 /// fence some local models wrap around JSON.
-fn parse_json_object(text: &str) -> Option<serde_json::Map<String, Value>> {
+pub(crate) fn parse_json_object(text: &str) -> Option<serde_json::Map<String, Value>> {
     let trimmed = strip_code_fence(text.trim());
     serde_json::from_str::<Value>(trimmed)
         .ok()?

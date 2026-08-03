@@ -1,16 +1,20 @@
-//! [`SemcastDialect`] — sqlparser dialect adding the infix `MEANS` operator.
+//! [`SemcastDialect`] — sqlparser dialect adding the infix `MEANS` and
+//! `RELEVANCE TO` operators.
 //!
 //! `text MEANS 'condition'` desugars at parse time into a call to the
-//! [`means`] marker UDF, so the dialect is pure surface syntax: the rewrite
-//! rule, `SemFilter` node, and `VerifyExec` see exactly what they see today.
+//! [`means`] marker UDF, and `text RELEVANCE TO 'query'` into [`relevance`],
+//! so the dialect is pure surface syntax: the rewrite rules, extension nodes,
+//! and execution operators see exactly what they see today.
 //!
 //! The dialect wraps [`GenericDialect`] (DataFusion's default) and forwards
 //! its feature flags, so everything Generic accepts still parses. One
 //! deliberate cost: `means` is effectively a reserved word — an unquoted
 //! trailing alias like `SELECT x means FROM t` no longer parses. Quote it
-//! (`"means"`) if you need it as an identifier.
+//! (`"means"`) if you need it as an identifier. `relevance` costs nothing,
+//! because it only binds when followed by `TO`.
 //!
 //! [`means`]: crate::sql::means_udf
+//! [`relevance`]: crate::sql::rank_udf
 
 use datafusion::sql::sqlparser::ast::{
     Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, Ident,
@@ -24,6 +28,7 @@ use datafusion::sql::sqlparser::tokenizer::Token;
 use crate::sql::ddl::parse_field_type;
 use crate::sql::extract_udf::SEM_EXTRACT_INLINE_UDF_NAME;
 use crate::sql::means_udf::MEANS_UDF_NAME;
+use crate::sql::rank_udf::RELEVANCE_UDF_NAME;
 
 /// Forward `fn(&self) -> bool` feature flags to the wrapped [`GenericDialect`]
 /// so we track its behavior instead of the trait's conservative defaults.
@@ -62,6 +67,25 @@ fn peek_is_word(parser: &Parser, word: &str) -> bool {
     )
 }
 
+/// Is the `n`th lookahead token the unquoted word `word`?
+fn peek_nth_is_word(parser: &Parser, n: usize, word: &str) -> bool {
+    matches!(
+        &parser.peek_nth_token_ref(n).token,
+        Token::Word(w) if w.quote_style.is_none() && w.value.eq_ignore_ascii_case(word)
+    )
+}
+
+/// Is the next token pair the (case-insensitive, unquoted) words
+/// `RELEVANCE TO`?
+///
+/// The two-token guard is what keeps `relevance` an ordinary identifier:
+/// `SELECT score relevance FROM t` still parses as a trailing alias, because
+/// nothing follows it with `TO`. `MEANS` cannot afford the same trick — it
+/// takes a single operand — which is why that word really is reserved.
+fn peek_is_relevance_to(parser: &Parser) -> bool {
+    peek_is_word(parser, "RELEVANCE") && peek_nth_is_word(parser, 1, "TO")
+}
+
 /// Parse `EXTRACT ( field TYPE 'doc' FROM source )` into a
 /// `sem_extract_inline(source, 'field', '<typespec>', 'doc')` call. Errors
 /// (including a plain `EXTRACT(part FROM ts)`) make `maybe_parse` backtrack.
@@ -89,27 +113,37 @@ fn parse_inline_extract(parser: &mut Parser) -> Result<Expr, ParserError> {
     let source = parser.parse_expr()?;
     parser.expect_token(&Token::RParen)?;
 
-    Ok(Expr::Function(Function {
-        name: ObjectName::from(vec![Ident::new(SEM_EXTRACT_INLINE_UDF_NAME)]),
+    Ok(marker_call(
+        SEM_EXTRACT_INLINE_UDF_NAME,
+        vec![
+            source,
+            string_literal(field.value),
+            string_literal(field_type.to_string()),
+            string_literal(doc),
+        ],
+    ))
+}
+
+/// A plain `udf(args..)` call — how every piece of semcast surface syntax
+/// leaves the parser.
+fn marker_call(udf: &str, args: Vec<Expr>) -> Expr {
+    Expr::Function(Function {
+        name: ObjectName::from(vec![Ident::new(udf)]),
         uses_odbc_syntax: false,
         parameters: FunctionArguments::None,
         args: FunctionArguments::List(FunctionArgumentList {
             duplicate_treatment: None,
-            args: vec![
-                FunctionArg::Unnamed(FunctionArgExpr::Expr(source)),
-                FunctionArg::Unnamed(FunctionArgExpr::Expr(string_literal(field.value))),
-                FunctionArg::Unnamed(FunctionArgExpr::Expr(string_literal(
-                    field_type.to_string(),
-                ))),
-                FunctionArg::Unnamed(FunctionArgExpr::Expr(string_literal(doc))),
-            ],
+            args: args
+                .into_iter()
+                .map(|arg| FunctionArg::Unnamed(FunctionArgExpr::Expr(arg)))
+                .collect(),
             clauses: vec![],
         }),
         filter: None,
         null_treatment: None,
         over: None,
         within_group: vec![],
-    }))
+    })
 }
 
 fn string_literal(s: String) -> Expr {
@@ -129,11 +163,11 @@ impl Dialect for SemcastDialect {
         self.generic.is_identifier_part(ch)
     }
 
-    /// `MEANS` binds like `LIKE`: tighter than `NOT` / `AND` / `OR`, looser
-    /// than comparisons. `NOT a MEANS 'x' AND b > 1` groups as
-    /// `(NOT (a MEANS 'x')) AND (b > 1)`.
+    /// `MEANS` and `RELEVANCE TO` bind like `LIKE`: tighter than `NOT` /
+    /// `AND` / `OR`, looser than comparisons. `NOT a MEANS 'x' AND b > 1`
+    /// groups as `(NOT (a MEANS 'x')) AND (b > 1)`.
     fn get_next_precedence(&self, parser: &Parser) -> Option<Result<u8, ParserError>> {
-        if peek_is_means(parser) {
+        if peek_is_means(parser) || peek_is_relevance_to(parser) {
             return Some(Ok(self.prec_value(Precedence::Like)));
         }
         None
@@ -162,35 +196,25 @@ impl Dialect for SemcastDialect {
         expr: &Expr,
         _precedence: u8,
     ) -> Option<Result<Expr, ParserError>> {
-        if !peek_is_means(parser) {
+        // Both operators desugar to a two-argument marker UDF the optimizer
+        // rewrites; only the keyword shape and the target name differ.
+        let udf = if peek_is_means(parser) {
+            parser.next_token(); // MEANS
+            MEANS_UDF_NAME
+        } else if peek_is_relevance_to(parser) {
+            parser.next_token(); // RELEVANCE
+            parser.next_token(); // TO
+            RELEVANCE_UDF_NAME
+        } else {
             return None;
-        }
-        parser.next_token(); // consume MEANS
+        };
 
-        // Parse the condition at MEANS's own precedence, then desugar
-        // `lhs MEANS rhs` to `means(lhs, rhs)` — the marker UDF the
-        // optimizer rewrite already understands.
+        // Parse the right-hand side at the operator's own precedence.
         let rhs = match parser.parse_subexpr(self.prec_value(Precedence::Like)) {
             Ok(rhs) => rhs,
             Err(e) => return Some(Err(e)),
         };
-        Some(Ok(Expr::Function(Function {
-            name: ObjectName::from(vec![Ident::new(MEANS_UDF_NAME)]),
-            uses_odbc_syntax: false,
-            parameters: FunctionArguments::None,
-            args: FunctionArguments::List(FunctionArgumentList {
-                duplicate_treatment: None,
-                args: vec![
-                    FunctionArg::Unnamed(FunctionArgExpr::Expr(expr.clone())),
-                    FunctionArg::Unnamed(FunctionArgExpr::Expr(rhs)),
-                ],
-                clauses: vec![],
-            }),
-            filter: None,
-            null_treatment: None,
-            over: None,
-            within_group: vec![],
-        })))
+        Some(Ok(marker_call(udf, vec![expr.clone(), rhs])))
     }
 
     delegate_flags!(
@@ -337,6 +361,44 @@ mod tests {
         assert_eq!(
             parse("SELECT EXTRACT(stage ONEOF(none, shipped) 'the stage' FROM t) FROM m"),
             "SELECT sem_extract_inline(t, 'stage', 'ONEOF(none,shipped)', 'the stage') FROM m"
+        );
+    }
+
+    #[test]
+    fn relevance_to_desugars_to_udf_call() {
+        assert_eq!(
+            parse("SELECT id FROM meetings ORDER BY transcript RELEVANCE TO 'offline sync'"),
+            "SELECT id FROM meetings ORDER BY relevance(transcript, 'offline sync')"
+        );
+    }
+
+    #[test]
+    fn relevance_to_is_case_insensitive() {
+        assert_eq!(
+            parse("SELECT id FROM t ORDER BY body relevance to 'urgent' LIMIT 5"),
+            "SELECT id FROM t ORDER BY relevance(body, 'urgent') LIMIT 5"
+        );
+    }
+
+    #[test]
+    fn relevance_without_to_stays_an_identifier() {
+        // The two-token guard: `relevance` is only an operator before `TO`,
+        // so it still works as a trailing alias and as a column name.
+        assert_eq!(
+            parse("SELECT score relevance FROM t"),
+            "SELECT score AS relevance FROM t"
+        );
+        assert_eq!(
+            parse("SELECT relevance FROM t ORDER BY relevance"),
+            "SELECT relevance FROM t ORDER BY relevance"
+        );
+    }
+
+    #[test]
+    fn relevance_to_binds_like_means() {
+        assert_eq!(
+            parse("SELECT * FROM t WHERE a MEANS 'x' ORDER BY b RELEVANCE TO 'y' DESC LIMIT 3"),
+            "SELECT * FROM t WHERE means(a, 'x') ORDER BY relevance(b, 'y') DESC LIMIT 3"
         );
     }
 
