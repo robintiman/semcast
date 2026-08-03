@@ -323,7 +323,7 @@ impl Verifier {
     }
 
     fn cache_key(&self, input: &str) -> CacheKey {
-        means_cache_key(&self.condition, input, &self.model_id)
+        means_cache_key(&self.condition, input, &self.model_id, MEANS_PROMPT_VERSION)
     }
 }
 
@@ -331,7 +331,18 @@ impl Verifier {
 /// → same verdict, across every query that ever asks again. Shared with
 /// `WITH RECALL` calibration, whose ground-truth labels are exactly
 /// full-text verdicts — the two stages pay for each other's cache.
-pub(crate) fn means_cache_key(condition: &str, input: &str, model_id: &ModelId) -> CacheKey {
+///
+/// `prompt_version` is a parameter, not the constant, because classify asks
+/// the same question through a different prompt when it fuses several
+/// conditions into one call. Passing [`MEANS_PROMPT_VERSION`] is what declares
+/// "this request is byte-identical to a verify call, so share the entry";
+/// anything else keeps the two apart, which is the honest default.
+pub(crate) fn means_cache_key(
+    condition: &str,
+    input: &str,
+    model_id: &ModelId,
+    prompt_version: &str,
+) -> CacheKey {
     use std::hash::{DefaultHasher, Hash, Hasher};
     let mut hasher = DefaultHasher::new();
     input.hash(&mut hasher);
@@ -340,7 +351,7 @@ pub(crate) fn means_cache_key(condition: &str, input: &str, model_id: &ModelId) 
         field: "means".to_owned(),
         input_hash: hasher.finish(),
         model_id: model_id.clone(),
-        prompt_version: MEANS_PROMPT_VERSION.to_owned(),
+        prompt_version: prompt_version.to_owned(),
     }
 }
 

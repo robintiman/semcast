@@ -51,6 +51,12 @@ pub struct FunnelCounts {
     pub extract_cache_hits: usize,
     pub extract_rows_failed: usize,
     pub extract_fields_failed: usize,
+    pub has_classify: bool,
+    pub classify_model_calls: usize,
+    pub classify_cache_hits: usize,
+    pub classify_rows_gated: usize,
+    pub classify_rows_failed: usize,
+    pub classify_branches_failed: usize,
     pub has_rank: bool,
     pub rank_candidate_rows: usize,
     pub rank_rows_pruned: usize,
@@ -64,7 +70,11 @@ pub struct FunnelCounts {
 
 impl FunnelCounts {
     pub fn is_semantic(&self) -> bool {
-        self.has_index_scan || self.has_verify || self.has_extract || self.has_rank
+        self.has_index_scan
+            || self.has_verify
+            || self.has_extract
+            || self.has_rank
+            || self.has_classify
     }
 }
 
@@ -113,6 +123,16 @@ pub fn snapshot(plan: &Arc<dyn ExecutionPlan>) -> FunnelCounts {
                     counts.extract_cache_hits += counter_total(&metrics, "cache_hits");
                     counts.extract_rows_failed += counter_total(&metrics, "rows_failed");
                     counts.extract_fields_failed += counter_total(&metrics, "fields_failed");
+                }
+            }
+            "SemClassifyExec" => {
+                counts.has_classify = true;
+                if let Some(metrics) = metrics {
+                    counts.classify_model_calls += counter_total(&metrics, "model_calls");
+                    counts.classify_cache_hits += counter_total(&metrics, "cache_hits");
+                    counts.classify_rows_gated += counter_total(&metrics, "rows_gated");
+                    counts.classify_rows_failed += counter_total(&metrics, "rows_failed");
+                    counts.classify_branches_failed += counter_total(&metrics, "branches_failed");
                 }
             }
             "SemRankExec" => {
@@ -179,6 +199,17 @@ pub fn render(counts: &FunnelCounts) -> String {
             counts.extract_fields_failed,
         ));
     }
+    if counts.has_classify {
+        parts.push(format!(
+            "classify: {} model calls, {} cache hits, {} rows gated, \
+             {} rows failed, {} branches failed",
+            counts.classify_model_calls,
+            counts.classify_cache_hits,
+            counts.classify_rows_gated,
+            counts.classify_rows_failed,
+            counts.classify_branches_failed,
+        ));
+    }
     if counts.has_rank {
         parts.push(format!(
             "rank: {} candidates, {} pruned, {} model calls, {} cache hits, {} rows failed",
@@ -210,7 +241,7 @@ fn semcast_nodes(plan: &Arc<dyn ExecutionPlan>) -> Vec<Arc<dyn ExecutionPlan>> {
 fn collect(plan: &Arc<dyn ExecutionPlan>, out: &mut Vec<Arc<dyn ExecutionPlan>>) {
     if matches!(
         plan.name(),
-        "IndexScanExec" | "VerifyExec" | "SemExtractExec" | "SemRankExec"
+        "IndexScanExec" | "VerifyExec" | "SemExtractExec" | "SemRankExec" | "SemClassifyExec"
     ) {
         out.push(Arc::clone(plan));
     }

@@ -7,6 +7,7 @@
 //! honest under a recall target ([`calibrate`]).
 
 pub mod calibrate;
+pub mod classify;
 pub mod extract;
 pub mod funnel;
 pub mod rank;
