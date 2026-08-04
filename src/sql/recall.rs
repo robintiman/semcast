@@ -1,10 +1,15 @@
-//! Trailing `WITH RECALL <target>` — statement-level syntax.
+//! Trailing `WITH <knob> <value>` clauses — statement-level syntax.
 //!
-//! The dialect can't carry it: infix `MEANS` desugars to a function call,
-//! and the recall target rides the whole statement, not one expression. So
-//! this is a wrapped-parser extension — parse the statement, then consume
-//! the clause if one trails it. [`crate::sql`] threads the target back into
-//! every `means()` call in the plan.
+//! The dialect can't carry these: infix `MEANS` desugars to a function call,
+//! and a recall target rides the whole statement, not one expression. So this
+//! is a wrapped-parser extension — parse the statement, then consume whatever
+//! clauses trail it. [`crate::sql`] threads each value back into the calls it
+//! governs.
+//!
+//! Two knobs today, both fractions in `(0, 1]`: `WITH RECALL` calibrates the
+//! index pre-filter under a `MEANS`, and `WITH SIMILARITY` sets how alike two
+//! documents must be to count as duplicates under a `SEMANTIC DISTINCT ON`.
+//! `BUDGET` is meant to land here too.
 
 use datafusion::error::DataFusionError;
 use datafusion::sql::parser::{DFParserBuilder, Statement};
@@ -14,55 +19,81 @@ use datafusion::sql::sqlparser::tokenizer::Token;
 
 use super::SemcastDialect;
 
-/// Parse exactly one statement plus an optional trailing `WITH RECALL <f>`.
+/// The trailing knobs a statement carried.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct TrailingClauses {
+    /// `WITH RECALL <f>` — calibration target for the index pre-filter.
+    pub recall: Option<f64>,
+    /// `WITH SIMILARITY <f>` — the duplicate threshold for a semantic dedupe.
+    pub similarity: Option<f64>,
+}
+
+/// Parse exactly one statement plus any trailing `WITH <knob> <value>`.
 ///
 /// Statements go through DataFusion's [`DFParserBuilder`] rather than a raw
 /// sqlparser `Parser` so DataFusion-only syntax — `CREATE EXTERNAL TABLE`,
 /// `COPY ... TO` — parses too; everything else delegates to sqlparser under
 /// [`SemcastDialect`].
-pub fn parse_statement_with_recall(query: &str) -> crate::Result<(Statement, Option<f64>)> {
+pub fn parse_statement_with_recall(query: &str) -> crate::Result<(Statement, TrailingClauses)> {
     let dialect = SemcastDialect::default();
     let mut df_parser = DFParserBuilder::new(query).with_dialect(&dialect).build()?;
     let statement = df_parser.parse_statement()?;
     let parser = &mut df_parser.parser;
 
     // The statement parse stops before a trailing WITH — only the
-    // multi-statement loop of `Parser::parse_sql` would reject it.
-    let recall = if parser.parse_keyword(Keyword::WITH) {
-        match parser.next_token().token {
-            Token::Word(word) if word.value.eq_ignore_ascii_case("recall") => {}
+    // multi-statement loop of `Parser::parse_sql` would reject it. Loop, so
+    // a statement can carry more than one knob.
+    let mut clauses = TrailingClauses::default();
+    while parser.parse_keyword(Keyword::WITH) {
+        let knob = match parser.next_token().token {
+            Token::Word(word) => word.value.to_lowercase(),
             other => {
                 return Err(plan_error(format!(
-                    "expected RECALL after trailing WITH, got {other}"
+                    "expected RECALL or SIMILARITY after trailing WITH, got {other}"
                 )));
             }
+        };
+        let slot = match knob.as_str() {
+            "recall" => &mut clauses.recall,
+            "similarity" => &mut clauses.similarity,
+            other => {
+                return Err(plan_error(format!(
+                    "expected RECALL or SIMILARITY after trailing WITH, got {other}"
+                )));
+            }
+        };
+        if slot.is_some() {
+            return Err(plan_error(format!(
+                "WITH {} given twice",
+                knob.to_uppercase()
+            )));
         }
-        Some(parse_recall_target(parser)?)
-    } else {
-        None
-    };
+        *slot = Some(parse_fraction(parser, &knob.to_uppercase())?);
+    }
 
     let _ = parser.consume_token(&Token::SemiColon);
     parser
         .expect_token(&Token::EOF)
         .map_err(|e| plan_error(format!("unexpected trailing input: {e}")))?;
-    Ok((statement, recall))
+    Ok((statement, clauses))
 }
 
-fn parse_recall_target(parser: &mut Parser) -> crate::Result<f64> {
+/// Both knobs are fractions in `(0, 1]`; neither zero nor "more than all"
+/// means anything for a recall target or a similarity threshold.
+fn parse_fraction(parser: &mut Parser, knob: &str) -> crate::Result<f64> {
     let target = match parser.next_token().token {
         Token::Number(number, _) => number
             .parse::<f64>()
-            .map_err(|e| plan_error(format!("WITH RECALL expects a number, got {number}: {e}")))?,
+            .map_err(|e| plan_error(format!("WITH {knob} expects a number, got {number}: {e}")))?,
         other => {
             return Err(plan_error(format!(
-                "WITH RECALL expects a number in (0, 1], got {other}"
+                "WITH {knob} expects a number in (0, 1], got {other}"
             )));
         }
     };
     if !(target > 0.0 && target <= 1.0) {
         return Err(plan_error(format!(
-            "WITH RECALL must be in (0, 1], got {target}"
+            "WITH {knob} must be in (0, 1], got {target}"
         )));
     }
     Ok(target)
@@ -77,7 +108,11 @@ mod tests {
     use super::*;
 
     fn recall_of(query: &str) -> Option<f64> {
-        parse_statement_with_recall(query).unwrap().1
+        parse_statement_with_recall(query).unwrap().1.recall
+    }
+
+    fn similarity_of(query: &str) -> Option<f64> {
+        parse_statement_with_recall(query).unwrap().1.similarity
     }
 
     fn error_of(query: &str) -> String {
@@ -110,20 +145,20 @@ mod tests {
 
     #[test]
     fn works_under_explain() {
-        let (statement, recall) =
+        let (statement, clauses) =
             parse_statement_with_recall("EXPLAIN SELECT 1 WITH RECALL 0.9").unwrap();
         assert!(matches!(statement, Statement::Explain(_)));
-        assert_eq!(recall, Some(0.9));
+        assert_eq!(clauses.recall, Some(0.9));
     }
 
     #[test]
     fn parses_create_external_table() {
-        let (statement, recall) = parse_statement_with_recall(
+        let (statement, clauses) = parse_statement_with_recall(
             "CREATE EXTERNAL TABLE t STORED AS CSV LOCATION '/data/t.csv'",
         )
         .unwrap();
         assert!(matches!(statement, Statement::CreateExternalTable(_)));
-        assert_eq!(recall, None);
+        assert_eq!(clauses, TrailingClauses::default());
     }
 
     #[test]
@@ -173,8 +208,42 @@ mod tests {
     }
 
     #[test]
-    fn trailing_with_that_is_not_recall_is_rejected() {
+    fn trailing_with_that_is_not_a_known_knob_is_rejected() {
         let message = error_of("SELECT 1 WITH options");
-        assert!(message.contains("expected RECALL"), "got: {message}");
+        assert!(
+            message.contains("expected RECALL or SIMILARITY"),
+            "got: {message}"
+        );
+    }
+
+    #[test]
+    fn parses_trailing_with_similarity() {
+        assert_eq!(similarity_of("SELECT 1 WITH SIMILARITY 0.85"), Some(0.85));
+        assert_eq!(similarity_of("select 1 with similarity 0.5;"), Some(0.5));
+        assert_eq!(similarity_of("SELECT 1"), None);
+    }
+
+    #[test]
+    fn similarity_shares_the_range_check() {
+        assert!(error_of("SELECT 1 WITH SIMILARITY 0").contains("must be in (0, 1]"));
+        assert!(error_of("SELECT 1 WITH SIMILARITY 1.5").contains("must be in (0, 1]"));
+        assert!(error_of("SELECT 1 WITH SIMILARITY high").contains("expects a number"));
+    }
+
+    /// Both knobs can ride one statement — a dedupe over a filtered scan
+    /// wants a threshold *and* a recall target.
+    #[test]
+    fn knobs_compose() {
+        let clauses = parse_statement_with_recall("SELECT 1 WITH RECALL 0.9 WITH SIMILARITY 0.8")
+            .unwrap()
+            .1;
+        assert_eq!(clauses.recall, Some(0.9));
+        assert_eq!(clauses.similarity, Some(0.8));
+    }
+
+    #[test]
+    fn the_same_knob_twice_is_rejected() {
+        let message = error_of("SELECT 1 WITH RECALL 0.9 WITH RECALL 0.8");
+        assert!(message.contains("given twice"), "got: {message}");
     }
 }

@@ -4,7 +4,7 @@
 //! use DataFusion types: only Arrow (shared at one version across both
 //! trees) crosses the boundary.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use ::lance::dataset::{Dataset, WriteMode, WriteParams};
@@ -266,6 +266,68 @@ impl SemanticIndex for LanceIndex {
             }
         }
         Ok(hits)
+    }
+
+    /// Scan every chunk vector and average them per document.
+    ///
+    /// A document is its chunks, so its position in embedding space is their
+    /// mean — renormalized, because the mean of unit vectors is not one, and
+    /// cosine distance downstream assumes it is.
+    async fn doc_vectors(&self) -> Result<HashMap<u64, Embedding>> {
+        let dataset = self.dataset.lock().await.clone();
+        let mut scan = dataset.scan();
+        scan.project(&["doc_hash", "vector"]).map_err(lance_err)?;
+        let batches: Vec<RecordBatch> = scan
+            .try_into_stream()
+            .await
+            .map_err(lance_err)?
+            .try_collect()
+            .await
+            .map_err(lance_err)?;
+
+        let mut sums: HashMap<u64, (Embedding, usize)> = HashMap::new();
+        for batch in &batches {
+            let hashes = column::<UInt64Array>(batch, "doc_hash")?;
+            let vectors = column::<FixedSizeListArray>(batch, "vector")?;
+            for i in 0..batch.num_rows() {
+                let values = vectors.value(i);
+                let values = values
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .ok_or_else(|| {
+                        SemcastError::Index("index vectors are not Float32".to_owned())
+                    })?;
+                let (sum, count) = sums
+                    .entry(hashes.value(i))
+                    .or_insert_with(|| (vec![0.0; self.dim], 0));
+                for (slot, value) in sum.iter_mut().zip(values.values()) {
+                    *slot += value;
+                }
+                *count += 1;
+            }
+        }
+
+        Ok(sums
+            .into_iter()
+            .map(|(hash, (mut sum, count))| {
+                for value in &mut sum {
+                    *value /= count as f32;
+                }
+                normalize(&mut sum);
+                (hash, sum)
+            })
+            .collect())
+    }
+}
+
+/// Scale to unit length in place; an all-zero vector is left alone rather
+/// than turned into NaNs.
+fn normalize(vector: &mut [f32]) {
+    let norm = vector.iter().map(|v| v * v).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for value in vector {
+            *value /= norm;
+        }
     }
 }
 

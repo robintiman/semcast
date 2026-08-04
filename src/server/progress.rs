@@ -51,6 +51,21 @@ pub struct FunnelCounts {
     pub extract_cache_hits: usize,
     pub extract_rows_failed: usize,
     pub extract_fields_failed: usize,
+    pub has_distinct: bool,
+    pub distinct_groups: usize,
+    pub distinct_duplicate_rows: usize,
+    /// Rows the index has never seen. Dedupe gives them a NULL key, and NULL
+    /// never equals NULL, so they all survive — duplicates stay in rather
+    /// than data going out.
+    pub distinct_unindexed_rows: usize,
+    pub has_cluster: bool,
+    pub cluster_groups: usize,
+    pub cluster_model_calls: usize,
+    pub cluster_cache_hits: usize,
+    /// Rows the index has never seen. Clustering gives them a NULL label
+    /// rather than a group, so a non-zero count means a gap until refresh.
+    pub cluster_unindexed_rows: usize,
+    pub cluster_labels_failed: usize,
     pub has_classify: bool,
     pub classify_model_calls: usize,
     pub classify_cache_hits: usize,
@@ -75,6 +90,8 @@ impl FunnelCounts {
             || self.has_extract
             || self.has_rank
             || self.has_classify
+            || self.has_cluster
+            || self.has_distinct
     }
 }
 
@@ -123,6 +140,24 @@ pub fn snapshot(plan: &Arc<dyn ExecutionPlan>) -> FunnelCounts {
                     counts.extract_cache_hits += counter_total(&metrics, "cache_hits");
                     counts.extract_rows_failed += counter_total(&metrics, "rows_failed");
                     counts.extract_fields_failed += counter_total(&metrics, "fields_failed");
+                }
+            }
+            "SemDistinctExec" => {
+                counts.has_distinct = true;
+                if let Some(metrics) = metrics {
+                    counts.distinct_groups += counter_total(&metrics, "groups");
+                    counts.distinct_duplicate_rows += counter_total(&metrics, "duplicate_rows");
+                    counts.distinct_unindexed_rows += counter_total(&metrics, "unindexed_rows");
+                }
+            }
+            "SemClusterExec" => {
+                counts.has_cluster = true;
+                if let Some(metrics) = metrics {
+                    counts.cluster_groups += counter_total(&metrics, "groups");
+                    counts.cluster_model_calls += counter_total(&metrics, "model_calls");
+                    counts.cluster_cache_hits += counter_total(&metrics, "cache_hits");
+                    counts.cluster_unindexed_rows += counter_total(&metrics, "unindexed_rows");
+                    counts.cluster_labels_failed += counter_total(&metrics, "labels_failed");
                 }
             }
             "SemClassifyExec" => {
@@ -199,6 +234,37 @@ pub fn render(counts: &FunnelCounts) -> String {
             counts.extract_fields_failed,
         ));
     }
+    if counts.has_distinct {
+        parts.push(format!(
+            "dedupe: {} distinct, {} duplicates collapsed",
+            counts.distinct_groups, counts.distinct_duplicate_rows,
+        ));
+        if counts.distinct_unindexed_rows > 0 {
+            parts.push(format!(
+                "dedupe: {} rows are not in the semantic index and were left as-is — \
+                 REFRESH SEMANTIC INDEX to deduplicate them",
+                counts.distinct_unindexed_rows,
+            ));
+        }
+    }
+    if counts.has_cluster {
+        parts.push(format!(
+            "cluster: {} groups, {} model calls, {} cache hits, {} labels failed",
+            counts.cluster_groups,
+            counts.cluster_model_calls,
+            counts.cluster_cache_hits,
+            counts.cluster_labels_failed,
+        ));
+        // An unlabelled row is invisible in a GROUP BY result, so it gets its
+        // own line rather than a number buried in the funnel.
+        if counts.cluster_unindexed_rows > 0 {
+            parts.push(format!(
+                "cluster: {} rows are not in the semantic index and have no group — \
+                 REFRESH SEMANTIC INDEX to include them",
+                counts.cluster_unindexed_rows,
+            ));
+        }
+    }
     if counts.has_classify {
         parts.push(format!(
             "classify: {} model calls, {} cache hits, {} rows gated, \
@@ -241,7 +307,13 @@ fn semcast_nodes(plan: &Arc<dyn ExecutionPlan>) -> Vec<Arc<dyn ExecutionPlan>> {
 fn collect(plan: &Arc<dyn ExecutionPlan>, out: &mut Vec<Arc<dyn ExecutionPlan>>) {
     if matches!(
         plan.name(),
-        "IndexScanExec" | "VerifyExec" | "SemExtractExec" | "SemRankExec" | "SemClassifyExec"
+        "IndexScanExec"
+            | "VerifyExec"
+            | "SemExtractExec"
+            | "SemRankExec"
+            | "SemClassifyExec"
+            | "SemClusterExec"
+            | "SemDistinctExec"
     ) {
         out.push(Arc::clone(plan));
     }

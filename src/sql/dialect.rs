@@ -25,6 +25,7 @@ use datafusion::sql::sqlparser::keywords::Keyword;
 use datafusion::sql::sqlparser::parser::{Parser, ParserError};
 use datafusion::sql::sqlparser::tokenizer::Token;
 
+use crate::sql::cluster_udf::MEANING_OF_UDF_NAME;
 use crate::sql::ddl::parse_field_type;
 use crate::sql::extract_udf::SEM_EXTRACT_INLINE_UDF_NAME;
 use crate::sql::means_udf::MEANS_UDF_NAME;
@@ -146,6 +147,54 @@ fn marker_call(udf: &str, args: Vec<Expr>) -> Expr {
     })
 }
 
+/// Parse `MEANING OF <expr> [INTO <k>] [AS <label>]` into a
+/// `meaning_of(source[, k][, 'label'])` call.
+///
+/// `INTO` and `AS` are consumed here rather than left to the surrounding
+/// clause because neither is legal where this appears: a `GROUP BY` list
+/// takes bare expressions, so nothing downstream would accept them.
+/// Errors make `maybe_parse` backtrack, leaving `meaning` an ordinary
+/// identifier.
+fn parse_meaning_of(parser: &mut Parser) -> Result<Expr, ParserError> {
+    parser.next_token(); // MEANING
+    parser.next_token(); // OF
+    let source = parser.parse_subexpr(prec_value_like())?;
+
+    let mut args = vec![source];
+    if parser.parse_keyword(Keyword::INTO) {
+        // `INTO 0` parses here and is rejected by the optimizer: an error
+        // raised inside `maybe_parse` is swallowed as a backtrack, which
+        // would surface as a baffling complaint about the word `OF`.
+        let k = parser.parse_literal_uint()?;
+        args.push(Expr::Value(
+            Value::Number(k.to_string(), false).with_empty_span(),
+        ));
+    }
+    // The label rides along as a literal so the AST pass can bind it in the
+    // SELECT list, where a bare `MEANING OF ... AS topic` alias cannot reach.
+    if parser.parse_keyword(Keyword::AS) {
+        let label = parser.parse_identifier()?;
+        if args.len() == 1 {
+            args.push(Expr::Value(
+                Value::Number(AUTO_K_SENTINEL.to_string(), false).with_empty_span(),
+            ));
+        }
+        args.push(string_literal(label.value));
+    }
+    Ok(marker_call(MEANING_OF_UDF_NAME, args))
+}
+
+/// Stands in for an absent `INTO` when a label forces the argument to exist.
+/// Negative because zero is a `k` a user can write, and writing it should be
+/// an error rather than silently meaning "choose for me".
+pub const AUTO_K_SENTINEL: i64 = -1;
+
+fn prec_value_like() -> u8 {
+    // `Dialect::prec_value` needs a dialect; the free functions above only
+    // need the numeric value, which is fixed for `Precedence::Like`.
+    SemcastDialect::default().prec_value(Precedence::Like)
+}
+
 fn string_literal(s: String) -> Expr {
     Expr::Value(Value::SingleQuotedString(s).with_empty_span())
 }
@@ -179,6 +228,13 @@ impl Dialect for SemcastDialect {
     /// grammar is attempted under `maybe_parse` (which backtracks), and on any
     /// mismatch we return `None` to let the default `EXTRACT` path run.
     fn parse_prefix(&self, parser: &mut Parser) -> Option<Result<Expr, ParserError>> {
+        if peek_is_word(parser, "MEANING") && peek_nth_is_word(parser, 1, "OF") {
+            return match parser.maybe_parse(parse_meaning_of) {
+                Ok(Some(expr)) => Some(Ok(expr)),
+                Ok(None) => None,
+                Err(e) => Some(Err(e)),
+            };
+        }
         if !peek_is_word(parser, "EXTRACT") {
             return None;
         }
