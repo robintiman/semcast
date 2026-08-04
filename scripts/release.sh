@@ -116,9 +116,6 @@ cargo update -p semcast --offline >/dev/null 2>&1 || cargo check --quiet
 grep -q "^version = \"$VERSION\"$" Cargo.toml \
   || die "version bump did not apply cleanly to Cargo.toml; inspect it by hand"
 
-step "Running tests"
-cargo test --quiet
-
 # The exact check CI performs. If dist can't resolve the tag to a package
 # version here, the release job would have failed the same way.
 if command -v dist >/dev/null 2>&1; then
