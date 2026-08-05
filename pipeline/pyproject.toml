@@ -1,0 +1,30 @@
+[project]
+name = "semcast-hn"
+version = "0.1.0"
+description = "Daily Hacker News digest, filtered and extracted with semcast"
+requires-python = ">=3.11"
+dependencies = [
+    "dagster>=1.9",
+    "dagster-webserver>=1.9",
+    "psycopg2-binary>=2.9",
+    "pyarrow>=17",
+    "requests>=2.32",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["semcast_hn*"]
+
+# The templates are loaded at runtime, so they have to ship — an editable
+# install hides this, a real one would not.
+[tool.setuptools.package-data]
+semcast_hn = ["sql/*.sql"]
+
+[tool.dagster]
+module_name = "semcast_hn.definitions"
