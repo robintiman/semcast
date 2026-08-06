@@ -198,8 +198,14 @@ fn parquet_error(error: datafusion::parquet::errors::ParquetError) -> crate::Sem
 
 /// Command tag for statements without a result shape, from the leading
 /// keywords: `CREATE TABLE`, `CREATE SEMANTIC INDEX`, `DROP TABLE`, ...
+///
+/// The one place still derived from text rather than from a parse tree —
+/// deliberately, because it is a cosmetic wire label and mapping the whole
+/// `sqlparser::Statement` enum onto Postgres command tags is far more surface
+/// than that earns. Reading the words through the tokenizer is what keeps a
+/// leading comment from being reported as the command (issue #17).
 fn command_tag(sql: &str) -> String {
-    let mut words = sql.split_whitespace().map(|word| word.to_ascii_uppercase());
+    let mut words = crate::sql::head::leading_words(sql, 3).into_iter();
     match (words.next().as_deref(), words.next().as_deref()) {
         (Some(first @ ("CREATE" | "DROP" | "ALTER")), Some("SEMANTIC")) => match words.next() {
             Some(third) => format!("{first} SEMANTIC {third}"),
@@ -288,6 +294,16 @@ mod tests {
     fn create_external_table_tags_as_create_table() {
         let tag = command_tag("CREATE EXTERNAL TABLE t STORED AS CSV LOCATION 'x.csv'");
         assert_eq!(tag, "CREATE TABLE");
+    }
+
+    /// Issue #17: the tag used to be reported as `--`.
+    #[test]
+    fn a_leading_comment_is_not_the_command() {
+        assert_eq!(
+            command_tag("-- build the index\nCREATE SEMANTIC INDEX ON t(c)"),
+            "CREATE SEMANTIC INDEX",
+        );
+        assert_eq!(command_tag("/* tidy up */ DROP TABLE t"), "DROP TABLE");
     }
 
     #[tokio::test]

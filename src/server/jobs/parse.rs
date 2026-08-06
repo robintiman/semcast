@@ -43,18 +43,13 @@ pub fn parse_cancel_job(statement: &str) -> Result<Option<String>, String> {
 
 /// The remainder after a leading `keyword`, if `statement` starts with it as a
 /// whole word.
+///
+/// Read off the token stream, so a leading comment doesn't hide the keyword
+/// (issue #17). The remainder stays a subslice of the original text — that is
+/// what lets `SUBMIT` hand its payload through byte-for-byte. The
+/// `SUBMITTED is not SUBMIT` guard comes free: the tokenizer makes it one word.
 fn strip_keyword<'a>(statement: &'a str, keyword: &str) -> Option<&'a str> {
-    let trimmed = statement.trim_start();
-    let head = trimmed.get(..keyword.len())?;
-    if !head.eq_ignore_ascii_case(keyword) {
-        return None;
-    }
-    let rest = &trimmed[keyword.len()..];
-    // `SUBMITTED` is not `SUBMIT`.
-    if !rest.is_empty() && !rest.starts_with(|c: char| c.is_whitespace()) {
-        return None;
-    }
-    Some(rest.trim())
+    crate::sql::head::strip_leading_keyword(statement, keyword)
 }
 
 fn cancel_error(message: impl Into<String>) -> String {
@@ -90,6 +85,33 @@ mod tests {
         assert_eq!(parse_submit("SUBMIT   "), None);
         assert_eq!(parse_submit("SUBMITTED SELECT 1"), None);
         assert_eq!(parse_submit("SELECT * FROM submissions"), None);
+    }
+
+    /// Issue #17: a leading comment used to hide the keyword, so the whole
+    /// statement fell through to the engine as a parse error.
+    #[test]
+    fn a_leading_comment_never_hides_the_keyword() {
+        assert_eq!(
+            parse_submit("-- run this detached\nSUBMIT SELECT 1"),
+            Some("SELECT 1"),
+        );
+        assert_eq!(
+            parse_submit("/* detached */ SUBMIT SELECT 1"),
+            Some("SELECT 1"),
+        );
+        assert_eq!(
+            parse_cancel_job("-- never mind\nCANCEL JOB 'job_17_0001'").unwrap(),
+            Some("job_17_0001".to_owned()),
+        );
+    }
+
+    #[test]
+    fn comments_inside_the_payload_survive() {
+        // `SUBMIT` hands its payload through byte-for-byte.
+        assert_eq!(
+            parse_submit("SUBMIT SELECT 1 -- why we run it\n"),
+            Some("SELECT 1 -- why we run it"),
+        );
     }
 
     #[test]
