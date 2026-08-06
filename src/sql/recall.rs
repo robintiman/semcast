@@ -1,10 +1,10 @@
 //! Trailing `WITH <knob> <value>` clauses — statement-level syntax.
 //!
 //! The dialect can't carry these: infix `MEANS` desugars to a function call,
-//! and a recall target rides the whole statement, not one expression. So this
-//! is a wrapped-parser extension — parse the statement, then consume whatever
-//! clauses trail it. [`crate::sql`] threads each value back into the calls it
-//! governs.
+//! and a recall target rides the whole statement, not one expression. So they
+//! are consumed after the statement, off the same parser
+//! ([`crate::sql::statement`]). [`crate::sql`] threads each value back into
+//! the calls it governs.
 //!
 //! Two knobs today, both fractions in `(0, 1]`: `WITH RECALL` calibrates the
 //! index pre-filter under a `MEANS`, and `WITH SIMILARITY` sets how alike two
@@ -12,12 +12,9 @@
 //! `BUDGET` is meant to land here too.
 
 use datafusion::error::DataFusionError;
-use datafusion::sql::parser::{DFParserBuilder, Statement};
 use datafusion::sql::sqlparser::keywords::Keyword;
 use datafusion::sql::sqlparser::parser::Parser;
 use datafusion::sql::sqlparser::tokenizer::Token;
-
-use super::SemcastDialect;
 
 /// The trailing knobs a statement carried.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -28,18 +25,9 @@ pub struct TrailingClauses {
     pub similarity: Option<f64>,
 }
 
-/// Parse exactly one statement plus any trailing `WITH <knob> <value>`.
-///
-/// Statements go through DataFusion's [`DFParserBuilder`] rather than a raw
-/// sqlparser `Parser` so DataFusion-only syntax — `CREATE EXTERNAL TABLE`,
-/// `COPY ... TO` — parses too; everything else delegates to sqlparser under
-/// [`SemcastDialect`].
-pub fn parse_statement_with_recall(query: &str) -> crate::Result<(Statement, TrailingClauses)> {
-    let dialect = SemcastDialect::default();
-    let mut df_parser = DFParserBuilder::new(query).with_dialect(&dialect).build()?;
-    let statement = df_parser.parse_statement()?;
-    let parser = &mut df_parser.parser;
-
+/// Consume any trailing `WITH <knob> <value>` clauses, then the end of the
+/// statement. Called with the parser left where the statement parse stopped.
+pub(crate) fn trailing_clauses(parser: &mut Parser) -> crate::Result<TrailingClauses> {
     // The statement parse stops before a trailing WITH — only the
     // multi-statement loop of `Parser::parse_sql` would reject it. Loop, so
     // a statement can carry more than one knob.
@@ -75,7 +63,7 @@ pub fn parse_statement_with_recall(query: &str) -> crate::Result<(Statement, Tra
     parser
         .expect_token(&Token::EOF)
         .map_err(|e| plan_error(format!("unexpected trailing input: {e}")))?;
-    Ok((statement, clauses))
+    Ok(clauses)
 }
 
 /// Both knobs are fractions in `(0, 1]`; neither zero nor "more than all"
@@ -106,6 +94,8 @@ fn plan_error(message: String) -> crate::SemcastError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::statement::parse_statement_with_recall;
+    use datafusion::sql::parser::Statement;
 
     fn recall_of(query: &str) -> Option<f64> {
         parse_statement_with_recall(query).unwrap().1.recall

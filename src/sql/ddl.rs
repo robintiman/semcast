@@ -1,9 +1,12 @@
 //! `CREATE SEMANTIC INDEX / TYPE / PREDICATE` statements.
 //!
-//! DataFusion hook: a custom statement parser (sqlparser dialect extension)
-//! feeding a planner extension. `CREATE SEMANTIC INDEX` and `TYPE` are
-//! token-level parsers (no sqlparser `DataType` involvement); `PREDICATE`
-//! remains a not-implemented stub.
+//! The grammar only — hand-written token-level parsers with no sqlparser
+//! `DataType` involvement. `PREDICATE` remains a not-implemented stub.
+//!
+//! Recognizing these statements is not this module's job: [`crate::sql::statement`]
+//! owns the parser and dispatches to [`parse_semantic_ddl`] once the leading
+//! `CREATE SEMANTIC` has been consumed. That module also records why this is
+//! not a `Dialect::parse_statement` hook.
 
 use std::hash::{DefaultHasher, Hash, Hasher};
 
@@ -31,35 +34,13 @@ pub enum SemanticDdl {
     },
 }
 
-/// Recognize a semantic DDL statement; `Ok(None)` means "not ours, let
-/// DataFusion parse it".
-pub fn parse_semantic_ddl(sql: &str) -> crate::Result<Option<SemanticDdl>> {
-    // Cheap gate so ordinary statements never pay for a second parse: the
-    // first two words must be CREATE SEMANTIC.
-    let mut words = sql.split_whitespace();
-    let prefix_matches = words
-        .next()
-        .is_some_and(|w| w.eq_ignore_ascii_case("create"))
-        && words
-            .next()
-            .is_some_and(|w| w.eq_ignore_ascii_case("semantic"));
-    if !prefix_matches {
-        return Ok(None);
-    }
-
-    let mut parser = Parser::new(&GenericDialect {})
-        .try_with_sql(sql)
-        .map_err(|e| DataFusionError::Plan(format!("invalid CREATE SEMANTIC statement: {e}")))?;
-
-    expect_word(&mut parser, "CREATE").map_err(index_error)?;
-    expect_word(&mut parser, "SEMANTIC").map_err(index_error)?;
+/// Parse the tail of a semantic DDL statement — the leading `CREATE SEMANTIC`
+/// is already consumed by [`crate::sql::statement::parse_semcast_statement`],
+/// which is the only thing that decides whether a statement is ours.
+pub fn parse_semantic_ddl(parser: &mut Parser) -> crate::Result<SemanticDdl> {
     match parser.next_token().token {
-        Token::Word(word) if word.value.eq_ignore_ascii_case("index") => {
-            parse_create_index(&mut parser).map(Some)
-        }
-        Token::Word(word) if word.value.eq_ignore_ascii_case("type") => {
-            parse_create_type(&mut parser).map(Some)
-        }
+        Token::Word(word) if word.value.eq_ignore_ascii_case("index") => parse_create_index(parser),
+        Token::Word(word) if word.value.eq_ignore_ascii_case("type") => parse_create_type(parser),
         Token::Word(word) if word.value.eq_ignore_ascii_case("predicate") => {
             Err(crate::SemcastError::DataFusion(DataFusionError::Plan(
                 "CREATE SEMANTIC PREDICATE is not implemented yet (needs template \
@@ -373,9 +354,21 @@ fn type_error(message: impl Into<String>) -> crate::SemcastError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::statement::{SemcastStatement, parse_semcast_statement};
 
+    /// The grammar is only reachable through the statement parser, so the
+    /// tests drive it the way production does.
     fn ddl(sql: &str) -> SemanticDdl {
-        parse_semantic_ddl(sql).unwrap().expect("recognized as DDL")
+        match parse_semcast_statement(sql).unwrap() {
+            SemcastStatement::Ddl(ddl) => ddl,
+            SemcastStatement::Sql(statement, _) => {
+                panic!("expected DDL, parsed as SQL: {statement}")
+            }
+        }
+    }
+
+    fn parse_err(sql: &str) -> crate::SemcastError {
+        parse_semcast_statement(sql).unwrap_err()
     }
 
     #[test]
@@ -412,34 +405,21 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_statements_are_not_ours() {
-        assert_eq!(parse_semantic_ddl("SELECT 1").unwrap(), None);
-        assert_eq!(
-            parse_semantic_ddl("CREATE TABLE t AS SELECT 1").unwrap(),
-            None,
-        );
-        assert_eq!(parse_semantic_ddl("").unwrap(), None);
-        assert_eq!(parse_semantic_ddl("CREATE").unwrap(), None);
-    }
-
-    #[test]
     fn malformed_index_statement_is_a_clear_error() {
-        let err = parse_semantic_ddl("CREATE SEMANTIC INDEX meetings(transcript)").unwrap_err();
-        let message = err.to_string();
+        let message = parse_err("CREATE SEMANTIC INDEX meetings(transcript)").to_string();
         assert!(message.contains("expected ON"), "got: {message}");
         assert!(
             message.contains("CREATE SEMANTIC INDEX ON table(column)"),
             "shows the expected shape: {message}",
         );
 
-        let err = parse_semantic_ddl("CREATE SEMANTIC INDEX ON meetings(transcript) garbage")
-            .unwrap_err();
+        let err = parse_err("CREATE SEMANTIC INDEX ON meetings(transcript) garbage");
         assert!(err.to_string().contains("EOF"), "got: {err}");
     }
 
     #[test]
     fn predicate_is_explicit_not_implemented() {
-        let err = parse_semantic_ddl("CREATE SEMANTIC PREDICATE p(t) AS t").unwrap_err();
+        let err = parse_err("CREATE SEMANTIC PREDICATE p(t) AS t");
         assert!(err.to_string().contains("not implemented"), "got: {err}");
     }
 
@@ -543,8 +523,7 @@ mod tests {
 
     #[test]
     fn duplicate_field_name_is_an_error() {
-        let err =
-            parse_semantic_ddl("CREATE SEMANTIC TYPE T AS (x TEXT 'a', x INT 'b')").unwrap_err();
+        let err = parse_err("CREATE SEMANTIC TYPE T AS (x TEXT 'a', x INT 'b')");
         assert!(
             err.to_string().contains("duplicate field name x"),
             "got: {err}"
@@ -553,15 +532,13 @@ mod tests {
 
     #[test]
     fn together_needs_at_least_two_members() {
-        let err =
-            parse_semantic_ddl("CREATE SEMANTIC TYPE T AS (TOGETHER (x TEXT 'a'))").unwrap_err();
+        let err = parse_err("CREATE SEMANTIC TYPE T AS (TOGETHER (x TEXT 'a'))");
         assert!(err.to_string().contains("at least two"), "got: {err}");
     }
 
     #[test]
     fn nested_type_reference_is_deferred() {
-        let err = parse_semantic_ddl("CREATE SEMANTIC TYPE T AS (sub OtherType 'a nested thing')")
-            .unwrap_err();
+        let err = parse_err("CREATE SEMANTIC TYPE T AS (sub OtherType 'a nested thing')");
         assert!(
             err.to_string().contains("nested semantic types"),
             "got: {err}"
@@ -570,7 +547,7 @@ mod tests {
 
     #[test]
     fn missing_doc_string_is_a_clear_error() {
-        let err = parse_semantic_ddl("CREATE SEMANTIC TYPE T AS (x TEXT)").unwrap_err();
+        let err = parse_err("CREATE SEMANTIC TYPE T AS (x TEXT)");
         assert!(err.to_string().contains("doc string"), "got: {err}");
     }
 }
