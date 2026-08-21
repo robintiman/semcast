@@ -81,37 +81,42 @@ pub fn semcast_context(model: Arc<dyn ModelProvider>) -> SessionContext {
 /// only accepts sqlparser's built-in dialects, so the custom syntax needs its
 /// own entry point; queries that call `means()` directly work through either.
 pub async fn sql(ctx: &SessionContext, query: &str) -> Result<DataFrame> {
-    // `CREATE SEMANTIC ...` is semcast syntax, not SQL — intercept it before
-    // the parser. DDL yields an empty DataFrame, like DataFusion's own DDL.
-    if let Some(ddl) = sql::ddl::parse_semantic_ddl(query)? {
-        return match ddl {
-            sql::ddl::SemanticDdl::CreateIndex { table, column } => {
-                create_semantic_index(ctx, &table, &column, IndexOptions::default()).await?;
-                let no_rows = LogicalPlanBuilder::empty(false).build()?;
-                Ok(DataFrame::new(ctx.state(), no_rows))
-            }
-            sql::ddl::SemanticDdl::CreateType(ty) => {
-                let runtime = ctx
-                    .state()
-                    .config()
-                    .get_extension::<SemcastRuntime>()
-                    .ok_or_else(|| {
-                        DataFusionError::Plan("semcast runtime is not registered".to_owned())
-                    })?;
-                runtime.type_registry().register(ty)?;
-                let no_rows = LogicalPlanBuilder::empty(false).build()?;
-                Ok(DataFrame::new(ctx.state(), no_rows))
-            }
-            other => Err(DataFusionError::Plan(format!(
-                "semantic DDL not implemented yet: {other:?}"
-            ))
-            .into()),
-        };
-    }
     // `SEMANTIC` qualifies a select modifier, where sqlparser has no dialect
-    // hook — remove the word, then mark what it qualified in the AST.
+    // hook — remove the word, then mark what it qualified in the AST. Safe to
+    // run ahead of the DDL branch: it only fires on `SEMANTIC DISTINCT`, and
+    // `CREATE SEMANTIC INDEX`/`TYPE` never is.
     let (query, semantic_distinct) = sql::distinct::strip_semantic_distinct(query);
-    let (mut statement, clauses) = sql::recall::parse_statement_with_recall(&query)?;
+    // `CREATE SEMANTIC ...` is semcast syntax, not SQL. The statement parser
+    // dispatches it on its own token stream; DDL is executed here rather than
+    // planned, and yields an empty DataFrame like DataFusion's own DDL.
+    let (mut statement, clauses) = match sql::parse_semcast_statement(&query)? {
+        sql::SemcastStatement::Ddl(ddl) => {
+            return match ddl {
+                sql::ddl::SemanticDdl::CreateIndex { table, column } => {
+                    create_semantic_index(ctx, &table, &column, IndexOptions::default()).await?;
+                    let no_rows = LogicalPlanBuilder::empty(false).build()?;
+                    Ok(DataFrame::new(ctx.state(), no_rows))
+                }
+                sql::ddl::SemanticDdl::CreateType(ty) => {
+                    let runtime = ctx
+                        .state()
+                        .config()
+                        .get_extension::<SemcastRuntime>()
+                        .ok_or_else(|| {
+                            DataFusionError::Plan("semcast runtime is not registered".to_owned())
+                        })?;
+                    runtime.type_registry().register(ty)?;
+                    let no_rows = LogicalPlanBuilder::empty(false).build()?;
+                    Ok(DataFrame::new(ctx.state(), no_rows))
+                }
+                other => Err(DataFusionError::Plan(format!(
+                    "semantic DDL not implemented yet: {other:?}"
+                ))
+                .into()),
+            };
+        }
+        sql::SemcastStatement::Sql(statement, clauses) => (statement, clauses),
+    };
     if semantic_distinct && !sql::distinct::mark_semantic_distinct(&mut statement) {
         return Err(DataFusionError::Plan(
             "SEMANTIC only qualifies DISTINCT ON (<column>); a plain SEMANTIC \

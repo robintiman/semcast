@@ -82,8 +82,13 @@ async fn calibrated_funnel_round_trips_with_progress_notices() {
         ))
         .await
         .unwrap();
+    // Commented, because issue #17 was reported against exactly this path:
+    // a leading comment made the DDL fail to parse over the wire.
     client
-        .simple_query("CREATE SEMANTIC INDEX ON meetings(transcript)")
+        .simple_query(
+            "-- transcripts are long, so index them\n\
+             CREATE SEMANTIC INDEX ON meetings(transcript)",
+        )
         .await
         .unwrap();
 

@@ -70,7 +70,7 @@ fn is_relevance_call(expr: &Expr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::recall::parse_statement_with_recall;
+    use crate::sql::statement::parse_statement_with_recall;
 
     fn rewrite(sql: &str) -> String {
         let (mut statement, _) = parse_statement_with_recall(sql).unwrap();

@@ -29,6 +29,7 @@ use datafusion::sql::sqlparser::tokenizer::{Token, Tokenizer};
 
 use crate::sql::SemcastDialect;
 use crate::sql::distinct_udf::SEMANTIC_KEY_UDF_NAME;
+use crate::sql::head::{byte_offset, line_offsets};
 
 /// Remove the word `SEMANTIC` where it qualifies a `DISTINCT`, returning the
 /// rewritten SQL and whether anything was removed.
@@ -77,31 +78,6 @@ pub fn strip_semantic_distinct(sql: &str) -> (String, bool) {
     }
     stripped.push_str(&sql[cursor..]);
     (stripped, true)
-}
-
-/// Byte offset of the start of each 1-based line.
-fn line_offsets(sql: &str) -> Vec<usize> {
-    let mut offsets = vec![0usize];
-    for (i, byte) in sql.bytes().enumerate() {
-        if byte == b'\n' {
-            offsets.push(i + 1);
-        }
-    }
-    offsets
-}
-
-/// sqlparser reports 1-based line and column in *characters*; the cut needs
-/// bytes. Walking the line rather than adding the column keeps a multibyte
-/// literal earlier on the same line from shifting the cut.
-fn byte_offset(sql: &str, offsets: &[usize], line: u64, column: u64) -> Option<usize> {
-    let line_start = *offsets.get(line.checked_sub(1)? as usize)?;
-    let column = column.checked_sub(1)? as usize;
-    let rest = sql.get(line_start..)?;
-    Some(match rest.char_indices().nth(column) {
-        Some((offset, _)) => line_start + offset,
-        // The location is the end of the text.
-        None => sql.len(),
-    })
 }
 
 /// Wrap every `DISTINCT ON` expression in `semantic_key(...)`, so the marker
@@ -155,7 +131,7 @@ fn key_call(arg: Expr) -> Expr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::recall::parse_statement_with_recall;
+    use crate::sql::statement::parse_statement_with_recall;
 
     fn strip(sql: &str) -> (String, bool) {
         strip_semantic_distinct(sql)

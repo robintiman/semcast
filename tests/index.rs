@@ -388,6 +388,39 @@ async fn create_semantic_index_ddl_plans_the_funnel() {
     assert!(display.contains("IndexScanExec"), "plan:\n{display}");
 }
 
+/// Issue #17: a leading comment made the DDL fail to parse, which is the first
+/// thing you hit once the SQL lives in a file instead of at a `psql` prompt.
+/// Asserting the index is actually *built*, not just that the call returned.
+#[tokio::test]
+async fn a_commented_create_semantic_index_still_builds_the_index() {
+    let model = Arc::new(MockModel::answering_yes_to(["sync"]));
+    let ctx = separable_context(model).await;
+
+    semcast::sql(
+        &ctx,
+        "-- the transcripts are long, so index them\n\
+         CREATE SEMANTIC INDEX ON meetings(transcript);",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    // The funnel only plans an IndexScanExec if the index exists.
+    let plan = semcast::sql(
+        &ctx,
+        "SELECT meeting_id FROM meetings WHERE transcript MEANS 'sync'",
+    )
+    .await
+    .unwrap()
+    .create_physical_plan()
+    .await
+    .unwrap();
+    let display = displayable(plan.as_ref()).indent(true).to_string();
+    assert!(display.contains("IndexScanExec"), "plan:\n{display}");
+}
+
 #[tokio::test]
 async fn create_on_plain_datafusion_context_is_a_clear_error() {
     let ctx = SessionContext::new();

@@ -4,6 +4,12 @@
 //! reject — and the context is shared across connections, so `SET` must not
 //! reach it anyway.
 
+use datafusion::sql::sqlparser::ast::Statement;
+use datafusion::sql::sqlparser::parser::Parser;
+
+use crate::sql::SemcastDialect;
+use crate::sql::head;
+
 use super::jobs;
 
 /// Where a statement goes. `Canned*` variants answer client handshake
@@ -120,9 +126,21 @@ fn skip_block_comment(bytes: &[u8], open: usize) -> usize {
     i
 }
 
+/// Decide where a statement goes.
+///
+/// Session chatter is recognized from the *parse tree*, not from leading
+/// words. Reading words off raw text is what made a leading comment hide the
+/// statement (issue #17) — `-- note\nSET x = 1` looked like a statement
+/// starting with `--` and went to the engine, which is exactly where `SET`
+/// must never go.
+///
+/// Anything sqlparser rejects falls through to [`Route::Engine`]: semcast
+/// syntax (`CREATE SEMANTIC ...`, a trailing `WITH RECALL`) and DataFusion
+/// syntax (`CREATE EXTERNAL TABLE`) are not plain SQL, and the engine — not
+/// the router — owns every error message.
 pub fn classify(statement: &str) -> Route<'_> {
     // Job statements are matched on the original text: `SUBMIT` passes its
-    // payload through untouched, so it must not see a lowercased copy.
+    // payload through untouched, so it must not be re-serialized.
     if let Some(job_sql) = jobs::parse::parse_submit(statement) {
         return Route::Submit(job_sql);
     }
@@ -132,22 +150,46 @@ pub fn classify(statement: &str) -> Route<'_> {
         Err(message) => return Route::JobError(message),
     }
 
-    let lower = statement.to_ascii_lowercase();
-    let mut words = lower.split_whitespace();
-    match words.next() {
-        Some("set") => Route::NoOp("SET"),
-        Some("begin") | Some("start") => Route::NoOp("BEGIN"),
-        Some("commit") | Some("end") => Route::NoOp("COMMIT"),
-        Some("rollback") | Some("abort") => Route::NoOp("ROLLBACK"),
-        Some("discard") => Route::NoOp("DISCARD"),
-        Some("reset") => Route::NoOp("RESET"),
-        Some("show") => match words.collect::<Vec<_>>().join(" ").as_str() {
-            "transaction_isolation" | "transaction isolation level" => {
-                Route::CannedTransactionIsolation
+    // sqlparser models `ABORT` only as an `OR ABORT` conflict clause, never
+    // as a statement, so the parse below cannot see it. Postgres clients do
+    // send it, so it keeps an explicit check — read through the tokenizer,
+    // which is what makes it comment-proof.
+    if head::leading_words(statement, 1) == ["ABORT"] {
+        return Route::NoOp("ROLLBACK");
+    }
+
+    let Ok(parsed) = Parser::parse_sql(&SemcastDialect::default(), statement) else {
+        return Route::Engine;
+    };
+    let [statement] = parsed.as_slice() else {
+        return Route::Engine;
+    };
+    match statement {
+        Statement::Set(_) => Route::NoOp("SET"),
+        // Covers both `BEGIN` and `START TRANSACTION`.
+        Statement::StartTransaction { .. } => Route::NoOp("BEGIN"),
+        // Covers `END` too.
+        Statement::Commit { .. } => Route::NoOp("COMMIT"),
+        Statement::Rollback { .. } => Route::NoOp("ROLLBACK"),
+        Statement::Discard { .. } => Route::NoOp("DISCARD"),
+        Statement::Reset(_) => Route::NoOp("RESET"),
+        // `SHOW` is mostly the engine's — only the handshake probes are
+        // answered here, matched on the variable the client actually asked
+        // for rather than on the tail of the string.
+        Statement::ShowVariable { variable } => {
+            let variable = variable
+                .iter()
+                .map(|ident| ident.value.to_ascii_lowercase())
+                .collect::<Vec<_>>()
+                .join(" ");
+            match variable.as_str() {
+                "transaction_isolation" | "transaction isolation level" => {
+                    Route::CannedTransactionIsolation
+                }
+                "server_version" => Route::CannedServerVersion,
+                _ => Route::Engine,
             }
-            "server_version" => Route::CannedServerVersion,
-            _ => Route::Engine,
-        },
+        }
         _ => Route::Engine,
     }
 }
@@ -231,6 +273,34 @@ mod tests {
             classify("SHOW datafusion.execution.batch_size"),
             Route::Engine
         );
+    }
+
+    /// Issue #17, the routing half: a leading comment used to make every
+    /// classification fall through, so a commented `SET` reached the shared
+    /// `SessionContext`.
+    #[test]
+    fn a_leading_comment_never_changes_the_route() {
+        assert_eq!(
+            classify("-- set it up\nSET application_name = 'x'"),
+            Route::NoOp("SET"),
+        );
+        assert_eq!(classify("/* begin */ BEGIN"), Route::NoOp("BEGIN"));
+        assert_eq!(classify("-- bail\nABORT"), Route::NoOp("ROLLBACK"));
+        assert_eq!(
+            classify("/* what isolation? */ SHOW transaction_isolation"),
+            Route::CannedTransactionIsolation,
+        );
+        assert_eq!(
+            classify("-- the real work\nSELECT * FROM t WHERE x MEANS 'a'"),
+            Route::Engine,
+        );
+    }
+
+    #[test]
+    fn the_words_have_to_be_tokens() {
+        // A statement that merely mentions the chatter is not the chatter.
+        assert_eq!(classify("SELECT 'SET application_name'"), Route::Engine);
+        assert_eq!(classify(r#"SELECT "commit" FROM t"#), Route::Engine);
     }
 
     #[test]

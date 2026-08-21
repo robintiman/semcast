@@ -28,6 +28,7 @@ use datafusion::sql::sqlparser::tokenizer::Token;
 use crate::sql::cluster_udf::MEANING_OF_UDF_NAME;
 use crate::sql::ddl::parse_field_type;
 use crate::sql::extract_udf::SEM_EXTRACT_INLINE_UDF_NAME;
+use crate::sql::head::{peek_is_word, peek_nth_is_word};
 use crate::sql::means_udf::MEANS_UDF_NAME;
 use crate::sql::rank_udf::RELEVANCE_UDF_NAME;
 
@@ -58,22 +59,6 @@ fn peek_is_means(parser: &Parser) -> bool {
         }
         _ => false,
     }
-}
-
-/// Is the next token the unquoted word `word` (keyword status aside)?
-fn peek_is_word(parser: &Parser, word: &str) -> bool {
-    matches!(
-        &parser.peek_token_ref().token,
-        Token::Word(w) if w.quote_style.is_none() && w.value.eq_ignore_ascii_case(word)
-    )
-}
-
-/// Is the `n`th lookahead token the unquoted word `word`?
-fn peek_nth_is_word(parser: &Parser, n: usize, word: &str) -> bool {
-    matches!(
-        &parser.peek_nth_token_ref(n).token,
-        Token::Word(w) if w.quote_style.is_none() && w.value.eq_ignore_ascii_case(word)
-    )
 }
 
 /// Is the next token pair the (case-insensitive, unquoted) words

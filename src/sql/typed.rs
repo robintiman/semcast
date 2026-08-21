@@ -153,7 +153,7 @@ fn call(name: &str, args: Vec<Expr>) -> Expr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::recall::parse_statement_with_recall;
+    use crate::sql::statement::parse_statement_with_recall;
     use crate::types::SemanticType;
 
     fn registry_with(name: &str) -> TypeRegistry {
