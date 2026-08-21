@@ -132,8 +132,20 @@ pub async fn sql(ctx: &SessionContext, query: &str) -> Result<DataFrame> {
     // created yet; bind it before the planner tries to resolve it.
     sql::cluster::bind_meaning_labels(&mut statement);
     let mut plan = ctx.state().statement_to_plan(statement).await?;
-    if let Some(recall) = clauses.recall {
-        plan = optimizer::rewrite::apply_recall(plan, recall)?;
+    match (clauses.recall, clauses.confidence) {
+        (Some(recall), confidence) => {
+            plan = optimizer::rewrite::apply_recall(plan, recall, confidence)?;
+        }
+        // A confidence qualifies a recall target; alone it qualifies nothing.
+        (None, Some(_)) => {
+            return Err(datafusion::error::DataFusionError::Plan(
+                "WITH CONFIDENCE certifies a WITH RECALL target; give a recall \
+                 target for it to certify"
+                    .to_owned(),
+            )
+            .into());
+        }
+        (None, None) => {}
     }
     if let Some(similarity) = clauses.similarity {
         plan = optimizer::distinct::apply_similarity(plan, similarity)?;

@@ -25,6 +25,10 @@ pub struct SemFilterNode {
     /// Recall floor from `WITH RECALL`; `None` means best-effort thresholds,
     /// and `EXPLAIN` says so.
     pub recall: Option<f64>,
+    /// Confidence from `WITH CONFIDENCE`, which turns `recall` from a point
+    /// estimate on the calibration sample into a bound certified for the
+    /// population. `None` keeps the estimate.
+    pub confidence: Option<f64>,
 }
 
 impl SemFilterNode {
@@ -33,17 +37,23 @@ impl SemFilterNode {
         text: Expr,
         condition: impl Into<String>,
         recall: Option<f64>,
+        confidence: Option<f64>,
     ) -> Self {
         Self {
             input,
             text,
             condition: condition.into(),
             recall,
+            confidence,
         }
     }
 
-    fn recall_bits(&self) -> Option<u64> {
-        self.recall.map(f64::to_bits)
+    /// Both knobs as bit patterns, so equality and hashing agree on floats.
+    fn target_bits(&self) -> (Option<u64>, Option<u64>) {
+        (
+            self.recall.map(f64::to_bits),
+            self.confidence.map(f64::to_bits),
+        )
     }
 }
 
@@ -52,7 +62,7 @@ impl PartialEq for SemFilterNode {
         self.input == other.input
             && self.text == other.text
             && self.condition == other.condition
-            && self.recall_bits() == other.recall_bits()
+            && self.target_bits() == other.target_bits()
     }
 }
 
@@ -60,11 +70,11 @@ impl Eq for SemFilterNode {}
 
 impl PartialOrd for SemFilterNode {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        (&self.input, &self.text, &self.condition, self.recall_bits()).partial_cmp(&(
+        (&self.input, &self.text, &self.condition, self.target_bits()).partial_cmp(&(
             &other.input,
             &other.text,
             &other.condition,
-            other.recall_bits(),
+            other.target_bits(),
         ))
     }
 }
@@ -74,7 +84,7 @@ impl Hash for SemFilterNode {
         self.input.hash(state);
         self.text.hash(state);
         self.condition.hash(state);
-        self.recall_bits().hash(state);
+        self.target_bits().hash(state);
     }
 }
 
@@ -97,9 +107,12 @@ impl UserDefinedLogicalNodeCore for SemFilterNode {
 
     fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "SemFilter: MEANS('{}')", self.condition)?;
-        match self.recall {
-            Some(r) => write!(f, "   recall ≥ {r:.2}"),
-            None => write!(f, "   recall best-effort"),
+        match (self.recall, self.confidence) {
+            // A confidence turns the target into a claim about the population,
+            // so EXPLAIN states which kind of promise this plan is making.
+            (Some(r), Some(c)) => write!(f, "   recall ≥ {r:.2} certified at {c:.2}"),
+            (Some(r), None) => write!(f, "   recall ≥ {r:.2} estimated"),
+            (None, _) => write!(f, "   recall best-effort"),
         }
     }
 
@@ -120,6 +133,7 @@ impl UserDefinedLogicalNodeCore for SemFilterNode {
             text: exprs.swap_remove(0),
             condition: self.condition.clone(),
             recall: self.recall,
+            confidence: self.confidence,
         })
     }
 }

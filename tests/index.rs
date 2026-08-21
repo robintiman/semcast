@@ -688,3 +688,113 @@ async fn conjunct_ordering_does_not_change_the_rows() {
     assert_eq!(answers[0], vec![1], "the one meeting matching both");
     assert_eq!(answers[0], answers[1]);
 }
+
+// ---------------------------------------------------------------------------
+// WITH CONFIDENCE: the recall target becomes a certified lower bound rather
+// than a point estimate on the calibration sample.
+
+async fn plan_error(ctx: &SessionContext, sql: &str) -> String {
+    match semcast::sql(ctx, sql).await {
+        Ok(frame) => match frame.into_optimized_plan() {
+            Ok(plan) => panic!("expected an error, got a plan:\n{}", plan.display_indent()),
+            Err(err) => err.to_string(),
+        },
+        Err(err) => err.to_string(),
+    }
+}
+
+/// A confidence is a claim *about* a recall target; on its own there is
+/// nothing for it to qualify.
+#[tokio::test]
+async fn confidence_without_recall_is_a_plan_time_error() {
+    let ctx = meetings_context().await;
+    let message = plan_error(
+        &ctx,
+        "SELECT meeting_id FROM meetings
+         WHERE transcript MEANS 'sync' WITH CONFIDENCE 0.95",
+    )
+    .await;
+    assert!(
+        message.contains("certifies a WITH RECALL target"),
+        "got: {message}",
+    );
+}
+
+/// No finite sample proves that *every* match survives, so asking to certify
+/// 1.0 is refused rather than quietly certified.
+#[tokio::test]
+async fn certifying_full_recall_is_refused() {
+    let ctx = meetings_context().await;
+    let message = plan_error(
+        &ctx,
+        "SELECT meeting_id FROM meetings
+         WHERE transcript MEANS 'sync' WITH RECALL 1 WITH CONFIDENCE 0.95",
+    )
+    .await;
+    assert!(message.contains("cannot be certified"), "got: {message}");
+    // Without the confidence it is still a legal, best-effort request.
+    assert!(
+        semcast::sql(
+            &ctx,
+            "SELECT meeting_id FROM meetings
+             WHERE transcript MEANS 'sync' WITH RECALL 1",
+        )
+        .await
+        .unwrap()
+        .into_optimized_plan()
+        .is_ok(),
+    );
+}
+
+/// EXPLAIN says which kind of promise the plan makes, because "recall ≥ 0.9"
+/// means something different with and without a confidence behind it.
+#[tokio::test]
+async fn explain_distinguishes_an_estimate_from_a_certificate() {
+    let ctx = meetings_context().await;
+    for (query, expected) in [
+        (
+            "SELECT meeting_id FROM meetings
+             WHERE transcript MEANS 'sync' WITH RECALL 0.9",
+            "recall ≥ 0.90 estimated",
+        ),
+        (
+            "SELECT meeting_id FROM meetings
+             WHERE transcript MEANS 'sync' WITH RECALL 0.9 WITH CONFIDENCE 0.95",
+            "recall ≥ 0.90 certified at 0.95",
+        ),
+    ] {
+        let plan = semcast::sql(&ctx, query)
+            .await
+            .unwrap()
+            .into_optimized_plan()
+            .unwrap();
+        let display = plan.display_indent().to_string();
+        assert!(
+            display.contains(expected),
+            "want {expected:?} in:\n{display}"
+        );
+    }
+}
+
+/// Certifying must never drop a row an estimate would have kept: the bound is
+/// more conservative, so the funnel is wider, never narrower.
+#[tokio::test]
+async fn certifying_keeps_at_least_what_estimating_keeps() {
+    let query = "SELECT meeting_id FROM meetings
+                 WHERE transcript MEANS 'offline sync' WITH RECALL 0.9";
+    let certified_query = "SELECT meeting_id FROM meetings
+                           WHERE transcript MEANS 'offline sync'
+                           WITH RECALL 0.9 WITH CONFIDENCE 0.95";
+
+    let mut kept = Vec::new();
+    for sql in [query, certified_query] {
+        let ctx = meetings_context().await;
+        let dir = tempfile::tempdir().unwrap();
+        create_semantic_index(&ctx, "meetings", "transcript", index_options(&dir))
+            .await
+            .unwrap();
+        kept.push(matching_ids(&ctx, sql).await);
+    }
+    assert_eq!(kept[0], vec![1]);
+    assert_eq!(kept[1], vec![1], "the certified funnel is at least as wide");
+}

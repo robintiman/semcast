@@ -153,9 +153,9 @@ impl OptimizerRule for MeansRewriteRule {
 /// orders, and the unit it can fuse into a single model call.
 struct TextGroup {
     text: Expr,
-    /// `(condition, recall)` in source order, duplicates kept: the unfused
-    /// path stacks exactly what was written.
-    specs: Vec<(String, Option<f64>)>,
+    /// `(condition, recall, confidence)` in source order, duplicates kept:
+    /// the unfused path stacks exactly what was written.
+    specs: Vec<(String, Option<f64>, Option<f64>)>,
     /// Whether a semantic index covers `text`.
     indexed: bool,
 }
@@ -165,7 +165,7 @@ impl TextGroup {
     /// same condition twice is one question, not two.
     fn distinct_conditions(&self) -> Vec<String> {
         let mut conditions: Vec<String> = Vec::new();
-        for (condition, _) in &self.specs {
+        for (condition, _, _) in &self.specs {
             if !conditions.contains(condition) {
                 conditions.push(condition.clone());
             }
@@ -186,20 +186,20 @@ impl TextGroup {
     /// silently dropped.
     fn fusable(&self) -> bool {
         !self.indexed
-            && self.specs.iter().all(|(_, recall)| recall.is_none())
+            && self.specs.iter().all(|(_, recall, _)| recall.is_none())
             && self.distinct_conditions().len() > 1
     }
 }
 
 /// Collect predicates by the text they read, in first-appearance order.
-fn group_by_text(specs: Vec<(Expr, String, Option<f64>)>) -> Vec<TextGroup> {
+fn group_by_text(specs: Vec<(Expr, String, Option<f64>, Option<f64>)>) -> Vec<TextGroup> {
     let mut groups: Vec<TextGroup> = Vec::new();
-    for (text, condition, recall) in specs {
+    for (text, condition, recall, confidence) in specs {
         match groups.iter_mut().find(|group| group.text == text) {
-            Some(group) => group.specs.push((condition, recall)),
+            Some(group) => group.specs.push((condition, recall, confidence)),
             None => groups.push(TextGroup {
                 text,
-                specs: vec![(condition, recall)],
+                specs: vec![(condition, recall, confidence)],
                 indexed: false,
             }),
         }
@@ -211,9 +211,15 @@ fn group_by_text(specs: Vec<(Expr, String, Option<f64>)>) -> Vec<TextGroup> {
 fn stack(input: LogicalPlan, group: TextGroup) -> LogicalPlan {
     let TextGroup { text, specs, .. } = group;
     let mut plan = input;
-    for (condition, recall) in specs {
+    for (condition, recall, confidence) in specs {
         plan = LogicalPlan::Extension(Extension {
-            node: Arc::new(SemFilterNode::new(plan, text.clone(), condition, recall)),
+            node: Arc::new(SemFilterNode::new(
+                plan,
+                text.clone(),
+                condition,
+                recall,
+                confidence,
+            )),
         });
     }
     plan
@@ -259,7 +265,22 @@ fn fuse(input: LogicalPlan, group: TextGroup, id: usize) -> Result<LogicalPlan> 
 /// Attach a statement-level `WITH RECALL` target to every `means()` call in
 /// the plan, as a third literal argument the rewrite reads back out. Zero
 /// calls is a user mistake, not a no-op.
-pub fn apply_recall(plan: LogicalPlan, recall: f64) -> Result<LogicalPlan> {
+pub fn apply_recall(
+    plan: LogicalPlan,
+    recall: f64,
+    confidence: Option<f64>,
+) -> Result<LogicalPlan> {
+    // A confidence is a claim about a recall target; on its own there is
+    // nothing for it to qualify.
+    if let Some(confidence) = confidence {
+        if recall >= 1.0 {
+            return plan_err!(
+                "WITH RECALL 1 cannot be certified: no finite sample proves that \
+                 every match survives. Ask for a target below 1 (0.99, say), or \
+                 drop WITH CONFIDENCE {confidence} for a best-effort estimate"
+            );
+        }
+    }
     let mut rewrites = 0usize;
     let transformed = plan.transform_up(|plan| {
         plan.map_expressions(|expr| {
@@ -269,6 +290,10 @@ pub fn apply_recall(plan: LogicalPlan, recall: f64) -> Result<LogicalPlan> {
                 {
                     call.args
                         .push(Expr::Literal(ScalarValue::Float64(Some(recall)), None));
+                    // Positional: the fourth argument is the confidence, and
+                    // `destructure_means` reads it back out in the same order.
+                    call.args
+                        .push(Expr::Literal(ScalarValue::Float64(confidence), None));
                     rewrites += 1;
                     Ok(Transformed::yes(Expr::ScalarFunction(call)))
                 }
@@ -290,13 +315,14 @@ pub(crate) fn contains_means(expr: &Expr) -> Result<bool> {
     expr.exists(|e| Ok(is_means_call(e)))
 }
 
-/// Pull `(text_expr, condition, recall)` out of a validated `means(..)` call.
-pub(crate) fn destructure_means(expr: Expr) -> Result<(Expr, String, Option<f64>)> {
+/// Pull `(text_expr, condition, recall, confidence)` out of a validated
+/// `means(..)` call.
+pub(crate) fn destructure_means(expr: Expr) -> Result<(Expr, String, Option<f64>, Option<f64>)> {
     let Expr::ScalarFunction(ScalarFunction { args, .. }) = expr else {
         unreachable!("caller checked is_means_call");
     };
-    if !(2..=3).contains(&args.len()) {
-        return plan_err!("means() takes 2 or 3 arguments, got {}", args.len());
+    if !(2..=4).contains(&args.len()) {
+        return plan_err!("means() takes 2 to 4 arguments, got {}", args.len());
     }
     let mut args = args.into_iter();
     let text = args.next().expect("length checked above");
@@ -323,5 +349,15 @@ pub(crate) fn destructure_means(expr: Expr) -> Result<(Expr, String, Option<f64>
             );
         }
     };
-    Ok((text, condition, recall))
+    let confidence = match args.next() {
+        None | Some(Expr::Literal(ScalarValue::Float64(None), _)) => None,
+        Some(Expr::Literal(ScalarValue::Float64(Some(c)), _)) if c > 0.0 && c < 1.0 => Some(c),
+        Some(other) => {
+            return plan_err!(
+                "the fourth argument of means() must be a confidence in (0, 1) \
+                 as a float literal, got: {other}"
+            );
+        }
+    };
+    Ok((text, condition, recall, confidence))
 }

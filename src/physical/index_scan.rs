@@ -39,10 +39,38 @@ use tokio::sync::OnceCell;
 use crate::cache::{CachedValue, SemanticCache};
 use crate::index::{SearchParams, SemanticIndex, doc_hash};
 use crate::model::{CompletionRequest, ModelProvider};
-use crate::optimizer::calibrate::{SampledScores, calibrate_threshold};
+use crate::optimizer::calibrate::{
+    CALIBRATION_LABEL_BUDGET, Calibration, SampledScores, calibrate_threshold,
+};
 use crate::physical::verify::{
     MEANS_PROMPT_VERSION, means_cache_key, parse_verdict, synthesize_means_prompt,
 };
+
+/// Where each labeled document sits against the index: scored, never indexed
+/// (passes through at any floor, so it helps recall for free), or indexed but
+/// beyond `fetch_k` (lost at any floor).
+fn score_labels(
+    labels: &[(String, bool)],
+    per_doc_best: &HashMap<u64, f32>,
+    indexed: &HashSet<u64>,
+) -> SampledScores {
+    let mut scores = SampledScores {
+        sampled: labels.len(),
+        ..Default::default()
+    };
+    for (text, positive) in labels {
+        if !*positive {
+            continue;
+        }
+        let hash = doc_hash(text);
+        match per_doc_best.get(&hash) {
+            Some(&score) => scores.positive_scores.push(score),
+            None if indexed.contains(&hash) => scores.positive_lost += 1,
+            None => scores.positive_unindexed += 1,
+        }
+    }
+    scores
+}
 
 /// What one index search learned, shared from the scan to the verify stage.
 #[derive(Debug)]
@@ -83,12 +111,28 @@ impl ChunkEvidence {
 #[derive(Debug, Clone)]
 pub struct CalibrationConfig {
     pub target_recall: f64,
-    /// Documents to label, at most — the calibration cost ceiling.
+    /// `WITH CONFIDENCE`: certify the target rather than estimate it. Turns
+    /// the sample adaptive, since a bound needs however much evidence it
+    /// needs, where an estimate is happy with whatever it is given.
+    pub confidence: Option<f64>,
+    /// Documents to label per tranche. Estimating buys exactly one.
     pub sample_size: usize,
     /// Labeling model — ground truth is this model reading the full text.
     pub model: Arc<dyn ModelProvider>,
     /// Verdict cache; labels are full-text verify verdicts and share keys.
     pub cache: Arc<dyn SemanticCache>,
+}
+
+impl CalibrationConfig {
+    /// Labels this calibration may buy in total. Estimating stops after one
+    /// tranche; certifying keeps drawing until the bound clears the target or
+    /// the budget runs out.
+    fn label_budget(&self) -> usize {
+        match self.confidence {
+            Some(_) => CALIBRATION_LABEL_BUDGET.max(self.sample_size),
+            None => self.sample_size,
+        }
+    }
 }
 
 /// Filters input batches through one nearest-vector search over the semantic
@@ -343,14 +387,14 @@ impl Scanner {
         self: Arc<Self>,
         mut input: SendableRecordBatchStream,
     ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
-        let sample_size = self
+        let budget = self
             .calibration
             .as_ref()
             .expect("calibrated path requires a config")
-            .sample_size;
+            .label_budget();
         let mut buffered: Vec<RecordBatch> = Vec::new();
         let mut buffered_rows = 0;
-        while buffered_rows < sample_size {
+        while buffered_rows < budget {
             match input.try_next().await? {
                 Some(batch) => {
                     buffered_rows += batch.num_rows();
@@ -403,27 +447,59 @@ impl Scanner {
             per_doc_best.entry(hit.doc_hash).or_insert(hit.score);
         }
 
-        let sample = self.sample_documents(buffered, calibration.sample_size)?;
-        let labels = self.label_sample(calibration, &sample).await;
-        self.calibration_sampled_rows.add(labels.len());
+        // One tranche at a time. Estimating draws exactly one, because a
+        // point estimate reads whatever the sample says. Certifying keeps
+        // drawing until the bound clears the target, because a bound the
+        // sample cannot support is not a bound — and stops at the budget,
+        // reporting the shortfall rather than pruning on faith.
+        let pool = self.sample_documents(buffered, calibration.label_budget())?;
+        let mut labels: Vec<(String, bool)> = Vec::new();
+        let mut labelled = 0;
+        let mut calibrated: Option<Calibration> = None;
+        while labelled < pool.len() {
+            let tranche = (labelled + calibration.sample_size).min(pool.len());
+            labels.extend(
+                self.label_sample(calibration, &pool[labelled..tranche])
+                    .await,
+            );
+            labelled = tranche;
 
-        let mut scores = SampledScores {
-            sampled: labels.len(),
-            ..Default::default()
-        };
-        for (text, positive) in labels {
-            if !positive {
-                continue;
-            }
-            let hash = doc_hash(&text);
-            match per_doc_best.get(&hash) {
-                Some(&score) => scores.positive_scores.push(score),
-                None if indexed.contains(&hash) => scores.positive_lost += 1,
-                None => scores.positive_unindexed += 1,
+            let attempt = calibrate_threshold(
+                calibration.target_recall,
+                calibration.confidence,
+                self.params.score_floor,
+                &score_labels(&labels, &per_doc_best, &indexed),
+            );
+            let settled =
+                calibration.confidence.is_none() || attempt.meets(calibration.target_recall);
+            calibrated = Some(attempt);
+            if settled {
+                break;
             }
         }
-        let calibrated =
-            calibrate_threshold(calibration.target_recall, self.params.score_floor, &scores);
+        self.calibration_sampled_rows.add(labels.len());
+
+        let calibrated = calibrated.unwrap_or_else(|| {
+            // Nothing to label: no rows, or every one of them NULL.
+            calibrate_threshold(
+                calibration.target_recall,
+                calibration.confidence,
+                self.params.score_floor,
+                &SampledScores::default(),
+            )
+        });
+        if !calibrated.meets(calibration.target_recall) {
+            tracing::warn!(
+                target: "semcast::calibrate",
+                condition = %self.condition,
+                target_recall = calibration.target_recall,
+                estimated_recall = calibrated.estimated_recall,
+                certified_recall = ?calibrated.certified_recall,
+                sampled_rows = calibrated.sampled_rows,
+                "the sample cannot support the recall target; keeping every \
+                 positive it can reach",
+            );
+        }
 
         Ok(Arc::new(PrefilterResult {
             chunks: bucket_chunks(hits, calibrated.threshold, self.params.chunks_per_doc),

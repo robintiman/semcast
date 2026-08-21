@@ -49,6 +49,7 @@ fn sem_filter_node_displays_like_the_readme() {
         lit("transcript"),
         "discussed the launch of offline sync in Atlas",
         Some(0.9),
+        None,
     );
     let plan = LogicalPlan::Extension(Extension {
         node: Arc::new(node),

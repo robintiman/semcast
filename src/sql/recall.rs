@@ -6,10 +6,11 @@
 //! clauses trail it. [`crate::sql`] threads each value back into the calls it
 //! governs.
 //!
-//! Two knobs today, both fractions in `(0, 1]`: `WITH RECALL` calibrates the
-//! index pre-filter under a `MEANS`, and `WITH SIMILARITY` sets how alike two
-//! documents must be to count as duplicates under a `SEMANTIC DISTINCT ON`.
-//! `BUDGET` is meant to land here too.
+//! Three knobs today, all fractions in `(0, 1]`: `WITH RECALL` calibrates the
+//! index pre-filter under a `MEANS`, `WITH CONFIDENCE` turns that target into
+//! a certified lower bound rather than a point estimate, and `WITH SIMILARITY`
+//! sets how alike two documents must be to count as duplicates under a
+//! `SEMANTIC DISTINCT ON`. `BUDGET` is meant to land here too.
 
 use datafusion::error::DataFusionError;
 use datafusion::sql::parser::{DFParserBuilder, Statement};
@@ -24,6 +25,9 @@ use super::SemcastDialect;
 pub struct TrailingClauses {
     /// `WITH RECALL <f>` — calibration target for the index pre-filter.
     pub recall: Option<f64>,
+    /// `WITH CONFIDENCE <f>` — certify the recall target at this confidence
+    /// instead of estimating it. Needs a `RECALL` to certify.
+    pub confidence: Option<f64>,
     /// `WITH SIMILARITY <f>` — the duplicate threshold for a semantic dedupe.
     pub similarity: Option<f64>,
 }
@@ -48,18 +52,15 @@ pub fn parse_statement_with_recall(query: &str) -> crate::Result<(Statement, Tra
         let knob = match parser.next_token().token {
             Token::Word(word) => word.value.to_lowercase(),
             other => {
-                return Err(plan_error(format!(
-                    "expected RECALL or SIMILARITY after trailing WITH, got {other}"
-                )));
+                return Err(plan_error(format!("{EXPECTED_KNOB}, got {other}")));
             }
         };
         let slot = match knob.as_str() {
             "recall" => &mut clauses.recall,
+            "confidence" => &mut clauses.confidence,
             "similarity" => &mut clauses.similarity,
             other => {
-                return Err(plan_error(format!(
-                    "expected RECALL or SIMILARITY after trailing WITH, got {other}"
-                )));
+                return Err(plan_error(format!("{EXPECTED_KNOB}, got {other}")));
             }
         };
         if slot.is_some() {
@@ -78,8 +79,11 @@ pub fn parse_statement_with_recall(query: &str) -> crate::Result<(Statement, Tra
     Ok((statement, clauses))
 }
 
-/// Both knobs are fractions in `(0, 1]`; neither zero nor "more than all"
-/// means anything for a recall target or a similarity threshold.
+const EXPECTED_KNOB: &str = "expected RECALL, CONFIDENCE or SIMILARITY after trailing WITH";
+
+/// Every knob is a fraction in `(0, 1]`; neither zero nor "more than all"
+/// means anything for a recall target, a confidence level, or a similarity
+/// threshold.
 fn parse_fraction(parser: &mut Parser, knob: &str) -> crate::Result<f64> {
     let target = match parser.next_token().token {
         Token::Number(number, _) => number
@@ -211,9 +215,26 @@ mod tests {
     fn trailing_with_that_is_not_a_known_knob_is_rejected() {
         let message = error_of("SELECT 1 WITH options");
         assert!(
-            message.contains("expected RECALL or SIMILARITY"),
+            message.contains("expected RECALL, CONFIDENCE or SIMILARITY"),
             "got: {message}"
         );
+    }
+
+    #[test]
+    fn parses_trailing_with_confidence() {
+        let clauses = parse_statement_with_recall(
+            "SELECT * FROM t WHERE x MEANS 'c' WITH RECALL 0.9 WITH CONFIDENCE 0.95",
+        )
+        .unwrap()
+        .1;
+        assert_eq!(clauses.recall, Some(0.9));
+        assert_eq!(clauses.confidence, Some(0.95));
+    }
+
+    #[test]
+    fn confidence_shares_the_range_check() {
+        assert!(error_of("SELECT 1 WITH CONFIDENCE 0").contains("must be in (0, 1]"));
+        assert!(error_of("SELECT 1 WITH CONFIDENCE 1.5").contains("must be in (0, 1]"));
     }
 
     #[test]

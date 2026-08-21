@@ -153,6 +153,32 @@ WHERE transcript MEANS 'discussed offline sync'
 WITH RECALL 0.9;
 ```
 
+#### `WITH CONFIDENCE`
+
+```sql
+<statement> WITH RECALL <fraction> WITH CONFIDENCE <fraction>
+```
+
+Requires a `WITH RECALL`. Turns the target from a point estimate on the sample
+into a bound certified for the population: the floor is the one whose Wilson
+lower bound clears the target, corrected across the floors considered because
+the same sample both picks and scores them.
+
+Certifying costs more and prunes less — that is the trade. The sample grows a
+tranche at a time until the bound clears, and if it never does, the funnel
+widens to keep every match it can rather than reporting a number it cannot
+defend. `EXPLAIN` says which promise a plan makes: *estimated* or *certified
+at*.
+
+`WITH RECALL 1 WITH CONFIDENCE …` is rejected — no finite sample proves that
+every match survives. Ask for 0.99.
+
+```sql
+SELECT meeting_id FROM meetings
+WHERE transcript MEANS 'discussed offline sync'
+WITH RECALL 0.9 WITH CONFIDENCE 0.95;
+```
+
 #### `RELEVANCE TO`
 
 ```sql

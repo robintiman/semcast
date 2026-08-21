@@ -101,6 +101,7 @@ impl ExtensionPlanner for SemcastExtensionPlanner {
                 // time by labeling a sample — same model and cache as verify.
                 let calibration = filter.recall.map(|target_recall| CalibrationConfig {
                     target_recall,
+                    confidence: filter.confidence,
                     sample_size: DEFAULT_CALIBRATION_SAMPLE,
                     model: Arc::clone(&self.model),
                     cache: Arc::clone(&self.cache),
