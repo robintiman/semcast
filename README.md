@@ -147,6 +147,14 @@ Requires a `MEANS`. Calibrates the index-pruning
 threshold instead of guessing it. The scan labels a sample of surviving rows and sets the floor so
 the given fraction of true matches survive. Without it, thresholds are best-effort.
 
+Those labels also buy a better score to threshold. Similarity ranks documents
+by how close they are to the condition's *wording*, which is the same geometry
+whatever you asked; the labels say which documents actually matched. So the
+scan fits a small classifier over vectors the index already holds, and
+thresholds its probability instead — no extra embedding, no extra model call.
+Too few labels, or all of them one class, and it falls back to plain
+similarity.
+
 ```sql
 SELECT meeting_id FROM meetings
 WHERE transcript MEANS 'discussed offline sync'

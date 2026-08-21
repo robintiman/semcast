@@ -24,6 +24,10 @@
 //! floor is chosen using the same sample that scores it — testing every
 //! candidate at the full confidence would certify one of them by luck.
 //!
+//! What gets thresholded is [`crate::optimizer::proxy`]'s business: raw
+//! similarity, or a classifier fitted to these same labels. Either way the
+//! target is enforced here, which is what makes trying a better proxy safe.
+//!
 //! Deliberately deferred: LOTUS-style importance sampling, and BARGAIN's
 //! adaptive betting confidence sequences, which spend a label budget more
 //! efficiently than a fixed split does.

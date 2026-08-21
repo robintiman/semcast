@@ -6,7 +6,9 @@
 //! Uncalibrated, it costs one embed call per query and zero completion
 //! calls; under `WITH RECALL`, the first poll additionally labels a small
 //! sample of input rows (full-text model calls, shared with the verdict
-//! cache) to set the floor at the recall target.
+//! cache) to set the floor at the recall target — thresholding either raw
+//! similarity or a classifier fitted to those labels, whichever the sample
+//! supports.
 //!
 //! [`VerifyExec`]: crate::physical::VerifyExec
 
@@ -42,6 +44,7 @@ use crate::model::{CompletionRequest, ModelProvider};
 use crate::optimizer::calibrate::{
     CALIBRATION_LABEL_BUDGET, Calibration, SampledScores, calibrate_threshold,
 };
+use crate::optimizer::proxy::LearnedProxy;
 use crate::physical::verify::{
     MEANS_PROMPT_VERSION, means_cache_key, parse_verdict, synthesize_means_prompt,
 };
@@ -370,10 +373,12 @@ impl Scanner {
     /// One embed call + one vector scan + one membership scan, shared by
     /// every partition through the evidence cell.
     async fn prefilter(&self) -> crate::Result<Arc<PrefilterResult>> {
+        // The search already applied `score_floor`, so every hit survives it
+        // and bucketing needs no second filter.
         let hits = self.index.search(&self.condition, &self.params).await?;
         let indexed = self.index.indexed_doc_hashes().await?;
         Ok(Arc::new(PrefilterResult {
-            chunks: bucket_chunks(hits, self.params.score_floor, self.params.chunks_per_doc),
+            chunks: bucket_chunks(hits, self.params.chunks_per_doc),
             indexed,
         }))
     }
@@ -447,6 +452,11 @@ impl Scanner {
             per_doc_best.entry(hit.doc_hash).or_insert(hit.score);
         }
 
+        // Vectors the index already stores — the raw material for a proxy
+        // fitted to this condition. An index that cannot supply them (or
+        // fails to) simply leaves the cosine proxy in place.
+        let vectors = self.index.doc_vectors().await.unwrap_or_default();
+
         // One tranche at a time. Estimating draws exactly one, because a
         // point estimate reads whatever the sample says. Certifying keeps
         // drawing until the bound clears the target, because a bound the
@@ -455,7 +465,7 @@ impl Scanner {
         let pool = self.sample_documents(buffered, calibration.label_budget())?;
         let mut labels: Vec<(String, bool)> = Vec::new();
         let mut labelled = 0;
-        let mut calibrated: Option<Calibration> = None;
+        let mut attempt: Option<(Calibration, HashMap<u64, f32>)> = None;
         while labelled < pool.len() {
             let tranche = (labelled + calibration.sample_size).min(pool.len());
             labels.extend(
@@ -464,30 +474,35 @@ impl Scanner {
             );
             labelled = tranche;
 
-            let attempt = calibrate_threshold(
-                calibration.target_recall,
-                calibration.confidence,
-                self.params.score_floor,
-                &score_labels(&labels, &per_doc_best, &indexed),
+            let outcome = self.calibrate_over_best_proxy(
+                calibration,
+                &labels,
+                &per_doc_best,
+                &indexed,
+                &vectors,
             );
             let settled =
-                calibration.confidence.is_none() || attempt.meets(calibration.target_recall);
-            calibrated = Some(attempt);
+                calibration.confidence.is_none() || outcome.0.meets(calibration.target_recall);
+            attempt = Some(outcome);
             if settled {
                 break;
             }
         }
         self.calibration_sampled_rows.add(labels.len());
-
-        let calibrated = calibrated.unwrap_or_else(|| {
+        let (calibrated, scores) = match attempt {
+            Some(outcome) => outcome,
             // Nothing to label: no rows, or every one of them NULL.
-            calibrate_threshold(
-                calibration.target_recall,
-                calibration.confidence,
-                self.params.score_floor,
-                &SampledScores::default(),
-            )
-        });
+            None => (
+                calibrate_threshold(
+                    calibration.target_recall,
+                    calibration.confidence,
+                    self.params.score_floor,
+                    &SampledScores::default(),
+                ),
+                per_doc_best.clone(),
+            ),
+        };
+
         if !calibrated.meets(calibration.target_recall) {
             tracing::warn!(
                 target: "semcast::calibrate",
@@ -501,10 +516,76 @@ impl Scanner {
             );
         }
 
-        Ok(Arc::new(PrefilterResult {
-            chunks: bucket_chunks(hits, calibrated.threshold, self.params.chunks_per_doc),
-            indexed,
-        }))
+        // Two decisions, deliberately separate. Which documents survive is the
+        // calibrated proxy's call — `scores` is cosine or a fitted
+        // probability. Which *chunks* verify then reads is always the cosine
+        // ranking, because that ranking is about where in the document the
+        // condition is discussed, which a document-level probability has
+        // nothing to say about.
+        let mut chunks = bucket_chunks(hits, self.params.chunks_per_doc);
+        chunks.retain(|hash, _| {
+            scores
+                .get(hash)
+                .is_some_and(|score| *score >= calibrated.threshold)
+        });
+        Ok(Arc::new(PrefilterResult { chunks, indexed }))
+    }
+
+    /// Calibrate over the best proxy the labels support: a logistic
+    /// regression fitted to *this* condition when there is enough evidence to
+    /// fit one, raw cosine similarity otherwise.
+    ///
+    /// Returns the calibration and the per-document scores it was calibrated
+    /// against, since the survivors must be decided on the same scale.
+    ///
+    /// The labels are split in half — the fit sees one half, the threshold is
+    /// calibrated on the other. Calibrating on rows the model trained on would
+    /// measure the fit rather than the population, and the bound would be
+    /// certifying the wrong thing.
+    fn calibrate_over_best_proxy(
+        &self,
+        calibration: &CalibrationConfig,
+        labels: &[(String, bool)],
+        per_doc_best: &HashMap<u64, f32>,
+        indexed: &HashSet<u64>,
+        vectors: &HashMap<u64, crate::model::Embedding>,
+    ) -> (Calibration, HashMap<u64, f32>) {
+        let calibrate_with = |scores: &HashMap<u64, f32>, labels: &[(String, bool)]| {
+            calibrate_threshold(
+                calibration.target_recall,
+                calibration.confidence,
+                self.params.score_floor,
+                &score_labels(labels, scores, indexed),
+            )
+        };
+
+        let (training, held_out) = labels.split_at(labels.len() / 2);
+        let examples: Vec<(&crate::model::Embedding, bool)> = training
+            .iter()
+            .filter_map(|(text, matched)| Some((vectors.get(&doc_hash(text))?, *matched)))
+            .collect();
+
+        // Every document the search returned needs a score on the new scale,
+        // or it would be pruned for having no opinion rather than a low one.
+        if let Some(proxy) = LearnedProxy::fit(&examples) {
+            let learned: Option<HashMap<u64, f32>> = per_doc_best
+                .keys()
+                .map(|hash| Some((*hash, proxy.score(vectors.get(hash)?)?)))
+                .collect();
+            if let Some(learned) = learned {
+                tracing::debug!(
+                    target: "semcast::calibrate",
+                    condition = %self.condition,
+                    trained_on = examples.len(),
+                    calibrated_on = held_out.len(),
+                    "calibrating a learned proxy instead of raw similarity",
+                );
+                let calibrated = calibrate_with(&learned, held_out);
+                return (calibrated, learned);
+            }
+        }
+        // No fit: cosine over every label, since none of them trained anything.
+        (calibrate_with(per_doc_best, labels), per_doc_best.clone())
     }
 
     /// The distinct documents of the buffered batches, at most `sample_size`.
@@ -596,14 +677,10 @@ impl Scanner {
 /// `floor`, best first, at most `chunks_per_doc` each.
 fn bucket_chunks(
     hits: Vec<crate::index::ChunkHit>,
-    floor: f32,
     chunks_per_doc: usize,
 ) -> HashMap<u64, Vec<String>> {
     let mut chunks: HashMap<u64, Vec<String>> = HashMap::new();
     for hit in hits {
-        if hit.score < floor {
-            continue;
-        }
         let doc_chunks = chunks.entry(hit.doc_hash).or_default();
         if doc_chunks.len() < chunks_per_doc {
             doc_chunks.push(hit.text);

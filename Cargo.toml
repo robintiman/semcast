@@ -16,6 +16,9 @@ datafusion = "54"
 futures = "0.3.32"
 lance = { version = "8", default-features = false }
 lance-linalg = "8"
+linfa = "0.8.1"
+linfa-logistic = "0.8.1"
+ndarray = "0.16"
 pgwire = "0.40.4"
 reqwest = { version = "0.13.4", features = ["json"] }
 serde = { version = "1.0.228", features = ["derive"] }
