@@ -9,11 +9,13 @@
 //! hosted option for embeddings (its inverse: no completions).
 
 mod anthropic;
+mod fallback;
 mod mock;
 mod ollama;
 mod voyage;
 
 pub use anthropic::{AnthropicProvider, DEFAULT_ANTHROPIC_MODEL, DEFAULT_ANTHROPIC_URL};
+pub use fallback::FallbackProvider;
 pub use mock::MockModel;
 pub use ollama::{DEFAULT_CHAT_MODEL, DEFAULT_EMBED_MODEL, DEFAULT_OLLAMA_URL, OllamaProvider};
 pub use voyage::{DEFAULT_VOYAGE_MODEL, DEFAULT_VOYAGE_URL, VoyageProvider};
