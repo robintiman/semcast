@@ -7,6 +7,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use datafusion::common::{Column, DFSchema, DataFusionError, Result};
+use datafusion::logical_expr::Expr;
+
 use crate::model::ModelProvider;
 use crate::types::registry::TypeRegistry;
 
@@ -87,5 +90,55 @@ impl SemcastRuntime {
             .expect("index registry poisoned")
             .get(&(table.to_owned(), column.to_owned()))
             .cloned()
+    }
+
+    /// The index covering whatever column `text` reads, or `None` when the
+    /// expression is computed, unqualified, or simply unindexed.
+    ///
+    /// Shared by the two places that need to know whether a `MEANS` gets a
+    /// funnel: the physical planner, which builds one, and the rewrite rule,
+    /// which orders the cheap predicates first.
+    pub fn index_for_text(&self, text: &Expr, schema: &DFSchema) -> Option<Arc<dyn SemanticIndex>> {
+        let column = column_behind_casts(text)?;
+        let (table, field) = qualified_name(column, schema).ok()?;
+        self.index_for(&table, &field)
+    }
+
+    /// Whether a semantic index covers `text` — the plan-time signal for
+    /// "this predicate prunes before it pays".
+    pub fn covers(&self, text: &Expr, schema: &DFSchema) -> bool {
+        self.index_for_text(text, schema).is_some()
+    }
+}
+
+/// The `(table, column)` a column reference names, as the index registry
+/// keys them.
+pub fn qualified_name(column: &Column, schema: &DFSchema) -> Result<(String, String)> {
+    let (qualifier, field) = schema.qualified_field_from_column(column)?;
+    let table = qualifier
+        .ok_or_else(|| {
+            DataFusionError::Plan(format!(
+                "cannot tell which table `{column}` belongs to; qualify it as \
+                 <table>.<column>"
+            ))
+        })?
+        .table()
+        .to_owned();
+    Ok((table, field.name().clone()))
+}
+
+/// The column a text expression reads, seen through casts and aliases —
+/// type coercion wraps string columns in `CAST(... AS Utf8)` for the
+/// `means` UDF signature, and a cast between string types doesn't change
+/// which document the text is (both stages hash the evaluated text, so the
+/// index keys still line up). Anything else is a computed expression: no
+/// index.
+pub fn column_behind_casts(expr: &Expr) -> Option<&Column> {
+    match expr {
+        Expr::Column(column) => Some(column),
+        Expr::Cast(cast) => column_behind_casts(&cast.expr),
+        Expr::TryCast(cast) => column_behind_casts(&cast.expr),
+        Expr::Alias(alias) => column_behind_casts(&alias.expr),
+        _ => None,
     }
 }

@@ -20,6 +20,7 @@ use datafusion::logical_expr::{Expr, Extension, Filter, LogicalPlan};
 use datafusion::optimizer::optimizer::ApplyOrder;
 use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
 
+use crate::index::registry::SemcastRuntime;
 use crate::logical::SemFilterNode;
 use crate::sql::means_udf::MEANS_UDF_NAME;
 
@@ -32,12 +33,29 @@ use crate::sql::means_udf::MEANS_UDF_NAME;
 /// filtering drops rows, labelling keeps them, so the two positions want
 /// different operators.
 ///
+/// Stacked semantic predicates are ordered before they are stacked: one that
+/// a semantic index covers prunes rows for free before the model sees them,
+/// so it belongs below one that pays full price for every row it is handed.
+/// Source order breaks ties within a tier, keeping the rewrite deterministic.
+///
 /// Restriction: `means()` is supported as a top-level `AND` conjunct of a
 /// `WHERE` clause, or anywhere in a `SELECT` list. Elsewhere — under
 /// `OR`/`NOT` in a `WHERE`, in a `GROUP BY`, with a non-literal condition —
 /// is a plan-time error rather than a silent model call per row.
-#[derive(Debug, Default)]
-pub struct MeansRewriteRule;
+#[derive(Debug)]
+pub struct MeansRewriteRule {
+    /// Holds the session runtime directly because `OptimizerConfig` exposes no
+    /// route to a `SessionConfig` extension. The index map behind it is
+    /// mutable and shared, so a `CREATE SEMANTIC INDEX` issued after the
+    /// context was built is visible here.
+    runtime: Arc<SemcastRuntime>,
+}
+
+impl MeansRewriteRule {
+    pub fn new(runtime: Arc<SemcastRuntime>) -> Self {
+        Self { runtime }
+    }
+}
 
 /// Both legal positions, named in every rejection so the error says where the
 /// marker *can* go rather than only where it cannot.
@@ -95,6 +113,18 @@ impl OptimizerRule for MeansRewriteRule {
             }
         }
 
+        let schema = Arc::clone(filter.input.schema());
+        let mut specs = Vec::with_capacity(semantic.len());
+        for call in semantic {
+            specs.push(destructure_means(call)?);
+        }
+        // An indexed predicate prunes before it pays, so it goes innermost.
+        // `partition` preserves relative order, so equally-priced predicates
+        // keep the order they were written in.
+        let (indexed, unindexed): (Vec<_>, Vec<_>) = specs
+            .into_iter()
+            .partition(|(text, _, _)| self.runtime.covers(text, &schema));
+
         // Free predicates stay in a Filter below the SemFilter, so they run
         // first and DataFusion keeps optimizing them as usual.
         let mut rewritten = match conjunction(free) {
@@ -103,8 +133,8 @@ impl OptimizerRule for MeansRewriteRule {
             }
             None => Arc::unwrap_or_clone(filter.input),
         };
-        for call in semantic {
-            let (text, condition, recall) = destructure_means(call)?;
+        // Each node wraps the previous one, so the first stacked runs first.
+        for (text, condition, recall) in indexed.into_iter().chain(unindexed) {
             rewritten = LogicalPlan::Extension(Extension {
                 node: Arc::new(SemFilterNode::new(rewritten, text, condition, recall)),
             });

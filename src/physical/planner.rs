@@ -12,13 +12,13 @@ use datafusion::common::DFSchema;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::QueryPlanner;
 use datafusion::execution::session_state::SessionState;
-use datafusion::logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNode};
+use datafusion::logical_expr::{LogicalPlan, UserDefinedLogicalNode};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner};
 
 use crate::cache::SemanticCache;
 use crate::index::SemanticIndex;
-use crate::index::registry::SemcastRuntime;
+use crate::index::registry::{SemcastRuntime, column_behind_casts, qualified_name};
 use crate::logical::{
     SemClassifyNode, SemClusterNode, SemDistinctNode, SemExtractNode, SemFilterNode, SemRankNode,
 };
@@ -274,28 +274,10 @@ fn resolve_index(
     schema: &DFSchema,
     session_state: &SessionState,
 ) -> Option<Arc<dyn SemanticIndex>> {
-    let column = column_behind_casts(&filter.text)?;
-    let (table, field) = qualified_name(column, schema).ok()?;
-    index_for(&table, &field, session_state)
-}
-
-/// The `(table, column)` a column reference names, as the index registry
-/// keys them.
-fn qualified_name(
-    column: &datafusion::common::Column,
-    schema: &DFSchema,
-) -> Result<(String, String)> {
-    let (qualifier, field) = schema.qualified_field_from_column(column)?;
-    let table = qualifier
-        .ok_or_else(|| {
-            DataFusionError::Plan(format!(
-                "cannot tell which table `{column}` belongs to; qualify it as \
-                 <table>.<column>"
-            ))
-        })?
-        .table()
-        .to_owned();
-    Ok((table, field.name().clone()))
+    session_state
+        .config()
+        .get_extension::<SemcastRuntime>()?
+        .index_for_text(&filter.text, schema)
 }
 
 fn index_for(
@@ -307,20 +289,4 @@ fn index_for(
         .config()
         .get_extension::<SemcastRuntime>()?
         .index_for(table, column)
-}
-
-/// The column a text expression reads, seen through casts and aliases —
-/// type coercion wraps string columns in `CAST(... AS Utf8)` for the
-/// `means` UDF signature, and a cast between string types doesn't change
-/// which document the text is (both stages hash the evaluated text, so the
-/// index keys still line up). Anything else is a computed expression: no
-/// index.
-fn column_behind_casts(expr: &Expr) -> Option<&datafusion::common::Column> {
-    match expr {
-        Expr::Column(column) => Some(column),
-        Expr::Cast(cast) => column_behind_casts(&cast.expr),
-        Expr::TryCast(cast) => column_behind_casts(&cast.expr),
-        Expr::Alias(alias) => column_behind_casts(&alias.expr),
-        _ => None,
-    }
 }

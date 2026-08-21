@@ -609,3 +609,82 @@ async fn builder_embedder_serves_ddl_created_indexes() {
         "verify calls stay on the session model",
     );
 }
+
+/// Depth of the first line containing `needle` in an indented plan display —
+/// deeper means closer to the scan, which means it runs earlier.
+fn depth_of(display: &str, needle: &str) -> usize {
+    display
+        .lines()
+        .find(|line| line.contains(needle))
+        .map(|line| line.len() - line.trim_start().len())
+        .unwrap_or_else(|| panic!("no line matching {needle:?} in:\n{display}"))
+}
+
+/// Both a title and a transcript can match, so a two-predicate query returns
+/// a row rather than trivially nothing.
+async fn indexed_transcript_context(dir: &tempfile::TempDir) -> SessionContext {
+    let ctx = semcast_context(Arc::new(MockModel::answering_yes_to([
+        "offline sync",
+        "atlas planning",
+    ])));
+    ctx.sql(&format!(
+        "CREATE TABLE meetings AS
+         SELECT * FROM (VALUES
+             (1, 'atlas planning',  '{MATCHING}'),
+             (2, 'weekly standup',  '{OTHER}'),
+             (3, 'retro',           CAST(NULL AS VARCHAR))
+         ) AS t(meeting_id, title, transcript)",
+    ))
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+    // Only `transcript` gets an index; `title` pays full price.
+    create_semantic_index(&ctx, "meetings", "transcript", index_options(dir))
+        .await
+        .unwrap();
+    ctx
+}
+
+const INDEXED_LAST: &str = "SELECT meeting_id FROM meetings
+     WHERE title MEANS 'planning' AND transcript MEANS 'sync'";
+const INDEXED_FIRST: &str = "SELECT meeting_id FROM meetings
+     WHERE transcript MEANS 'sync' AND title MEANS 'planning'";
+
+/// An indexed predicate prunes for free before the model sees a row, so it
+/// belongs below one that pays full price — whichever order it was written in.
+#[tokio::test]
+async fn an_indexed_predicate_is_stacked_below_an_unindexed_one() {
+    for (label, query) in [
+        ("indexed written last", INDEXED_LAST),
+        ("indexed written first", INDEXED_FIRST),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = indexed_transcript_context(&dir).await;
+        let plan = semcast::sql(&ctx, query)
+            .await
+            .unwrap()
+            .into_optimized_plan()
+            .unwrap();
+        let display = plan.display_indent().to_string();
+
+        assert!(
+            depth_of(&display, "MEANS('sync')") > depth_of(&display, "MEANS('planning')"),
+            "{label}: the indexed predicate must run first:\n{display}",
+        );
+    }
+}
+
+/// Ordering is a cost decision, not a semantic one: same rows either way.
+#[tokio::test]
+async fn conjunct_ordering_does_not_change_the_rows() {
+    let mut answers = Vec::new();
+    for query in [INDEXED_LAST, INDEXED_FIRST] {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = indexed_transcript_context(&dir).await;
+        answers.push(matching_ids(&ctx, query).await);
+    }
+    assert_eq!(answers[0], vec![1], "the one meeting matching both");
+    assert_eq!(answers[0], answers[1]);
+}

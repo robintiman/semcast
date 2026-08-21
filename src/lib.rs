@@ -236,13 +236,18 @@ impl SemcastContextBuilder {
         if let Some(root) = self.index_root {
             runtime = runtime.with_index_root(root);
         }
+        // One runtime, two holders: the session config (where the physical
+        // planner and the public API find it) and the means rewrite rule,
+        // which needs the index map at plan time and has no route to a
+        // `SessionConfig` extension of its own.
+        let runtime = Arc::new(runtime);
         let config = SessionConfig::new()
-            .with_extension(Arc::new(runtime))
+            .with_extension(Arc::clone(&runtime))
             .with_information_schema(self.information_schema);
         let state = SessionStateBuilder::new()
             .with_default_features()
             .with_config(config)
-            .with_optimizer_rule(Arc::new(MeansRewriteRule))
+            .with_optimizer_rule(Arc::new(MeansRewriteRule::new(Arc::clone(&runtime))))
             .with_optimizer_rule(Arc::new(
                 crate::optimizer::extract::ExtractRewriteRule::new(Arc::clone(&types)),
             ))
