@@ -154,12 +154,24 @@ impl ModelProvider for MockModel {
         requests
             .into_iter()
             .map(|req| {
+                let matched = || self.truthy.iter().any(|n| req.input.contains(n.as_str()));
                 let text = match (&self.json, &req.schema) {
                     (Some(responder), Some(_)) => responder(&req).to_string(),
-                    _ => {
-                        let matched = self.truthy.iter().any(|n| req.input.contains(n.as_str()));
-                        if matched { "yes" } else { "no" }.to_owned()
-                    }
+                    // A fused classify asks for one boolean per condition. The
+                    // needles say whether *this document* is truthy, so every
+                    // condition gets that same answer — the same verdict the
+                    // schemaless arm below would give, in the shape asked for.
+                    (None, Some(schema)) => match boolean_keys(schema) {
+                        Some(keys) => {
+                            let answer = Value::Bool(matched());
+                            Value::Object(
+                                keys.into_iter().map(|key| (key, answer.clone())).collect(),
+                            )
+                            .to_string()
+                        }
+                        None => if matched() { "yes" } else { "no" }.to_owned(),
+                    },
+                    _ => if matched() { "yes" } else { "no" }.to_owned(),
                 };
                 Ok(Completion {
                     output_tokens: text.len() / 4 + 1,
@@ -183,6 +195,20 @@ impl ModelProvider for MockModel {
             })
             .collect())
     }
+}
+
+/// The property names of an all-boolean object schema — the shape a fused
+/// classify asks for. `None` for any other schema (typed extraction), whose
+/// fields a bare yes/no mock has no business inventing values for.
+fn boolean_keys(schema: &Value) -> Option<Vec<String>> {
+    let properties = schema.get("properties")?.as_object()?;
+    if properties.is_empty() {
+        return None;
+    }
+    properties
+        .values()
+        .all(|field| field.get("type").and_then(Value::as_str) == Some("boolean"))
+        .then(|| properties.keys().cloned().collect())
 }
 
 const MOCK_EMBEDDING_DIM: usize = 16;

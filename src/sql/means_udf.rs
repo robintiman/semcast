@@ -55,6 +55,14 @@ pub fn means_udf() -> ScalarUDF {
             vec![
                 TypeSignature::Exact(vec![DataType::Utf8, DataType::Utf8]),
                 TypeSignature::Exact(vec![DataType::Utf8, DataType::Utf8, DataType::Float64]),
+                // `WITH RECALL … WITH CONFIDENCE`: the fourth argument is the
+                // confidence, NULL when only a recall target was given.
+                TypeSignature::Exact(vec![
+                    DataType::Utf8,
+                    DataType::Utf8,
+                    DataType::Float64,
+                    DataType::Float64,
+                ]),
             ],
             Volatility::Volatile,
         ),

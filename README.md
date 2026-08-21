@@ -97,6 +97,16 @@ WHERE held_at >= CAST('2026-01-01' AS TIMESTAMP)
   AND transcript MEANS 'discussed the launch of offline sync in Atlas';
 ```
 
+Several `MEANS` in one `WHERE` are ordered by what they cost, not by the order
+you wrote them: one whose column has a semantic index prunes for free, so it
+runs before one that pays for every row.
+
+Several over the *same* column are asked in **one call per row** instead of one
+call per predicate per surviving row — the same fusion a `CASE` gets. An
+indexed column keeps its stack instead, since pruning rows beats a floor of one
+call each. Fused verdicts are cached under their own key, so a query that fuses
+does not reuse verdicts cached by a single-condition query.
+
 #### `MEANS` in a `SELECT` list
 
 ```sql
@@ -137,10 +147,44 @@ Requires a `MEANS`. Calibrates the index-pruning
 threshold instead of guessing it. The scan labels a sample of surviving rows and sets the floor so
 the given fraction of true matches survive. Without it, thresholds are best-effort.
 
+Those labels also buy a better score to threshold. Similarity ranks documents
+by how close they are to the condition's *wording*, which is the same geometry
+whatever you asked; the labels say which documents actually matched. So the
+scan fits a small classifier over vectors the index already holds, and
+thresholds its probability instead — no extra embedding, no extra model call.
+Too few labels, or all of them one class, and it falls back to plain
+similarity.
+
 ```sql
 SELECT meeting_id FROM meetings
 WHERE transcript MEANS 'discussed offline sync'
 WITH RECALL 0.9;
+```
+
+#### `WITH CONFIDENCE`
+
+```sql
+<statement> WITH RECALL <fraction> WITH CONFIDENCE <fraction>
+```
+
+Requires a `WITH RECALL`. Turns the target from a point estimate on the sample
+into a bound certified for the population: the floor is the one whose Wilson
+lower bound clears the target, corrected across the floors considered because
+the same sample both picks and scores them.
+
+Certifying costs more and prunes less — that is the trade. The sample grows a
+tranche at a time until the bound clears, and if it never does, the funnel
+widens to keep every match it can rather than reporting a number it cannot
+defend. `EXPLAIN` says which promise a plan makes: *estimated* or *certified
+at*.
+
+`WITH RECALL 1 WITH CONFIDENCE …` is rejected — no finite sample proves that
+every match survives. Ask for 0.99.
+
+```sql
+SELECT meeting_id FROM meetings
+WHERE transcript MEANS 'discussed offline sync'
+WITH RECALL 0.9 WITH CONFIDENCE 0.95;
 ```
 
 #### `RELEVANCE TO`

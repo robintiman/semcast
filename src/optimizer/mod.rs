@@ -4,7 +4,7 @@
 //! framework that has always reordered predicates by cost. These rules turn
 //! the marker UDFs into extension nodes ([`rewrite`], [`extract`], [`rank`]),
 //! derive the cheap-then-verify funnel ([`funnel`]), and keep lossy shortcuts
-//! honest under a recall target ([`calibrate`]).
+//! honest under a recall target ([`calibrate`], scoring through [`proxy`]).
 
 pub mod calibrate;
 pub mod classify;
@@ -12,5 +12,6 @@ pub mod cluster;
 pub mod distinct;
 pub mod extract;
 pub mod funnel;
+pub mod proxy;
 pub mod rank;
 pub mod rewrite;

@@ -132,8 +132,20 @@ pub async fn sql(ctx: &SessionContext, query: &str) -> Result<DataFrame> {
     // created yet; bind it before the planner tries to resolve it.
     sql::cluster::bind_meaning_labels(&mut statement);
     let mut plan = ctx.state().statement_to_plan(statement).await?;
-    if let Some(recall) = clauses.recall {
-        plan = optimizer::rewrite::apply_recall(plan, recall)?;
+    match (clauses.recall, clauses.confidence) {
+        (Some(recall), confidence) => {
+            plan = optimizer::rewrite::apply_recall(plan, recall, confidence)?;
+        }
+        // A confidence qualifies a recall target; alone it qualifies nothing.
+        (None, Some(_)) => {
+            return Err(datafusion::error::DataFusionError::Plan(
+                "WITH CONFIDENCE certifies a WITH RECALL target; give a recall \
+                 target for it to certify"
+                    .to_owned(),
+            )
+            .into());
+        }
+        (None, None) => {}
     }
     if let Some(similarity) = clauses.similarity {
         plan = optimizer::distinct::apply_similarity(plan, similarity)?;
@@ -156,6 +168,7 @@ pub fn semcast_context_with_cache(
 /// SQL client can read any local file the process can.
 pub struct SemcastContextBuilder {
     model: Arc<dyn ModelProvider>,
+    fallbacks: Vec<Arc<dyn ModelProvider>>,
     embedder: Option<Arc<dyn ModelProvider>>,
     cache: Arc<dyn SemanticCache>,
     index_root: Option<std::path::PathBuf>,
@@ -166,11 +179,27 @@ impl SemcastContextBuilder {
     pub fn new(model: Arc<dyn ModelProvider>) -> Self {
         Self {
             model,
+            fallbacks: Vec::new(),
             embedder: None,
             cache: Arc::new(InMemoryCache::default()),
             index_root: None,
             information_schema: false,
         }
+    }
+
+    /// Cover for the session model: a request it fails on is retried against
+    /// each of `fallbacks` in turn, so a provider outage costs latency instead
+    /// of rows.
+    ///
+    /// The chain's id names every model in it, so adding a fallback
+    /// invalidates cached verdicts rather than attributing one model's answer
+    /// to another. An embedder left unset inherits the chain; one set
+    /// explicitly through [`with_embedder`] does not.
+    ///
+    /// [`with_embedder`]: Self::with_embedder
+    pub fn with_fallback_models(mut self, fallbacks: Vec<Arc<dyn ModelProvider>>) -> Self {
+        self.fallbacks = fallbacks;
+        self
     }
 
     /// Embed semantic indexes (and their queries) through `embedder` instead
@@ -201,28 +230,43 @@ impl SemcastContextBuilder {
         // One type registry, shared between the runtime (DDL dispatch) and the
         // marker UDFs (which resolve type fields at plan time).
         let types = Arc::new(crate::types::registry::TypeRegistry::default());
+        // Wrap once, here, so the runtime and the physical planner hold the
+        // same chain — they take separate handles to the session model.
+        let model: Arc<dyn ModelProvider> = if self.fallbacks.is_empty() {
+            self.model
+        } else {
+            Arc::new(crate::model::FallbackProvider::new(
+                self.model,
+                self.fallbacks,
+            ))
+        };
         let mut runtime =
-            SemcastRuntime::new(Arc::clone(&self.model)).with_type_registry(Arc::clone(&types));
+            SemcastRuntime::new(Arc::clone(&model)).with_type_registry(Arc::clone(&types));
         if let Some(embedder) = self.embedder {
             runtime = runtime.with_embedder(embedder);
         }
         if let Some(root) = self.index_root {
             runtime = runtime.with_index_root(root);
         }
+        // One runtime, two holders: the session config (where the physical
+        // planner and the public API find it) and the means rewrite rule,
+        // which needs the index map at plan time and has no route to a
+        // `SessionConfig` extension of its own.
+        let runtime = Arc::new(runtime);
         let config = SessionConfig::new()
-            .with_extension(Arc::new(runtime))
+            .with_extension(Arc::clone(&runtime))
             .with_information_schema(self.information_schema);
         let state = SessionStateBuilder::new()
             .with_default_features()
             .with_config(config)
-            .with_optimizer_rule(Arc::new(MeansRewriteRule))
+            .with_optimizer_rule(Arc::new(MeansRewriteRule::new(Arc::clone(&runtime))))
             .with_optimizer_rule(Arc::new(
                 crate::optimizer::extract::ExtractRewriteRule::new(Arc::clone(&types)),
             ))
             .with_optimizer_rule(Arc::new(RelevanceRewriteRule))
             .with_optimizer_rule(Arc::new(ClusterRewriteRule))
             .with_optimizer_rule(Arc::new(DistinctRewriteRule))
-            .with_query_planner(Arc::new(SemcastQueryPlanner::new(self.model, self.cache)))
+            .with_query_planner(Arc::new(SemcastQueryPlanner::new(model, self.cache)))
             .build();
         let ctx = SessionContext::new_with_state(state);
         ctx.register_udf(sql::means_udf::means_udf());

@@ -609,3 +609,192 @@ async fn builder_embedder_serves_ddl_created_indexes() {
         "verify calls stay on the session model",
     );
 }
+
+/// Depth of the first line containing `needle` in an indented plan display —
+/// deeper means closer to the scan, which means it runs earlier.
+fn depth_of(display: &str, needle: &str) -> usize {
+    display
+        .lines()
+        .find(|line| line.contains(needle))
+        .map(|line| line.len() - line.trim_start().len())
+        .unwrap_or_else(|| panic!("no line matching {needle:?} in:\n{display}"))
+}
+
+/// Both a title and a transcript can match, so a two-predicate query returns
+/// a row rather than trivially nothing.
+async fn indexed_transcript_context(dir: &tempfile::TempDir) -> SessionContext {
+    let ctx = semcast_context(Arc::new(MockModel::answering_yes_to([
+        "offline sync",
+        "atlas planning",
+    ])));
+    ctx.sql(&format!(
+        "CREATE TABLE meetings AS
+         SELECT * FROM (VALUES
+             (1, 'atlas planning',  '{MATCHING}'),
+             (2, 'weekly standup',  '{OTHER}'),
+             (3, 'retro',           CAST(NULL AS VARCHAR))
+         ) AS t(meeting_id, title, transcript)",
+    ))
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+    // Only `transcript` gets an index; `title` pays full price.
+    create_semantic_index(&ctx, "meetings", "transcript", index_options(dir))
+        .await
+        .unwrap();
+    ctx
+}
+
+const INDEXED_LAST: &str = "SELECT meeting_id FROM meetings
+     WHERE title MEANS 'planning' AND transcript MEANS 'sync'";
+const INDEXED_FIRST: &str = "SELECT meeting_id FROM meetings
+     WHERE transcript MEANS 'sync' AND title MEANS 'planning'";
+
+/// An indexed predicate prunes for free before the model sees a row, so it
+/// belongs below one that pays full price — whichever order it was written in.
+#[tokio::test]
+async fn an_indexed_predicate_is_stacked_below_an_unindexed_one() {
+    for (label, query) in [
+        ("indexed written last", INDEXED_LAST),
+        ("indexed written first", INDEXED_FIRST),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = indexed_transcript_context(&dir).await;
+        let plan = semcast::sql(&ctx, query)
+            .await
+            .unwrap()
+            .into_optimized_plan()
+            .unwrap();
+        let display = plan.display_indent().to_string();
+
+        assert!(
+            depth_of(&display, "MEANS('sync')") > depth_of(&display, "MEANS('planning')"),
+            "{label}: the indexed predicate must run first:\n{display}",
+        );
+    }
+}
+
+/// Ordering is a cost decision, not a semantic one: same rows either way.
+#[tokio::test]
+async fn conjunct_ordering_does_not_change_the_rows() {
+    let mut answers = Vec::new();
+    for query in [INDEXED_LAST, INDEXED_FIRST] {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = indexed_transcript_context(&dir).await;
+        answers.push(matching_ids(&ctx, query).await);
+    }
+    assert_eq!(answers[0], vec![1], "the one meeting matching both");
+    assert_eq!(answers[0], answers[1]);
+}
+
+// ---------------------------------------------------------------------------
+// WITH CONFIDENCE: the recall target becomes a certified lower bound rather
+// than a point estimate on the calibration sample.
+
+async fn plan_error(ctx: &SessionContext, sql: &str) -> String {
+    match semcast::sql(ctx, sql).await {
+        Ok(frame) => match frame.into_optimized_plan() {
+            Ok(plan) => panic!("expected an error, got a plan:\n{}", plan.display_indent()),
+            Err(err) => err.to_string(),
+        },
+        Err(err) => err.to_string(),
+    }
+}
+
+/// A confidence is a claim *about* a recall target; on its own there is
+/// nothing for it to qualify.
+#[tokio::test]
+async fn confidence_without_recall_is_a_plan_time_error() {
+    let ctx = meetings_context().await;
+    let message = plan_error(
+        &ctx,
+        "SELECT meeting_id FROM meetings
+         WHERE transcript MEANS 'sync' WITH CONFIDENCE 0.95",
+    )
+    .await;
+    assert!(
+        message.contains("certifies a WITH RECALL target"),
+        "got: {message}",
+    );
+}
+
+/// No finite sample proves that *every* match survives, so asking to certify
+/// 1.0 is refused rather than quietly certified.
+#[tokio::test]
+async fn certifying_full_recall_is_refused() {
+    let ctx = meetings_context().await;
+    let message = plan_error(
+        &ctx,
+        "SELECT meeting_id FROM meetings
+         WHERE transcript MEANS 'sync' WITH RECALL 1 WITH CONFIDENCE 0.95",
+    )
+    .await;
+    assert!(message.contains("cannot be certified"), "got: {message}");
+    // Without the confidence it is still a legal, best-effort request.
+    assert!(
+        semcast::sql(
+            &ctx,
+            "SELECT meeting_id FROM meetings
+             WHERE transcript MEANS 'sync' WITH RECALL 1",
+        )
+        .await
+        .unwrap()
+        .into_optimized_plan()
+        .is_ok(),
+    );
+}
+
+/// EXPLAIN says which kind of promise the plan makes, because "recall ≥ 0.9"
+/// means something different with and without a confidence behind it.
+#[tokio::test]
+async fn explain_distinguishes_an_estimate_from_a_certificate() {
+    let ctx = meetings_context().await;
+    for (query, expected) in [
+        (
+            "SELECT meeting_id FROM meetings
+             WHERE transcript MEANS 'sync' WITH RECALL 0.9",
+            "recall ≥ 0.90 estimated",
+        ),
+        (
+            "SELECT meeting_id FROM meetings
+             WHERE transcript MEANS 'sync' WITH RECALL 0.9 WITH CONFIDENCE 0.95",
+            "recall ≥ 0.90 certified at 0.95",
+        ),
+    ] {
+        let plan = semcast::sql(&ctx, query)
+            .await
+            .unwrap()
+            .into_optimized_plan()
+            .unwrap();
+        let display = plan.display_indent().to_string();
+        assert!(
+            display.contains(expected),
+            "want {expected:?} in:\n{display}"
+        );
+    }
+}
+
+/// Certifying must never drop a row an estimate would have kept: the bound is
+/// more conservative, so the funnel is wider, never narrower.
+#[tokio::test]
+async fn certifying_keeps_at_least_what_estimating_keeps() {
+    let query = "SELECT meeting_id FROM meetings
+                 WHERE transcript MEANS 'offline sync' WITH RECALL 0.9";
+    let certified_query = "SELECT meeting_id FROM meetings
+                           WHERE transcript MEANS 'offline sync'
+                           WITH RECALL 0.9 WITH CONFIDENCE 0.95";
+
+    let mut kept = Vec::new();
+    for sql in [query, certified_query] {
+        let ctx = meetings_context().await;
+        let dir = tempfile::tempdir().unwrap();
+        create_semantic_index(&ctx, "meetings", "transcript", index_options(&dir))
+            .await
+            .unwrap();
+        kept.push(matching_ids(&ctx, sql).await);
+    }
+    assert_eq!(kept[0], vec![1]);
+    assert_eq!(kept[1], vec![1], "the certified funnel is at least as wide");
+}

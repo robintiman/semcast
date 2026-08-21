@@ -65,7 +65,7 @@ pub fn rewrite_projection(projection: Projection) -> Result<Transformed<LogicalP
 /// produce, threading the guard that says which rows reach it.
 fn rewrite_expr(expr: Expr, guard: &Option<Expr>, builder: &mut Builder) -> Result<Expr> {
     if is_means_call(&expr) {
-        let (text, condition, recall) = destructure_means(expr)?;
+        let (text, condition, recall, _confidence) = destructure_means(expr)?;
         if recall.is_some() {
             return plan_err!(
                 "WITH RECALL calibrates the index pre-filter for a MEANS in a WHERE \
