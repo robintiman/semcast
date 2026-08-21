@@ -13,15 +13,16 @@
 use std::sync::Arc;
 
 use datafusion::common::tree_node::{Transformed, TreeNode};
-use datafusion::common::{Result, ScalarValue, plan_err};
+use datafusion::common::{Column, Result, ScalarValue, plan_err};
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::utils::{conjunction, split_conjunction_owned};
-use datafusion::logical_expr::{Expr, Extension, Filter, LogicalPlan};
+use datafusion::logical_expr::{Expr, Extension, Filter, LogicalPlan, Projection};
 use datafusion::optimizer::optimizer::ApplyOrder;
 use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
 
 use crate::index::registry::SemcastRuntime;
-use crate::logical::SemFilterNode;
+use crate::logical::sem_classify::branch_column_name;
+use crate::logical::{SemClassifyNode, SemFilterNode};
 use crate::sql::means_udf::MEANS_UDF_NAME;
 
 /// Finds `means(..)` calls inside `Filter` predicates, splits them out of the
@@ -118,29 +119,141 @@ impl OptimizerRule for MeansRewriteRule {
         for call in semantic {
             specs.push(destructure_means(call)?);
         }
-        // An indexed predicate prunes before it pays, so it goes innermost.
-        // `partition` preserves relative order, so equally-priced predicates
-        // keep the order they were written in.
-        let (indexed, unindexed): (Vec<_>, Vec<_>) = specs
-            .into_iter()
-            .partition(|(text, _, _)| self.runtime.covers(text, &schema));
+        let mut groups = group_by_text(specs);
+        for group in &mut groups {
+            group.indexed = self.runtime.covers(&group.text, &schema);
+        }
+        // An indexed group prunes before it pays, so it goes innermost.
+        // `partition` preserves relative order, so equally-priced groups keep
+        // the order they were written in.
+        let (indexed, unindexed): (Vec<_>, Vec<_>) =
+            groups.into_iter().partition(|group| group.indexed);
 
-        // Free predicates stay in a Filter below the SemFilter, so they run
-        // first and DataFusion keeps optimizing them as usual.
+        // Free predicates stay in a Filter below the semantic stage, so they
+        // run first and DataFusion keeps optimizing them as usual.
         let mut rewritten = match conjunction(free) {
             Some(predicate) => {
                 LogicalPlan::Filter(Filter::try_new(predicate, Arc::clone(&filter.input))?)
             }
             None => Arc::unwrap_or_clone(filter.input),
         };
-        // Each node wraps the previous one, so the first stacked runs first.
-        for (text, condition, recall) in indexed.into_iter().chain(unindexed) {
-            rewritten = LogicalPlan::Extension(Extension {
-                node: Arc::new(SemFilterNode::new(rewritten, text, condition, recall)),
-            });
+        // Each stage wraps the previous one, so the first built runs first.
+        for (id, group) in indexed.into_iter().chain(unindexed).enumerate() {
+            rewritten = if group.fusable() {
+                fuse(rewritten, group, id)?
+            } else {
+                stack(rewritten, group)
+            };
         }
         Ok(Transformed::yes(rewritten))
     }
+}
+
+/// Semantic predicates sharing one text expression — the unit the rewrite
+/// orders, and the unit it can fuse into a single model call.
+struct TextGroup {
+    text: Expr,
+    /// `(condition, recall)` in source order, duplicates kept: the unfused
+    /// path stacks exactly what was written.
+    specs: Vec<(String, Option<f64>)>,
+    /// Whether a semantic index covers `text`.
+    indexed: bool,
+}
+
+impl TextGroup {
+    /// Conditions in first-appearance order, asked once each. Writing the
+    /// same condition twice is one question, not two.
+    fn distinct_conditions(&self) -> Vec<String> {
+        let mut conditions: Vec<String> = Vec::new();
+        for (condition, _) in &self.specs {
+            if !conditions.contains(condition) {
+                conditions.push(condition.clone());
+            }
+        }
+        conditions
+    }
+
+    /// Whether asking every condition at once beats asking them in sequence.
+    ///
+    /// Fused costs exactly one call per row with non-NULL text; stacked costs
+    /// that plus one per surviving row per later predicate, so fusion never
+    /// loses on call count — *except* against an index, which prunes rows
+    /// before any call at all and so beats a floor of one-per-row. A classify
+    /// has no index stage by design, so an indexed group keeps its stack.
+    ///
+    /// `WITH RECALL` calibrates that index stage, so a group carrying one has
+    /// nothing to gain here and is left alone rather than having its target
+    /// silently dropped.
+    fn fusable(&self) -> bool {
+        !self.indexed
+            && self.specs.iter().all(|(_, recall)| recall.is_none())
+            && self.distinct_conditions().len() > 1
+    }
+}
+
+/// Collect predicates by the text they read, in first-appearance order.
+fn group_by_text(specs: Vec<(Expr, String, Option<f64>)>) -> Vec<TextGroup> {
+    let mut groups: Vec<TextGroup> = Vec::new();
+    for (text, condition, recall) in specs {
+        match groups.iter_mut().find(|group| group.text == text) {
+            Some(group) => group.specs.push((condition, recall)),
+            None => groups.push(TextGroup {
+                text,
+                specs: vec![(condition, recall)],
+                indexed: false,
+            }),
+        }
+    }
+    groups
+}
+
+/// One `SemFilter` per predicate, in the order they were written.
+fn stack(input: LogicalPlan, group: TextGroup) -> LogicalPlan {
+    let TextGroup { text, specs, .. } = group;
+    let mut plan = input;
+    for (condition, recall) in specs {
+        plan = LogicalPlan::Extension(Extension {
+            node: Arc::new(SemFilterNode::new(plan, text.clone(), condition, recall)),
+        });
+    }
+    plan
+}
+
+/// Every condition in one model call: a `SemClassify` materializes one boolean
+/// per condition, a `Filter` demands all of them, and a projection drops the
+/// booleans again.
+///
+/// The projection is not tidiness. It restores the input schema, so the rest
+/// of the plan sees what it expects — and it frees the `__sem_class_*` names
+/// again, which is what stops these columns colliding with a `SemClassify`
+/// that a `MEANS` in the same query's `SELECT` list builds above us.
+fn fuse(input: LogicalPlan, group: TextGroup, id: usize) -> Result<LogicalPlan> {
+    let conditions = group.distinct_conditions();
+    let passthrough: Vec<Expr> = input
+        .schema()
+        .columns()
+        .into_iter()
+        .map(Expr::Column)
+        .collect();
+    let classify = LogicalPlan::Extension(Extension {
+        node: Arc::new(SemClassifyNode::try_new(
+            input,
+            group.text,
+            conditions.clone(),
+            None,
+            id,
+        )?),
+    });
+    let predicate = conjunction(
+        (0..conditions.len())
+            .map(|branch| Expr::Column(Column::new_unqualified(branch_column_name(id, branch)))),
+    )
+    .expect("a fusable group has more than one condition");
+    let filtered = LogicalPlan::Filter(Filter::try_new(predicate, Arc::new(classify))?);
+    Ok(LogicalPlan::Projection(Projection::try_new(
+        passthrough,
+        Arc::new(filtered),
+    )?))
 }
 
 /// Attach a statement-level `WITH RECALL` target to every `means()` call in

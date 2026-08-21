@@ -97,6 +97,16 @@ WHERE held_at >= CAST('2026-01-01' AS TIMESTAMP)
   AND transcript MEANS 'discussed the launch of offline sync in Atlas';
 ```
 
+Several `MEANS` in one `WHERE` are ordered by what they cost, not by the order
+you wrote them: one whose column has a semantic index prunes for free, so it
+runs before one that pays for every row.
+
+Several over the *same* column are asked in **one call per row** instead of one
+call per predicate per surviving row — the same fusion a `CASE` gets. An
+indexed column keeps its stack instead, since pruning rows beats a floor of one
+call each. Fused verdicts are cached under their own key, so a query that fuses
+does not reuse verdicts cached by a single-condition query.
+
 #### `MEANS` in a `SELECT` list
 
 ```sql
