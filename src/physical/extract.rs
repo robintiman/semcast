@@ -282,13 +282,37 @@ impl Extractor {
         let completions = self.model.complete(requests).await;
         debug_assert_eq!(completions.len(), pending.len());
         for (pending_row, completion) in pending.iter().zip(&completions) {
-            let object = completion
-                .as_ref()
-                .ok()
-                .and_then(|c| parse_json_object(&c.text));
+            // A row that fails still costs a full model call, so say why. The
+            // two causes want different fixes — a rejected request is usually
+            // the type's shape (too many fields for the provider's schema
+            // limits, a `max_tokens` too low to close the object), while an
+            // unparseable response is the model going off-format — and the
+            // `rows_failed` counter alone distinguishes neither.
+            let object = match completion {
+                Ok(completion) => match parse_json_object(&completion.text) {
+                    Some(object) => Some(object),
+                    None => {
+                        tracing::warn!(
+                            target: "semcast::extract",
+                            semantic_type = %self.target.name,
+                            response = %completion.text,
+                            "extraction response was not a JSON object; row's fields stay NULL",
+                        );
+                        None
+                    }
+                },
+                Err(error) => {
+                    tracing::warn!(
+                        target: "semcast::extract",
+                        semantic_type = %self.target.name,
+                        fields = pending_row.pending_units.len(),
+                        %error,
+                        "extraction model call failed; row's fields stay NULL",
+                    );
+                    None
+                }
+            };
             let Some(object) = object else {
-                // Model error or unparseable response: all pending fields stay
-                // NULL for this row.
                 self.rows_failed.add(1);
                 continue;
             };
