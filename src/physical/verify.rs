@@ -305,18 +305,40 @@ impl Verifier {
         let verdicts = self.model.complete(requests).await;
         debug_assert_eq!(verdicts.len(), pending.len());
         for ((row, input), verdict) in pending.iter().zip(&verdicts) {
-            match verdict.as_ref().map(|c| parse_verdict(&c.text)) {
-                Ok(Some(matched)) => {
-                    keep[*row] = matched;
-                    // Only successful verdicts are cached: a transient model
-                    // failure must not permanently exclude a row.
-                    self.cache.put(
-                        self.cache_key(input),
-                        CachedValue::Value(if matched { "yes" } else { "no" }.to_owned()),
+            // Row-level failure: exclude and count, don't fail the query — but
+            // say why. A dropped row is a paid-for call that silently changed
+            // the result set, and `rows_dropped` alone cannot tell a model
+            // outage from a model that answered something other than yes/no.
+            match verdict {
+                Ok(completion) => match parse_verdict(&completion.text) {
+                    Some(matched) => {
+                        keep[*row] = matched;
+                        // Only successful verdicts are cached: a transient
+                        // model failure must not permanently exclude a row.
+                        self.cache.put(
+                            self.cache_key(input),
+                            CachedValue::Value(if matched { "yes" } else { "no" }.to_owned()),
+                        );
+                    }
+                    None => {
+                        tracing::warn!(
+                            target: "semcast::verify",
+                            condition = %self.condition,
+                            response = %completion.text,
+                            "verify response was not a yes/no verdict; row excluded",
+                        );
+                        self.rows_dropped.add(1);
+                    }
+                },
+                Err(error) => {
+                    tracing::warn!(
+                        target: "semcast::verify",
+                        condition = %self.condition,
+                        %error,
+                        "verify model call failed; row excluded",
                     );
+                    self.rows_dropped.add(1);
                 }
-                // Row-level failure: exclude and count, don't fail the query.
-                Ok(None) | Err(_) => self.rows_dropped.add(1),
             }
         }
         Ok(filter_record_batch(&batch, &BooleanArray::from(keep))?)
