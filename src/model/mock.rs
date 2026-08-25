@@ -25,6 +25,7 @@ pub struct MockModel {
     calls: AtomicUsize,
     inputs: Mutex<Vec<String>>,
     schemas: Mutex<Vec<Option<Value>>>,
+    max_tokens: Mutex<Vec<usize>>,
     embed_calls: AtomicUsize,
     /// Themes for [`MockModel::embedding_by_theme`]; empty means embed by
     /// byte position instead.
@@ -101,6 +102,13 @@ impl MockModel {
         self.schemas.lock().expect("schemas poisoned").clone()
     }
 
+    /// The `max_tokens` of every completion request served, in order — lets
+    /// tests assert the generation ceiling scales with what the call asks for,
+    /// rather than truncating a wide extraction mid-JSON.
+    pub fn completion_max_tokens(&self) -> Vec<usize> {
+        self.max_tokens.lock().expect("max_tokens poisoned").clone()
+    }
+
     /// `embed` requests served so far (one per call, however many texts).
     pub fn embed_calls(&self) -> usize {
         self.embed_calls.load(Ordering::Relaxed)
@@ -146,9 +154,11 @@ impl ModelProvider for MockModel {
         {
             let mut inputs = self.inputs.lock().expect("inputs poisoned");
             let mut schemas = self.schemas.lock().expect("schemas poisoned");
+            let mut max_tokens = self.max_tokens.lock().expect("max_tokens poisoned");
             for req in &requests {
                 inputs.push(req.input.clone());
                 schemas.push(req.schema.clone());
+                max_tokens.push(req.max_tokens);
             }
         }
         requests
