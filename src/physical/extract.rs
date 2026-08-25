@@ -39,9 +39,26 @@ use crate::logical::sem_extract::output_column_name;
 use crate::model::{CompletionRequest, ModelId, ModelProvider};
 use crate::types::{EXTRACT_PROMPT_VERSION, FieldSpec, FieldType, SemanticType, unit_hash};
 
-/// Per-row `max_tokens` for an extraction request. Typed JSON is compact; this
-/// is a ceiling, not a target.
+/// Per-row `max_tokens` floor for an extraction request. Typed JSON is
+/// compact, so a narrow extraction never approaches this.
 const EXTRACT_MAX_TOKENS: usize = 2048;
+
+/// Room allowed per field on top of the floor. A wide `TOGETHER` group emits
+/// one JSON member per field, and list-valued fields quoting source text emit
+/// many lines each — a flat ceiling truncates that mid-object, the truncated
+/// JSON fails to decode, and the row is dropped as an error. Since the row
+/// still costs a full model call, the failure is both silent and expensive, so
+/// the ceiling scales with the number of fields the call actually fills.
+const EXTRACT_TOKENS_PER_FIELD: usize = 384;
+
+/// Absolute ceiling, so a pathological type cannot ask for an unbounded
+/// generation.
+const EXTRACT_MAX_TOKENS_CAP: usize = 16384;
+
+/// The `max_tokens` for a call filling `fields` fields.
+fn extract_max_tokens(fields: usize) -> usize {
+    (fields * EXTRACT_TOKENS_PER_FIELD).clamp(EXTRACT_MAX_TOKENS, EXTRACT_MAX_TOKENS_CAP)
+}
 
 /// Extends the input with one nullable column per extracted field, then fills
 /// them with a model call per row (cached per generation unit).
@@ -264,7 +281,7 @@ impl Extractor {
                     .synthesize_prompt(&pending_fields)
                     .map_err(DataFusionError::from)?,
                 input: text.to_owned(),
-                max_tokens: EXTRACT_MAX_TOKENS,
+                max_tokens: extract_max_tokens(pending_fields.len()),
                 schema: Some(
                     self.target
                         .json_schema(&pending_fields)
@@ -460,5 +477,26 @@ fn scalar_from_normalized(ty: &FieldType, value: &Value) -> ScalarValue {
             None => ScalarValue::Null,
         },
         FieldType::Nested(_) => ScalarValue::Null,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn max_tokens_scales_with_field_count() {
+        // A narrow extraction keeps the historical floor.
+        assert_eq!(extract_max_tokens(1), EXTRACT_MAX_TOKENS);
+        assert_eq!(extract_max_tokens(5), EXTRACT_MAX_TOKENS);
+
+        // A wide one gets room to finish the object. The 41-field CUAD type
+        // is the case that motivated this: at a flat 2048 the JSON truncated
+        // mid-object and every row was dropped as a decode error.
+        assert!(extract_max_tokens(41) > EXTRACT_MAX_TOKENS);
+        assert_eq!(extract_max_tokens(41), 41 * EXTRACT_TOKENS_PER_FIELD);
+
+        // But never unbounded.
+        assert_eq!(extract_max_tokens(10_000), EXTRACT_MAX_TOKENS_CAP);
     }
 }
