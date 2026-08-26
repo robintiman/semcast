@@ -24,6 +24,7 @@ use crate::logical::{
 };
 use crate::model::ModelProvider;
 use crate::optimizer::calibrate::DEFAULT_CALIBRATION_SAMPLE;
+use crate::physical::extract::ReducedContext;
 use crate::physical::index_scan::{CalibrationConfig, ChunkEvidence, IndexScanExec};
 use crate::physical::{
     SemClassifyExec, SemClusterExec, SemDistinctExec, SemExtractExec, SemRankExec, VerifyExec,
@@ -253,14 +254,40 @@ impl ExtensionPlanner for SemcastExtensionPlanner {
                 logical_inputs[0].schema(),
                 session_state,
             )?;
-            return Ok(Some(Arc::new(SemExtractExec::new(
-                Arc::clone(&physical_inputs[0]),
-                source,
-                extract.target.clone(),
-                extract.id,
-                Arc::clone(&self.model),
-                Arc::clone(&self.cache),
-            )?)));
+            // Reduced-context extraction when an index covers the source
+            // column: the model reads the document's best excerpts against
+            // the field doc lines instead of its full text. Same rule as the
+            // MEANS funnel — an index makes the cheap stage available, its
+            // absence degrades to full price rather than failing.
+            let context = session_state
+                .config()
+                .get_extension::<SemcastRuntime>()
+                .and_then(|runtime| {
+                    runtime.index_for_text(&extract.source, logical_inputs[0].schema())
+                })
+                .map(|index| {
+                    let params = index.search_params();
+                    ReducedContext { index, params }
+                });
+            return Ok(Some(Arc::new(match context {
+                Some(context) => SemExtractExec::new_with_context(
+                    Arc::clone(&physical_inputs[0]),
+                    source,
+                    extract.target.clone(),
+                    extract.id,
+                    Arc::clone(&self.model),
+                    Arc::clone(&self.cache),
+                    context,
+                )?,
+                None => SemExtractExec::new(
+                    Arc::clone(&physical_inputs[0]),
+                    source,
+                    extract.target.clone(),
+                    extract.id,
+                    Arc::clone(&self.model),
+                    Arc::clone(&self.cache),
+                )?,
+            })));
         }
         Ok(None)
     }

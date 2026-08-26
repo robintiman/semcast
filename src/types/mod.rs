@@ -67,12 +67,33 @@ impl SemanticType {
     /// byte-for-byte and order-independent — the field subset alone decides
     /// the output, so it can key a cache and feed cost estimation.
     pub fn synthesize_prompt(&self, fields: &[&str]) -> crate::Result<String> {
-        let specs = self.select(fields)?;
-        let mut prompt = String::from(
+        self.prompt_with_preamble(
+            fields,
             "You extract structured facts from a document. Return a single JSON \
              object with exactly these keys, and nothing else. Base every value \
              only on the document; if a fact is not present, use null.\n",
-        );
+        )
+    }
+
+    /// The reduced-context variant: the model sees the document's best
+    /// excerpts from the semantic index rather than its full text, so the
+    /// prompt has to say the input is partial. A fact absent from the
+    /// excerpts is reported absent — that is the recall the reduced context
+    /// trades away for the tokens it saves.
+    pub fn synthesize_prompt_chunked(&self, fields: &[&str]) -> crate::Result<String> {
+        self.prompt_with_preamble(
+            fields,
+            "You extract structured facts from excerpts of a document, \
+             separated by `---`. The excerpts may be partial. Return a single \
+             JSON object with exactly these keys, and nothing else. Base every \
+             value only on the excerpts; if a fact is not present in them, use \
+             null.\n",
+        )
+    }
+
+    fn prompt_with_preamble(&self, fields: &[&str], preamble: &str) -> crate::Result<String> {
+        let specs = self.select(fields)?;
+        let mut prompt = String::from(preamble);
         for spec in specs {
             prompt.push_str(&format!(
                 "\n- {} ({}): {}",

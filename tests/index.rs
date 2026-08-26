@@ -831,3 +831,116 @@ async fn certifying_keeps_at_least_what_estimating_keeps() {
     assert_eq!(kept[0], vec![1]);
     assert_eq!(kept[1], vec![1], "the certified funnel is at least as wide");
 }
+
+/// Reduced-context extraction (Abacus's Reduced-Context Generation rule): with
+/// an index on the source column, `CAST(... AS T)` reads the document's best
+/// excerpts against the field doc lines instead of its full text.
+#[tokio::test]
+async fn extraction_reads_chunks_when_an_index_covers_the_column() {
+    // A long document whose extractable fact sits in one passage, padded so
+    // the full text is far larger than the chunks that carry it.
+    let padding = "routine boilerplate about nothing in particular ".repeat(2000);
+    let doc = format!("{padding} the launch stage is shipped {padding}");
+    let model = Arc::new(MockModel::answering_json_with(
+        |_| serde_json::json!({"launch_stage": "shipped", "stage_quote": "the launch stage is shipped"}),
+    ));
+    let ctx = semcast_context(model.clone());
+    ctx.sql(&format!(
+        "CREATE TABLE meetings AS
+         SELECT * FROM (VALUES (1, '{doc}')) AS t(meeting_id, transcript)",
+    ))
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+    semcast::sql(
+        &ctx,
+        "CREATE SEMANTIC TYPE Facts AS (
+           TOGETHER (
+             launch_stage TEXT 'the furthest launch stage discussed',
+             stage_quote  TEXT 'the line that shows that stage'
+           )
+         )",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    create_semantic_index(&ctx, "meetings", "transcript", index_options(&dir))
+        .await
+        .unwrap();
+
+    semcast::sql(
+        &ctx,
+        "SELECT CAST(transcript AS Facts).launch_stage FROM meetings",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    let inputs = model.completion_inputs();
+    let input = inputs.last().expect("one extraction call");
+    assert!(
+        input.len() < doc.len() / 2,
+        "extraction read {} bytes of a {}-byte document — should be top-k chunks",
+        input.len(),
+        doc.len(),
+    );
+}
+
+/// Without an index the same query still runs — at full price, on full text.
+/// An index gap degrades, never drops.
+#[tokio::test]
+async fn extraction_without_an_index_reads_the_full_document() {
+    let doc = "the launch stage is shipped ".repeat(500);
+    let model = Arc::new(MockModel::answering_json_with(
+        |_| serde_json::json!({"launch_stage": "shipped", "stage_quote": "q"}),
+    ));
+    let ctx = semcast_context(model.clone());
+    ctx.sql(&format!(
+        "CREATE TABLE meetings AS
+         SELECT * FROM (VALUES (1, '{doc}')) AS t(meeting_id, transcript)",
+    ))
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+    semcast::sql(
+        &ctx,
+        "CREATE SEMANTIC TYPE Facts AS (
+           TOGETHER (
+             launch_stage TEXT 'the furthest launch stage discussed',
+             stage_quote  TEXT 'the line that shows that stage'
+           )
+         )",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    semcast::sql(
+        &ctx,
+        "SELECT CAST(transcript AS Facts).launch_stage FROM meetings",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    let inputs = model.completion_inputs();
+    assert_eq!(
+        inputs.last().map(String::as_str),
+        Some(doc.as_str()),
+        "no index means the model reads the whole document",
+    );
+}

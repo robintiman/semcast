@@ -13,6 +13,8 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
+use tokio::sync::OnceCell;
+
 use datafusion::arrow::array::{Array, ArrayRef, StringArray};
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -35,8 +37,11 @@ use futures::TryStreamExt;
 use serde_json::Value;
 
 use crate::cache::{CacheKey, CachedValue, SemanticCache};
+use crate::index::{SearchParams, SemanticIndex, doc_hash};
 use crate::logical::sem_extract::output_column_name;
 use crate::model::{CompletionRequest, ModelId, ModelProvider};
+use crate::physical::index_scan::bucket_chunks;
+use crate::physical::verify::CHUNK_SEPARATOR;
 use crate::types::{EXTRACT_PROMPT_VERSION, FieldSpec, FieldType, SemanticType, unit_hash};
 
 /// Per-row `max_tokens` floor for an extraction request. Typed JSON is
@@ -60,6 +65,33 @@ fn extract_max_tokens(fields: usize) -> usize {
     (fields * EXTRACT_TOKENS_PER_FIELD).clamp(EXTRACT_MAX_TOKENS, EXTRACT_MAX_TOKENS_CAP)
 }
 
+/// Per-document excerpts, keyed by [`doc_hash`] so they survive whatever
+/// repartitioning DataFusion inserts under the operator.
+type DocChunks = HashMap<u64, Vec<String>>;
+
+/// Retrieved once per query and shared by every partition's stream.
+type SharedChunks = Arc<OnceCell<Arc<DocChunks>>>;
+
+/// Reduced-context extraction: feed the model the document's best excerpts
+/// from the semantic index instead of its full text.
+///
+/// A full-text extraction pays for the whole document on every call, however
+/// little of it bears on the fields being extracted. The index already knows
+/// which chunks are near which text, and each field carries a natural-language
+/// doc line — so the doc lines are the queries, and their top chunks are the
+/// context the model actually needs.
+///
+/// This is a cost/recall trade, not a free win: a fact outside the retrieved
+/// chunks is reported absent. How it lands depends on the corpus. Evidence
+/// concentrated in one passage survives the reduction; evidence dispersed
+/// through a long document does not. It is enabled by the presence of an
+/// index on the source column, so `CREATE SEMANTIC INDEX` is the knob.
+#[derive(Debug, Clone)]
+pub struct ReducedContext {
+    pub index: Arc<dyn SemanticIndex>,
+    pub params: SearchParams,
+}
+
 /// Extends the input with one nullable column per extracted field, then fills
 /// them with a model call per row (cached per generation unit).
 #[derive(Debug)]
@@ -73,6 +105,12 @@ pub struct SemExtractExec {
     id: usize,
     model: Arc<dyn ModelProvider>,
     cache: Arc<dyn SemanticCache>,
+    /// Present when a semantic index covers the source column: the model
+    /// reads excerpts instead of full documents.
+    context: Option<ReducedContext>,
+    /// Retrieval runs once per query, not once per partition or per row —
+    /// one search per field doc line covers the whole corpus.
+    chunks: SharedChunks,
     output_schema: SchemaRef,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
@@ -86,6 +124,31 @@ impl SemExtractExec {
         id: usize,
         model: Arc<dyn ModelProvider>,
         cache: Arc<dyn SemanticCache>,
+    ) -> Result<Self> {
+        Self::build(input, source, target, id, model, cache, None)
+    }
+
+    /// The reduced-context variant — see [`ReducedContext`].
+    pub fn new_with_context(
+        input: Arc<dyn ExecutionPlan>,
+        source: Arc<dyn PhysicalExpr>,
+        target: SemanticType,
+        id: usize,
+        model: Arc<dyn ModelProvider>,
+        cache: Arc<dyn SemanticCache>,
+        context: ReducedContext,
+    ) -> Result<Self> {
+        Self::build(input, source, target, id, model, cache, Some(context))
+    }
+
+    fn build(
+        input: Arc<dyn ExecutionPlan>,
+        source: Arc<dyn PhysicalExpr>,
+        target: SemanticType,
+        id: usize,
+        model: Arc<dyn ModelProvider>,
+        cache: Arc<dyn SemanticCache>,
+        context: Option<ReducedContext>,
     ) -> Result<Self> {
         let output_schema = extend_schema(&input.schema(), &target, id)?;
         let properties = Arc::new(PlanProperties::new(
@@ -101,6 +164,8 @@ impl SemExtractExec {
             id,
             model,
             cache,
+            context,
+            chunks: Arc::new(OnceCell::new()),
             output_schema,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -127,6 +192,15 @@ impl DisplayAs for SemExtractExec {
             self.target.fields.len(),
             self.model.id()
         )?;
+        // Which context the plan will feed the model — the difference between
+        // paying for whole documents and paying for excerpts.
+        if let Some(context) = &self.context {
+            write!(
+                f,
+                " reads top-{} chunks per doc",
+                context.params.chunks_per_doc
+            )?;
+        }
         // The bill before you run: one call per surviving row, worst case.
         match self.input.partition_statistics(None).map(|s| s.num_rows) {
             Ok(Precision::Exact(rows)) => write!(f, "   ≤{rows} model calls"),
@@ -153,13 +227,14 @@ impl ExecutionPlan for SemExtractExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(Self::new(
+        Ok(Arc::new(Self::build(
             Arc::clone(&children[0]),
             Arc::clone(&self.source),
             self.target.clone(),
             self.id,
             Arc::clone(&self.model),
             Arc::clone(&self.cache),
+            self.context.clone(),
         )?))
     }
 
@@ -176,10 +251,17 @@ impl ExecutionPlan for SemExtractExec {
             model: Arc::clone(&self.model),
             cache: Arc::clone(&self.cache),
             output_schema: Arc::clone(&self.output_schema),
+            context: self.context.clone(),
+            chunks: Arc::clone(&self.chunks),
             model_calls: MetricBuilder::new(&self.metrics).counter("model_calls", partition),
             cache_hits: MetricBuilder::new(&self.metrics).counter("cache_hits", partition),
             rows_failed: MetricBuilder::new(&self.metrics).counter("rows_failed", partition),
             fields_failed: MetricBuilder::new(&self.metrics).counter("fields_failed", partition),
+            reduced_rows: MetricBuilder::new(&self.metrics)
+                .counter("reduced_context_rows", partition),
+            full_text_rows: MetricBuilder::new(&self.metrics).counter("full_text_rows", partition),
+            input_tokens: MetricBuilder::new(&self.metrics).counter("input_tokens", partition),
+            output_tokens: MetricBuilder::new(&self.metrics).counter("output_tokens", partition),
         });
         let stream = input.and_then(move |batch| {
             let extractor = Arc::clone(&extractor);
@@ -209,21 +291,69 @@ struct Extractor {
     model_id: ModelId,
     model: Arc<dyn ModelProvider>,
     cache: Arc<dyn SemanticCache>,
+    context: Option<ReducedContext>,
+    /// Retrieved once per query, shared by every partition's stream.
+    chunks: SharedChunks,
     output_schema: SchemaRef,
     model_calls: Count,
     cache_hits: Count,
     rows_failed: Count,
     fields_failed: Count,
+    reduced_rows: Count,
+    full_text_rows: Count,
+    input_tokens: Count,
+    output_tokens: Count,
 }
 
 /// A row that needs a model call, plus which units are still pending.
 struct PendingRow {
     row: usize,
+    /// What the model reads for this row — the document, or its excerpts under
+    /// a [`ReducedContext`]. Cache keys hash this, so a reduced-context verdict
+    /// is never served for a full-text one.
     text: String,
     pending_units: Vec<usize>,
 }
 
 impl Extractor {
+    /// Retrieve the per-document excerpts, once per query.
+    ///
+    /// Each field's doc line is its own query — the fields are asking
+    /// different questions of the document, and a single blended query would
+    /// retrieve the passage that is vaguely near all of them rather than the
+    /// passages that answer each. Hits are then unioned per document, so a
+    /// document's excerpt set covers every field that found evidence in it.
+    async fn retrieve_chunks(&self, context: &ReducedContext) -> crate::Result<Arc<DocChunks>> {
+        let mut hits = Vec::new();
+        for spec in &self.target.fields {
+            hits.extend(context.index.search(&spec.doc, &context.params).await?);
+        }
+        // Best-scoring first, so the per-document cap keeps the strongest
+        // evidence when more fields hit a document than it has room for.
+        hits.sort_by(|a, b| b.score.total_cmp(&a.score));
+        hits.dedup_by(|a, b| a.doc_hash == b.doc_hash && a.chunk_index == b.chunk_index);
+        Ok(Arc::new(bucket_chunks(hits, context.params.chunks_per_doc)))
+    }
+
+    /// The text one row's model call should read: its excerpts when the index
+    /// has them, the full document otherwise. An index gap degrades to full
+    /// price rather than dropping the row.
+    fn input_for(&self, chunks: Option<&DocChunks>, text: &str) -> String {
+        let excerpts = chunks
+            .and_then(|chunks| chunks.get(&doc_hash(text)))
+            .filter(|excerpts| !excerpts.is_empty());
+        match excerpts {
+            Some(excerpts) => {
+                self.reduced_rows.add(1);
+                excerpts.join(CHUNK_SEPARATOR)
+            }
+            None => {
+                self.full_text_rows.add(1);
+                text.to_owned()
+            }
+        }
+    }
+
     async fn extract_batch(&self, batch: RecordBatch) -> Result<RecordBatch> {
         let rows = batch.num_rows();
         if rows == 0 {
@@ -246,6 +376,19 @@ impl Extractor {
             );
         }
 
+        // Retrieval is per-query: the OnceCell means the first batch to get
+        // here pays for it and every later batch and partition reads it.
+        let chunks = match &self.context {
+            Some(context) => Some(Arc::clone(
+                self.chunks
+                    .get_or_try_init(|| self.retrieve_chunks(context))
+                    .await
+                    .map_err(DataFusionError::from)?,
+            )),
+            None => None,
+        };
+        let chunks = chunks.as_deref();
+
         let units = self.target.generation_units();
         let mut requests = Vec::new();
         let mut pending: Vec<PendingRow> = Vec::new();
@@ -256,9 +399,14 @@ impl Extractor {
                 continue;
             }
             let text = texts.value(row);
+            // Key the cache on what the model actually reads, not on the
+            // document it came from: a full-text verdict and a reduced-context
+            // verdict are different answers to different inputs, and keying
+            // both on the document would let one be served for the other.
+            let input = self.input_for(chunks, text);
             let mut pending_units = Vec::new();
             for (unit_idx, unit) in units.iter().enumerate() {
-                match self.read_unit(unit, text) {
+                match self.read_unit(unit, &input) {
                     Some(hits) => {
                         self.cache_hits.add(unit.len());
                         for (name, scalar) in hits {
@@ -275,12 +423,18 @@ impl Extractor {
                 .iter()
                 .flat_map(|&i| units[i].iter().map(|s| s.name.as_str()))
                 .collect();
+            // The prompt has to match the input: telling a model it is reading
+            // a document when it is reading excerpts invites it to report an
+            // absent fact as present rather than null.
+            let system = if self.context.is_some() {
+                self.target.synthesize_prompt_chunked(&pending_fields)
+            } else {
+                self.target.synthesize_prompt(&pending_fields)
+            }
+            .map_err(DataFusionError::from)?;
             requests.push(CompletionRequest {
-                system: self
-                    .target
-                    .synthesize_prompt(&pending_fields)
-                    .map_err(DataFusionError::from)?,
-                input: text.to_owned(),
+                system,
+                input: input.clone(),
                 max_tokens: extract_max_tokens(pending_fields.len()),
                 schema: Some(
                     self.target
@@ -290,7 +444,7 @@ impl Extractor {
             });
             pending.push(PendingRow {
                 row,
-                text: text.to_owned(),
+                text: input,
                 pending_units,
             });
         }
@@ -298,6 +452,13 @@ impl Extractor {
 
         let completions = self.model.complete(requests).await;
         debug_assert_eq!(completions.len(), pending.len());
+        // Real spend, not an estimate from row counts: what a cost model has
+        // to be calibrated against, and what makes a reduced context's saving
+        // measurable rather than asserted.
+        for completion in completions.iter().flatten() {
+            self.input_tokens.add(completion.input_tokens);
+            self.output_tokens.add(completion.output_tokens);
+        }
         for (pending_row, completion) in pending.iter().zip(&completions) {
             let object = completion
                 .as_ref()

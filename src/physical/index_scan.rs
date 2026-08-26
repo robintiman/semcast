@@ -675,7 +675,7 @@ impl Scanner {
 
 /// Bucket search hits into per-document evidence: chunks scoring at least
 /// `floor`, best first, at most `chunks_per_doc` each.
-fn bucket_chunks(
+pub(crate) fn bucket_chunks(
     hits: Vec<crate::index::ChunkHit>,
     chunks_per_doc: usize,
 ) -> HashMap<u64, Vec<String>> {
