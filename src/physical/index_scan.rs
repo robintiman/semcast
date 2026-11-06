@@ -21,7 +21,6 @@ use datafusion::arrow::compute::{cast, filter_record_batch};
 use datafusion::arrow::datatypes::DataType;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::Statistics;
-use datafusion::common::stats::Precision;
 use datafusion::error::Result;
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
@@ -39,7 +38,7 @@ use futures::{StreamExt, TryStreamExt};
 use tokio::sync::OnceCell;
 
 use crate::cache::{CachedValue, SemanticCache};
-use crate::index::{SearchParams, SemanticIndex, doc_hash};
+use crate::index::{FilterScan, SearchParams, SemanticIndex, doc_hash};
 use crate::model::{CompletionRequest, ModelProvider};
 use crate::optimizer::calibrate::{
     CALIBRATION_LABEL_BUDGET, Calibration, SampledScores, calibrate_threshold,
@@ -51,7 +50,8 @@ use crate::physical::verify::{
 
 /// Where each labeled document sits against the index: scored, never indexed
 /// (passes through at any floor, so it helps recall for free), or indexed but
-/// beyond `fetch_k` (lost at any floor).
+/// missing from the scores (lost at any floor — the scan is exhaustive and
+/// reads scores and membership from one snapshot, so it produces none).
 fn score_labels(
     labels: &[(String, bool)],
     per_doc_best: &HashMap<u64, f32>,
@@ -138,9 +138,11 @@ impl CalibrationConfig {
     }
 }
 
-/// Filters input batches through one nearest-vector search over the semantic
-/// index. Rows the index never saw pass through — staleness must never
-/// silently drop a row; it only costs a full-text verify call downstream.
+/// Filters input batches through one exhaustive similarity scan over the
+/// semantic index: every indexed document is judged on its own score, never
+/// on its rank, so the index changes the cost of a query and not its answer.
+/// Rows the index never saw pass through — staleness must never silently
+/// drop a row; it only costs a full-text verify call downstream.
 #[derive(Debug)]
 pub struct IndexScanExec {
     input: Arc<dyn ExecutionPlan>,
@@ -286,16 +288,12 @@ impl ExecutionPlan for IndexScanExec {
         ))
     }
 
-    /// At most `fetch_k` distinct documents survive the vector scan; Inexact
-    /// because unindexed rows pass through on top of that.
+    /// At most the input survives, and how much less depends on the floor —
+    /// so the input's count, demoted to an estimate.
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
         let input_rows = self.input.partition_statistics(partition)?.num_rows;
-        let cap = self.params.fetch_k;
         let mut statistics = Statistics::new_unknown(&self.input.schema());
-        statistics.num_rows = match input_rows {
-            Precision::Exact(rows) | Precision::Inexact(rows) => Precision::Inexact(rows.min(cap)),
-            Precision::Absent => Precision::Inexact(cap),
-        };
+        statistics.num_rows = input_rows.to_inexact();
         Ok(Arc::new(statistics))
     }
 
@@ -375,11 +373,13 @@ impl Scanner {
     async fn prefilter(&self) -> crate::Result<Arc<PrefilterResult>> {
         // The search already applied `score_floor`, so every hit survives it
         // and bucketing needs no second filter.
-        let hits = self.index.search(&self.condition, &self.params).await?;
-        let indexed = self.index.indexed_doc_hashes().await?;
+        let scan = self
+            .index
+            .filter_scan(&self.condition, self.params.score_floor)
+            .await?;
         Ok(Arc::new(PrefilterResult {
-            chunks: bucket_chunks(hits, self.params.chunks_per_doc),
-            indexed,
+            chunks: bucket_chunks(scan.hits, self.params.chunks_per_doc),
+            indexed: scan.indexed,
         }))
     }
 
@@ -428,9 +428,8 @@ impl Scanner {
 
     /// [`Scanner::prefilter`], with the floor calibrated on the buffered
     /// sample first. Same single embed call: searching with the floor
-    /// dropped returns the identical `fetch_k`-nearest hit set unfiltered,
-    /// so one search serves both the sample's score lookup and the final
-    /// chunks map.
+    /// dropped scores every chunk, so one search serves both the sample's
+    /// score lookup and the final chunks map.
     async fn calibrated_prefilter(
         &self,
         buffered: &[RecordBatch],
@@ -439,12 +438,10 @@ impl Scanner {
             .calibration
             .as_ref()
             .expect("calibrated path requires a config");
-        let params = SearchParams {
-            score_floor: f32::NEG_INFINITY,
-            ..self.params
-        };
-        let hits = self.index.search(&self.condition, &params).await?;
-        let indexed = self.index.indexed_doc_hashes().await?;
+        let FilterScan { hits, indexed } = self
+            .index
+            .filter_scan(&self.condition, f32::NEG_INFINITY)
+            .await?;
 
         // Best chunk score per document — hits arrive best-first.
         let mut per_doc_best: HashMap<u64, f32> = HashMap::new();
@@ -511,8 +508,8 @@ impl Scanner {
                 estimated_recall = calibrated.estimated_recall,
                 certified_recall = ?calibrated.certified_recall,
                 sampled_rows = calibrated.sampled_rows,
-                "the sample cannot support the recall target; keeping every \
-                 positive it can reach",
+                "the sample cannot support the recall target; the index \
+                 prunes nothing and every row is verified",
             );
         }
 

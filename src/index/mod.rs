@@ -64,11 +64,21 @@ pub struct ChunkHit {
     pub text: String,
 }
 
+/// What a filter needs from one consistent read of the index.
+#[derive(Debug, Clone, Default)]
+pub struct FilterScan {
+    /// Every chunk at or above the floor, best first.
+    pub hits: Vec<ChunkHit>,
+    /// Every document the index held when `hits` were scored.
+    pub indexed: HashSet<u64>,
+}
+
 /// Knobs for the index pre-filter stage. Uncalibrated defaults; `WITH
 /// RECALL` (roadmap step 3) will derive `score_floor` from a sample.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SearchParams {
-    /// Chunk hits fetched from the vector scan before the floor is applied.
+    /// Chunk hits a top-k [`SemanticIndex::search`] fetches before the floor
+    /// is applied. The `MEANS` pre-filter ignores it: it scores every chunk.
     pub fetch_k: usize,
     /// Minimum cosine similarity for a chunk to count as a hit.
     pub score_floor: f32,
@@ -106,8 +116,17 @@ pub trait SemanticIndex: std::fmt::Debug + Send + Sync {
     async fn indexed_doc_hashes(&self) -> Result<HashSet<u64>>;
 
     /// Chunk hits scoring at least `params.score_floor` against the embedded
-    /// query, best first, at most `params.fetch_k`.
+    /// query, best first, at most `params.fetch_k`. Top-k retrieval: right
+    /// for ranking, where the cut is the point, wrong for filtering.
     async fn search(&self, query: &str, params: &SearchParams) -> Result<Vec<ChunkHit>>;
+
+    /// Every chunk scoring at least `score_floor` against the embedded query,
+    /// best first, with no cap — and the documents indexed, read from the
+    /// same snapshot. A filter must judge each indexed document on its own
+    /// score: a top-k cut would prune matches for rank alone, and a
+    /// membership set read from a later snapshot would prune documents the
+    /// scan never saw.
+    async fn filter_scan(&self, query: &str, score_floor: f32) -> Result<FilterScan>;
 
     /// One unit vector per indexed document — the mean of its chunk vectors,
     /// renormalized.
