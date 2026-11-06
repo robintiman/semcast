@@ -180,8 +180,16 @@ async fn opening_with_a_different_embedder_errors() {
 
 /// Fixture with byte-histogram-separable transcripts: doc 1 is exactly the
 /// query, doc 2 scores ~0.58 against it, doc 3 is NULL.
+/// Each context gets its own index root: `CREATE SEMANTIC INDEX` writes
+/// `<root>/meetings.transcript.lance`, and tests sharing the default root
+/// race on the same dataset (Lance rejects the second concurrent overwrite).
 async fn separable_context(model: Arc<MockModel>) -> SessionContext {
-    let ctx = semcast_context(model);
+    let root = tempfile::tempdir().unwrap();
+    let ctx = semcast::SemcastContextBuilder::new(model)
+        .with_index_root(root.path())
+        .build();
+    // Leak the tempdir so the Lance dataset outlives this helper.
+    std::mem::forget(root);
     ctx.sql(
         "CREATE TABLE meetings AS
          SELECT * FROM (VALUES
