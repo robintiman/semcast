@@ -16,8 +16,9 @@ use serde_json::{Value, json};
 /// keys: bump it and every cached extraction is honestly invalidated.
 pub const EXTRACT_PROMPT_VERSION: &str = "extract-v1";
 
-/// A named, versioned extraction spec. `version` participates in cache keys:
-/// editing one field's doc line invalidates exactly that field's entries.
+/// A named, versioned extraction spec. `version` identifies the type as a
+/// whole; cache keys use [`unit_hash`] instead, so editing one field's doc
+/// line invalidates exactly that field's unit and leaves its siblings valid.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Hash)]
 pub struct SemanticType {
     pub name: String,
@@ -220,14 +221,16 @@ impl SemanticType {
 
 /// A stable hash of a generation unit's specs (name + type + doc of every
 /// member). Editing one field's doc changes exactly its unit's hash, so the
-/// cache invalidates that unit and leaves sibling units valid.
-pub fn unit_hash(specs: &[&FieldSpec]) -> u64 {
-    use std::hash::{DefaultHasher, Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    for spec in specs {
-        spec.hash(&mut hasher);
-    }
-    hasher.finish()
+/// cache invalidates that unit and leaves sibling units valid. Keys durable
+/// cache entries, so it digests the canonical rendering — the type's
+/// `Display`, which round-trips through the DDL parser — never `Hash`.
+pub fn unit_hash(specs: &[&FieldSpec]) -> u128 {
+    let rendered: Vec<String> = specs
+        .iter()
+        .flat_map(|spec| [spec.name.clone(), spec.ty.to_string(), spec.doc.clone()])
+        .collect();
+    let parts: Vec<&[u8]> = rendered.iter().map(|part| part.as_bytes()).collect();
+    crate::cache::stable_digest(&parts)
 }
 
 impl FieldType {

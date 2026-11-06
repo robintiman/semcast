@@ -467,13 +467,10 @@ impl Ranker {
 /// Full provenance: same query + sent excerpts + model + prompt scheme → same
 /// score, across every query that ever asks again.
 pub(crate) fn relevance_cache_key(query: &str, input: &str, model_id: &ModelId) -> CacheKey {
-    use std::hash::{DefaultHasher, Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    input.hash(&mut hasher);
     CacheKey {
         type_version: query.to_owned(),
         field: "relevance".to_owned(),
-        input_hash: hasher.finish(),
+        input_digest: crate::cache::stable_digest(&[input.as_bytes()]),
         model_id: model_id.clone(),
         prompt_version: RELEVANCE_PROMPT_VERSION.to_owned(),
     }

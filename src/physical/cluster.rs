@@ -420,15 +420,17 @@ impl Grouper {
     /// Provenance: the exact set of documents grouped together, plus the
     /// model and prompt scheme that named them.
     fn cache_key(&self, members: &[usize], hashes: &[u64]) -> CacheKey {
-        use std::hash::{DefaultHasher, Hash, Hasher};
-        let mut hasher = DefaultHasher::new();
         let mut member_hashes: Vec<u64> = members.iter().map(|&point| hashes[point]).collect();
         member_hashes.sort_unstable();
-        member_hashes.hash(&mut hasher);
+        let bytes: Vec<[u8; 8]> = member_hashes
+            .iter()
+            .map(|hash| hash.to_le_bytes())
+            .collect();
+        let parts: Vec<&[u8]> = bytes.iter().map(|b| b.as_slice()).collect();
         CacheKey {
             type_version: "cluster".to_owned(),
             field: "label".to_owned(),
-            input_hash: hasher.finish(),
+            input_digest: crate::cache::stable_digest(&parts),
             model_id: self.model_id.clone(),
             prompt_version: CLUSTER_PROMPT_VERSION.to_owned(),
         }

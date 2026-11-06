@@ -5716,6 +5716,7 @@ name = "semcast"
 version = "0.3.1"
 dependencies = [
  "async-trait",
+ "blake3",
  "clap",
  "datafusion 54.0.0",
  "futures",

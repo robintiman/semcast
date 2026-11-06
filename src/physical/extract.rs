@@ -376,13 +376,10 @@ impl Extractor {
 
     /// Provenance: per-unit type hash + field + input + model + prompt scheme.
     fn cache_key(&self, unit: &[&FieldSpec], field: &str, text: &str) -> CacheKey {
-        use std::hash::{DefaultHasher, Hash, Hasher};
-        let mut hasher = DefaultHasher::new();
-        text.hash(&mut hasher);
         CacheKey {
             type_version: format!("{}@{:x}", self.target.name, unit_hash(unit)),
             field: field.to_owned(),
-            input_hash: hasher.finish(),
+            input_digest: crate::cache::stable_digest(&[text.as_bytes()]),
             model_id: self.model_id.clone(),
             prompt_version: EXTRACT_PROMPT_VERSION.to_owned(),
         }
