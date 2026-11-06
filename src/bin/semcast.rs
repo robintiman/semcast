@@ -58,6 +58,11 @@ struct ServeArgs {
     /// Where semantic indexes are stored; temp dir if unset.
     #[arg(long)]
     index_dir: Option<PathBuf>,
+    /// SQLite file that stores model verdicts across restarts, created if
+    /// missing. A query answered once costs no model calls after the server
+    /// restarts. Verdicts live in memory only if unset.
+    #[arg(long)]
+    store: Option<PathBuf>,
     /// Where batch job state and results are stored; temp dir if unset.
     /// Jobs submitted with `SUBMIT` survive the connection that started
     /// them, and finished jobs stay queryable across restarts.
@@ -133,6 +138,12 @@ async fn main() -> std::io::Result<()> {
     }
     if let Some(dir) = &args.index_dir {
         builder = builder.with_index_root(dir);
+    }
+    if let Some(path) = &args.store {
+        let store = semcast::cache::sqlite::SqliteCache::open(path).map_err(|error| {
+            std::io::Error::other(format!("opening {}: {error}", path.display()))
+        })?;
+        builder = builder.with_cache(Arc::new(store));
     }
     let ctx = Arc::new(builder.build());
 

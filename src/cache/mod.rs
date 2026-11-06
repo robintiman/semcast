@@ -5,6 +5,8 @@
 //! re-running a query is deterministic even though the model isn't — and the
 //! cache doubles as a checkpoint for resumed jobs.
 
+pub mod sqlite;
+
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -57,9 +59,8 @@ pub trait SemanticCache: std::fmt::Debug + Send + Sync {
     fn put(&self, key: CacheKey, value: CachedValue);
 }
 
-/// Process-local cache — enough for tests and single-session use. A
-/// persistent (disk-backed) implementation is what makes the cache compound
-/// across sessions and act as a checkpoint.
+/// Process-local cache — enough for tests and single-session use. For one
+/// that survives restarts, see [`sqlite::SqliteCache`].
 #[derive(Debug, Default)]
 pub struct InMemoryCache {
     entries: Mutex<HashMap<CacheKey, CachedValue>>,
