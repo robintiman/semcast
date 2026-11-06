@@ -246,7 +246,15 @@ fn certified_floor(
     positive: &[f32],
     scores: &SampledScores,
 ) -> Option<f32> {
-    let candidates = candidate_floors(positive, scores);
+    // A failed label can only lower the floor, never raise it: a candidate
+    // above every scored positive keeps none of them, and would certify on
+    // the strength of unindexed positives alone. With no scored positive,
+    // there is no floor to lower, as before.
+    let ceiling = positive.first().copied();
+    let candidates: Vec<f32> = candidate_floors(positive, scores)
+        .into_iter()
+        .filter(|candidate| ceiling.is_some_and(|top| *candidate <= top))
+        .collect();
     if candidates.is_empty() {
         return None;
     }
@@ -467,6 +475,32 @@ mod tests {
             let certified = calibrate_threshold(0.9, Some(0.9), 0.35, &sample);
             assert_eq!(certified.threshold, 0.4, "{certified:?}");
             assert!(certified.meets(0.9));
+        }
+
+        /// A failed label scoring above every positive cannot raise the
+        /// certified floor. Here 400 unindexed positives certify on their own;
+        /// without the cap, the failure's 0.95 would become the floor and prune
+        /// every unsampled document below it.
+        #[test]
+        fn a_failed_label_never_raises_the_certified_floor() {
+            let base = SampledScores {
+                positive_scores: vec![0.5, 0.5],
+                positive_unindexed: 400,
+                sampled: 500,
+                ..Default::default()
+            };
+            let without = calibrate_threshold(0.9, Some(0.95), 0.35, &base);
+            let with = calibrate_threshold(
+                0.9,
+                Some(0.95),
+                0.35,
+                &SampledScores {
+                    unverified_scores: vec![0.95],
+                    ..base.clone()
+                },
+            );
+            assert_eq!(without.threshold, 0.5);
+            assert_eq!(with.threshold, 0.5, "{with:?}");
         }
 
         /// A sample with no known positive and one failed label says nothing
