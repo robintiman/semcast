@@ -6,12 +6,16 @@
 //! full [`CacheKey`], so an entry written by one build is found by the next.
 //!
 //! Operators call the cache from async tasks, row by row, so writes never
-//! touch SQLite on the caller's thread: a `put` lands in an in-memory pending
-//! map, visible to `get` at once, and a dedicated writer thread commits the
-//! backlog in batched transactions. Reads go to SQLite directly — a point
-//! lookup, and in WAL mode a reader never waits for a writer. Dropping the
-//! cache flushes the backlog; a crash loses at most the uncommitted tail,
-//! which costs re-asking the model, never a wrong answer.
+//! touch SQLite on the caller's thread: a `put` lands in an in-memory map of
+//! every verdict this instance has stored, visible to `get` at once, and a
+//! dedicated writer thread persists the backlog in batched transactions. The
+//! map is the instance's memory of what it has returned, so first evaluation
+//! wins regardless of what the disk does: a write that fails leaves the
+//! verdict served from memory, as the in-memory cache would. Reads of
+//! verdicts from earlier runs go to SQLite — a point lookup, and in WAL mode
+//! a reader never waits for a writer. Dropping the cache flushes the backlog;
+//! a crash loses at most the uncommitted tail, which costs re-asking the
+//! model after a restart, never a wrong answer.
 //!
 //! Rows fail, queries don't: a read or write the database refuses is logged
 //! and treated as a miss, never as a query error. The cost of a broken store
@@ -19,8 +23,8 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use rusqlite::{Connection, OptionalExtension, params};
@@ -55,8 +59,10 @@ struct Row {
 #[derive(Debug)]
 pub struct SqliteCache {
     reader: Mutex<Connection>,
-    /// Verdicts handed to the writer and not yet committed.
-    pending: Arc<Mutex<HashMap<RowKey, CachedValue>>>,
+    /// Every verdict this instance has stored, committed or not. Never
+    /// shrinks, like the in-memory cache: it is what makes first evaluation
+    /// win within the instance whatever happens on disk.
+    stored: Mutex<HashMap<RowKey, CachedValue>>,
     /// `None` only while dropping, so the writer sees its channel close.
     rows: Option<Sender<Row>>,
     writer: Option<JoinHandle<()>>,
@@ -136,18 +142,14 @@ impl SqliteCache {
 
         let reader = Connection::open(path).map_err(store_err)?;
         reader.busy_timeout(BUSY_TIMEOUT).map_err(store_err)?;
-        let pending = Arc::new(Mutex::new(HashMap::new()));
         let (rows, received) = mpsc::channel();
-        let writer = {
-            let pending = Arc::clone(&pending);
-            std::thread::Builder::new()
-                .name("semcast-store-writer".to_owned())
-                .spawn(move || write_loop(writer, received, pending))
-                .map_err(|error| SemcastError::Store(error.to_string()))?
-        };
+        let writer = std::thread::Builder::new()
+            .name("semcast-store-writer".to_owned())
+            .spawn(move || write_loop(writer, received))
+            .map_err(|error| SemcastError::Store(error.to_string()))?;
         Ok(Self {
             reader: Mutex::new(reader),
-            pending,
+            stored: Mutex::new(HashMap::new()),
             rows: Some(rows),
             writer: Some(writer),
         })
@@ -181,11 +183,7 @@ impl Drop for SqliteCache {
 
 /// Commit rows as they arrive, as many per transaction as are waiting (up to
 /// [`MAX_BATCH`]), until the cache is dropped.
-fn write_loop(
-    mut connection: Connection,
-    rows: Receiver<Row>,
-    pending: Arc<Mutex<HashMap<RowKey, CachedValue>>>,
-) {
+fn write_loop(mut connection: Connection, rows: Receiver<Row>) {
     while let Ok(first) = rows.recv() {
         let mut batch = vec![first];
         while batch.len() < MAX_BATCH {
@@ -212,21 +210,17 @@ fn write_loop(
                     target: "semcast::store",
                     %error,
                     rows = batch.len(),
-                    "store write failed; these verdicts stay uncached",
+                    "store write failed; these verdicts are kept in memory for this \
+                     process only",
                 );
             }
-        }
-        // Committed (or given up on): reads go to disk from here.
-        let mut pending = pending.lock().expect("store lock poisoned");
-        for row in &batch {
-            pending.remove(&row.key);
         }
     }
 }
 
 /// Commit `batch`, returning the rows whose key already held a different
 /// verdict — written by another instance sharing the file, since this one
-/// never puts a key it holds pending or committed.
+/// puts each key at most once.
 fn write_batch<'a>(
     connection: &mut Connection,
     batch: &'a [Row],
@@ -306,7 +300,7 @@ impl SemanticCache for SqliteCache {
     fn get(&self, key: &CacheKey) -> Option<CachedValue> {
         let row_key = row_key(key);
         if let Some(value) = self
-            .pending
+            .stored
             .lock()
             .expect("store lock poisoned")
             .get(&row_key)
@@ -319,15 +313,14 @@ impl SemanticCache for SqliteCache {
     fn put(&self, key: CacheKey, value: CachedValue) {
         let row_key = row_key(&key);
         {
-            // First evaluation wins, pending or committed. The pending lock
-            // is held across both checks: the writer removes a key from
-            // pending only after committing it, so a key in neither place
-            // is genuinely new, and no committed verdict can be shadowed.
-            let mut pending = self.pending.lock().expect("store lock poisoned");
-            if pending.contains_key(&row_key) || self.committed(&row_key).is_some() {
+            // First evaluation wins: a key this instance has stored keeps its
+            // verdict. No disk read here — a put follows a get that missed,
+            // and the map, not the disk, is what this instance has returned.
+            let mut stored = self.stored.lock().expect("store lock poisoned");
+            if stored.contains_key(&row_key) {
                 return;
             }
-            pending.insert(row_key, value.clone());
+            stored.insert(row_key, value.clone());
         }
         let (is_error, value) = match value {
             CachedValue::Value(value) => (false, value),
@@ -450,8 +443,8 @@ mod tests {
         }
     }
 
-    /// The writer commits a verdict and drops it from the pending map; a
-    /// later put for the same key must still lose to it.
+    /// After the writer commits a verdict, a later put for the same key must
+    /// still lose to it.
     #[test]
     fn first_evaluation_wins_after_it_is_committed() {
         let dir = tempfile::tempdir().unwrap();
@@ -464,10 +457,6 @@ mod tests {
                 "writer never committed"
             );
             std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        // Committed; the pending entry is gone once the writer clears it.
-        while !cache.pending.lock().unwrap().is_empty() {
-            std::thread::sleep(std::time::Duration::from_millis(1));
         }
         cache.put(key("a"), CachedValue::Value("no".to_owned()));
         assert_eq!(
@@ -503,6 +492,27 @@ mod tests {
         let other = [row("no")];
         assert_eq!(write_batch(&mut connection, &other).unwrap().len(), 1);
         let cache = SqliteCache::open(&path).unwrap();
+        assert_eq!(
+            cache.get(&key("a")),
+            Some(CachedValue::Value("yes".to_owned()))
+        );
+    }
+
+    /// A write the database refuses must not make this instance forget a
+    /// verdict it already returned.
+    #[test]
+    fn a_failed_write_keeps_the_verdict_in_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        let cache = SqliteCache::open(&path).unwrap();
+        Connection::open(&path)
+            .unwrap()
+            .execute("DROP TABLE verdicts", [])
+            .unwrap();
+        cache.put(key("a"), CachedValue::Value("yes".to_owned()));
+        // Give the writer time to try, and fail, to commit it.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        cache.put(key("a"), CachedValue::Value("no".to_owned()));
         assert_eq!(
             cache.get(&key("a")),
             Some(CachedValue::Value("yes".to_owned()))
