@@ -49,12 +49,18 @@ use crate::physical::verify::{
     MEANS_PROMPT_VERSION, means_cache_key, parse_verdict, synthesize_means_prompt,
 };
 
+/// A sampled document and its label: `Some(matched)`, or `None` when the
+/// labeling call failed and its truth is unknown.
+type Label = (String, Option<bool>);
+
 /// Where each labeled document sits against the index: scored, never indexed
 /// (passes through at any floor, so it helps recall for free), or indexed but
 /// missing from the scores (lost at any floor — the scan is exhaustive and
-/// reads scores and membership from one snapshot, so it produces none).
+/// reads scores and membership from one snapshot, so it produces none). A
+/// document whose label failed counts as an unverified positive: the worst
+/// case, since the scan cannot vouch for a match it could not check.
 fn score_labels(
-    labels: &[(String, bool)],
+    labels: &[Label],
     per_doc_best: &HashMap<u64, f32>,
     indexed: &HashSet<u64>,
 ) -> SampledScores {
@@ -62,9 +68,14 @@ fn score_labels(
         sampled: labels.len(),
         ..Default::default()
     };
-    for (text, positive) in labels {
-        if !*positive {
-            continue;
+    for (text, label) in labels {
+        match label {
+            None => {
+                scores.positive_unverified += 1;
+                continue;
+            }
+            Some(false) => continue,
+            Some(true) => {}
         }
         let hash = doc_hash(text);
         match per_doc_best.get(&hash) {
@@ -289,6 +300,8 @@ impl ExecutionPlan for IndexScanExec {
                 .counter("calibration_sampled_rows", partition),
             calibration_model_calls: MetricBuilder::new(&self.metrics)
                 .counter("calibration_model_calls", partition),
+            calibration_label_errors: MetricBuilder::new(&self.metrics)
+                .counter("calibration_label_errors", partition),
         });
         let stream: BoxStream<'_, Result<RecordBatch>> = if scanner.calibration.is_some() {
             // Calibration samples the whole input before anything can be
@@ -346,6 +359,7 @@ struct Scanner {
     passthrough_rows: Count,
     calibration_sampled_rows: Count,
     calibration_model_calls: Count,
+    calibration_label_errors: Count,
 }
 
 impl Scanner {
@@ -487,7 +501,7 @@ impl Scanner {
         // sample cannot support is not a bound — and stops at the budget,
         // reporting the shortfall rather than pruning on faith.
         let pool = self.sample_documents(buffered, calibration.label_budget())?;
-        let mut labels: Vec<(String, bool)> = Vec::new();
+        let mut labels: Vec<Label> = Vec::new();
         let mut labelled = 0;
         let mut attempt: Option<(Calibration, HashMap<u64, f32>)> = None;
         while labelled < pool.len() {
@@ -569,12 +583,12 @@ impl Scanner {
     fn calibrate_over_best_proxy(
         &self,
         calibration: &CalibrationConfig,
-        labels: &[(String, bool)],
+        labels: &[Label],
         per_doc_best: &HashMap<u64, f32>,
         indexed: &HashSet<u64>,
         vectors: &HashMap<u64, crate::model::Embedding>,
     ) -> (Calibration, HashMap<u64, f32>) {
-        let calibrate_with = |scores: &HashMap<u64, f32>, labels: &[(String, bool)]| {
+        let calibrate_with = |scores: &HashMap<u64, f32>, labels: &[Label]| {
             calibrate_threshold(
                 calibration.target_recall,
                 calibration.confidence,
@@ -586,7 +600,7 @@ impl Scanner {
         let (training, held_out) = labels.split_at(labels.len() / 2);
         let examples: Vec<(&crate::model::Embedding, bool)> = training
             .iter()
-            .filter_map(|(text, matched)| Some((vectors.get(&doc_hash(text))?, *matched)))
+            .filter_map(|(text, label)| Some((vectors.get(&doc_hash(text))?, (*label)?)))
             .collect();
 
         // Every document the search returned needs a score on the new scale,
@@ -656,13 +670,11 @@ impl Scanner {
     /// full text — the definition of `MEANS`. Byte-identical requests and
     /// cache keys to the no-index verify path, so labels land in the verdict
     /// cache and repeat calibrations draw from it. A document whose call
-    /// fails or answers unparseably drops out of the sample — rows fail,
-    /// queries don't.
-    async fn label_sample(
-        &self,
-        calibration: &CalibrationConfig,
-        sample: &[String],
-    ) -> Vec<(String, bool)> {
+    /// fails or answers unparseably stays in the sample, labelled `None`:
+    /// rows fail, queries don't, but the certificate counts the failure as a
+    /// possible miss rather than pretending the document was never drawn.
+    /// Failures are not cached, so the next calibration retries them.
+    async fn label_sample(&self, calibration: &CalibrationConfig, sample: &[String]) -> Vec<Label> {
         let prompt = synthesize_means_prompt(&self.condition);
         let model_id = calibration.model.id();
         let mut labels = Vec::new();
@@ -675,7 +687,9 @@ impl Scanner {
                 &model_id,
                 MEANS_PROMPT_VERSION,
             )) {
-                Some(CachedValue::Value(verdict)) => labels.push((text.clone(), verdict == "yes")),
+                Some(CachedValue::Value(verdict)) => {
+                    labels.push((text.clone(), Some(verdict == "yes")));
+                }
                 _ => {
                     misses.push(text);
                     requests.push(CompletionRequest {
@@ -692,12 +706,18 @@ impl Scanner {
         let completions = calibration.model.complete(requests).await;
         debug_assert_eq!(completions.len(), misses.len());
         for (text, completion) in misses.into_iter().zip(&completions) {
-            if let Ok(Some(matched)) = completion.as_ref().map(|c| parse_verdict(&c.text)) {
-                calibration.cache.put(
-                    means_cache_key(&self.condition, text, &model_id, MEANS_PROMPT_VERSION),
-                    CachedValue::Value(if matched { "yes" } else { "no" }.to_owned()),
-                );
-                labels.push((text.clone(), matched));
+            match completion.as_ref().map(|c| parse_verdict(&c.text)) {
+                Ok(Some(matched)) => {
+                    calibration.cache.put(
+                        means_cache_key(&self.condition, text, &model_id, MEANS_PROMPT_VERSION),
+                        CachedValue::Value(if matched { "yes" } else { "no" }.to_owned()),
+                    );
+                    labels.push((text.clone(), Some(matched)));
+                }
+                Ok(None) | Err(_) => {
+                    self.calibration_label_errors.add(1);
+                    labels.push((text.clone(), None));
+                }
             }
         }
         labels

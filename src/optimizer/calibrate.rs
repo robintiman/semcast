@@ -77,6 +77,11 @@ pub struct SampledScores {
     /// Positive documents that are indexed but have no score — lost at any
     /// floor. The pre-filter scores every chunk, so it reports none.
     pub positive_lost: usize,
+    /// Documents whose label failed — a model error or an unparseable
+    /// answer. Their truth is unknown, so they count as the worst case: a
+    /// match the scan cannot vouch for. Dropping them from the sample instead
+    /// would bias it toward whatever the model answers reliably.
+    pub positive_unverified: usize,
     /// Total documents labeled, positive and negative.
     pub sampled: usize,
 }
@@ -96,7 +101,10 @@ pub fn calibrate_threshold(
 ) -> Calibration {
     let mut positive = scores.positive_scores.clone();
     positive.sort_by(|a, b| b.total_cmp(a));
-    let total = positive.len() + scores.positive_unindexed + scores.positive_lost;
+    let total = positive.len()
+        + scores.positive_unindexed
+        + scores.positive_lost
+        + scores.positive_unverified;
     if total == 0 {
         // No evidence to raise the floor with — keep the default; recall is
         // vacuously met.
@@ -370,6 +378,30 @@ mod tests {
             );
             assert_eq!(calibration.estimated_recall, 0.25);
             assert!(!calibration.meets(0.9));
+        }
+
+        /// A label the model failed to produce is a possible match the scan
+        /// cannot vouch for. Counted as one, ten good positives and two
+        /// failures cannot reach 90%, so pruning stands down. Dropped from the
+        /// sample instead, the same ten would have claimed full recall.
+        #[test]
+        fn failed_labels_count_against_the_target() {
+            let sample = SampledScores {
+                positive_scores: vec![0.9; 10],
+                positive_unverified: 2,
+                sampled: 20,
+                ..Default::default()
+            };
+            let calibration = calibrate_threshold(0.9, None, 0.35, &sample);
+            assert_eq!(calibration.threshold, f32::NEG_INFINITY);
+            assert_eq!(calibration.estimated_recall, 10.0 / 12.0);
+            assert!(!calibration.meets(0.9));
+
+            let certified = calibrate_threshold(0.8, Some(0.9), 0.35, &sample);
+            assert!(
+                certified.certified_recall.unwrap() < 10.0 / 12.0,
+                "the bound is computed over all 12, failures included",
+            );
         }
 
         #[test]

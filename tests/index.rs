@@ -821,6 +821,83 @@ async fn calibration_buffer_respects_the_memory_limit() {
     );
 }
 
+/// A failed calibration label is a possible miss, not a document that was
+/// never drawn. Here the model fails on 11 of the 40 matches; counted as
+/// misses, they put the recall target out of reach, so the index prunes
+/// nothing and every negative is verified. Dropped from the sample instead,
+/// the remaining 29 matches would all score 1.0 and the floor would prune
+/// every negative on a sample that silently excluded a quarter of the
+/// matches.
+#[tokio::test]
+async fn failed_calibration_labels_count_as_misses() {
+    let model = Arc::new(
+        MockModel::answering_yes_to(["sync"])
+            .embedding_by_theme(["sync"])
+            .failing_on(["sync 1"]),
+    );
+    let ctx = oversubscribed_context(Arc::clone(&model)).await;
+
+    let plan = semcast::sql(
+        &ctx,
+        "SELECT meeting_id FROM meetings WHERE transcript MEANS 'sync' WITH RECALL 0.9",
+    )
+    .await
+    .unwrap()
+    .create_physical_plan()
+    .await
+    .unwrap();
+    let batches = datafusion::physical_plan::collect(Arc::clone(&plan), ctx.task_ctx())
+        .await
+        .unwrap();
+    let mut ids: Vec<i64> = batches
+        .iter()
+        .flat_map(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect();
+    ids.sort_unstable();
+
+    // Verify fails on the same 11 rows (ids 1 and 10-19), which drop out.
+    let expected: Vec<i64> = (1..=MANY_MATCHES)
+        .filter(|id| !id.to_string().starts_with('1'))
+        .collect();
+    assert_eq!(ids, expected);
+
+    let scan = find_node(&plan, "IndexScanExec").expect("the funnel planned a scan");
+    let metrics = scan.metrics().unwrap();
+    assert_eq!(
+        metrics
+            .sum_by_name("calibration_label_errors")
+            .unwrap()
+            .as_usize(),
+        11,
+        "every failed label is reported",
+    );
+    assert_eq!(
+        metrics.sum_by_name("rows_pruned").unwrap().as_usize(),
+        0,
+        "failures put the target out of reach, so the index prunes nothing",
+    );
+}
+
+/// The first node named `name` in `plan`, depth first.
+fn find_node(
+    plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+    name: &str,
+) -> Option<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+    if plan.name() == name {
+        return Some(Arc::clone(plan));
+    }
+    plan.children()
+        .into_iter()
+        .find_map(|child| find_node(child, name))
+}
+
 #[tokio::test]
 async fn builder_index_root_hosts_ddl_created_indexes() {
     let dir = tempfile::tempdir().unwrap();
