@@ -38,7 +38,7 @@ use futures::{StreamExt, TryStreamExt};
 use tokio::sync::OnceCell;
 
 use crate::cache::{CachedValue, SemanticCache};
-use crate::index::{SearchParams, SemanticIndex, doc_hash};
+use crate::index::{FilterScan, SearchParams, SemanticIndex, doc_hash};
 use crate::model::{CompletionRequest, ModelProvider};
 use crate::optimizer::calibrate::{
     CALIBRATION_LABEL_BUDGET, Calibration, SampledScores, calibrate_threshold,
@@ -50,8 +50,8 @@ use crate::physical::verify::{
 
 /// Where each labeled document sits against the index: scored, never indexed
 /// (passes through at any floor, so it helps recall for free), or indexed but
-/// missing from the scores (lost at any floor — the search is exhaustive, so
-/// only an index changing under the query can produce one).
+/// missing from the scores (lost at any floor — the scan is exhaustive and
+/// reads scores and membership from one snapshot, so it produces none).
 fn score_labels(
     labels: &[(String, bool)],
     per_doc_best: &HashMap<u64, f32>,
@@ -373,14 +373,13 @@ impl Scanner {
     async fn prefilter(&self) -> crate::Result<Arc<PrefilterResult>> {
         // The search already applied `score_floor`, so every hit survives it
         // and bucketing needs no second filter.
-        let hits = self
+        let scan = self
             .index
-            .search_all(&self.condition, self.params.score_floor)
+            .filter_scan(&self.condition, self.params.score_floor)
             .await?;
-        let indexed = self.index.indexed_doc_hashes().await?;
         Ok(Arc::new(PrefilterResult {
-            chunks: bucket_chunks(hits, self.params.chunks_per_doc),
-            indexed,
+            chunks: bucket_chunks(scan.hits, self.params.chunks_per_doc),
+            indexed: scan.indexed,
         }))
     }
 
@@ -439,11 +438,10 @@ impl Scanner {
             .calibration
             .as_ref()
             .expect("calibrated path requires a config");
-        let hits = self
+        let FilterScan { hits, indexed } = self
             .index
-            .search_all(&self.condition, f32::NEG_INFINITY)
+            .filter_scan(&self.condition, f32::NEG_INFINITY)
             .await?;
-        let indexed = self.index.indexed_doc_hashes().await?;
 
         // Best chunk score per document — hits arrive best-first.
         let mut per_doc_best: HashMap<u64, f32> = HashMap::new();

@@ -618,6 +618,26 @@ async fn oversubscribed_context(model: Arc<MockModel>) -> SessionContext {
 }
 
 #[tokio::test]
+async fn filter_scan_scores_every_document_it_lists() {
+    let model = Arc::new(MockModel::answering_yes_to(["sync"]).embedding_by_theme(["sync"]));
+    let ctx = oversubscribed_context(model).await;
+    let runtime = ctx
+        .state()
+        .config()
+        .get_extension::<semcast::index::registry::SemcastRuntime>()
+        .unwrap();
+    let index = runtime.index_for("meetings", "transcript").unwrap();
+
+    // Far more chunks than the index's fetch_k of 16, and no floor: one
+    // consistent read must score every document it calls indexed, or the
+    // pre-filter would prune the unscored ones.
+    let scan = index.filter_scan("sync", f32::NEG_INFINITY).await.unwrap();
+    let scored: std::collections::HashSet<u64> = scan.hits.iter().map(|h| h.doc_hash).collect();
+    assert_eq!(scan.indexed.len(), (MANY_MATCHES + MANY_NEGATIVES) as usize);
+    assert_eq!(scored, scan.indexed);
+}
+
+#[tokio::test]
 async fn index_returns_every_match_beyond_fetch_k() {
     let model = Arc::new(MockModel::answering_yes_to(["sync"]).embedding_by_theme(["sync"]));
     let ctx = oversubscribed_context(Arc::clone(&model)).await;

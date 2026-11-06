@@ -23,7 +23,7 @@ use crate::model::{Embedding, ModelId, ModelProvider};
 use crate::{Result, SemcastError};
 
 use super::chunk::{ChunkConfig, chunk_text};
-use super::{ChunkHit, SearchParams, SemanticIndex, doc_hash};
+use super::{ChunkHit, FilterScan, SearchParams, SemanticIndex, doc_hash};
 
 const META_EMBED_MODEL: &str = "semcast.embed_model";
 const META_EMBED_DIM: &str = "semcast.embed_dim";
@@ -167,6 +167,84 @@ impl LanceIndex {
     }
 }
 
+impl LanceIndex {
+    /// Embed a query, checking it lands in the index's vector space.
+    async fn embed_query(&self, query: &str) -> Result<Vec<f32>> {
+        let mut embedded = self.embedder.embed(vec![query.to_owned()]).await?;
+        embedded
+            .pop()
+            .filter(|v| v.len() == self.dim)
+            .ok_or_else(|| {
+                SemcastError::Index(format!(
+                    "embedder {} did not return a {}-dimensional query vector",
+                    self.embedder.id().0,
+                    self.dim
+                ))
+            })
+    }
+}
+
+/// The `k` chunks nearest `query_vector` in `dataset` scoring at least
+/// `score_floor`, best first.
+async fn nearest_hits(
+    dataset: &Dataset,
+    query_vector: Vec<f32>,
+    k: usize,
+    score_floor: f32,
+) -> Result<Vec<ChunkHit>> {
+    let mut scan = dataset.scan();
+    scan.project(&["doc_hash", "chunk_index", "text"])
+        .map_err(lance_err)?;
+    scan.nearest("vector", &Float32Array::from(query_vector), k)
+        .map_err(lance_err)?;
+    scan.distance_metric(MetricType::Cosine);
+    let batches: Vec<RecordBatch> = scan
+        .try_into_stream()
+        .await
+        .map_err(lance_err)?
+        .try_collect()
+        .await
+        .map_err(lance_err)?;
+    let mut hits = Vec::new();
+    for batch in &batches {
+        let hashes = column::<UInt64Array>(batch, "doc_hash")?;
+        let chunk_indexes = column::<UInt32Array>(batch, "chunk_index")?;
+        let texts = column::<StringArray>(batch, "text")?;
+        let distances = column::<Float32Array>(batch, "_distance")?;
+        for i in 0..batch.num_rows() {
+            let score = 1.0 - distances.value(i);
+            if score >= score_floor {
+                hits.push(ChunkHit {
+                    doc_hash: hashes.value(i),
+                    chunk_index: chunk_indexes.value(i) as usize,
+                    score,
+                    text: texts.value(i).to_owned(),
+                });
+            }
+        }
+    }
+    Ok(hits)
+}
+
+/// Every document `dataset` holds a chunk of.
+async fn doc_hashes(dataset: &Dataset) -> Result<HashSet<u64>> {
+    let mut scan = dataset.scan();
+    scan.project(&["doc_hash"]).map_err(lance_err)?;
+    let batches: Vec<RecordBatch> = scan
+        .try_into_stream()
+        .await
+        .map_err(lance_err)?
+        .try_collect()
+        .await
+        .map_err(lance_err)?;
+    let mut hashes = HashSet::new();
+    for batch in &batches {
+        let column = column::<UInt64Array>(batch, "doc_hash")?;
+        hashes.extend(column.iter().flatten());
+    }
+    Ok(hashes)
+}
+
 #[async_trait]
 impl SemanticIndex for LanceIndex {
     fn embed_model_id(&self) -> ModelId {
@@ -204,84 +282,31 @@ impl SemanticIndex for LanceIndex {
 
     async fn indexed_doc_hashes(&self) -> Result<HashSet<u64>> {
         let dataset = self.dataset.lock().await.clone();
-        let mut scan = dataset.scan();
-        scan.project(&["doc_hash"]).map_err(lance_err)?;
-        let batches: Vec<RecordBatch> = scan
-            .try_into_stream()
-            .await
-            .map_err(lance_err)?
-            .try_collect()
-            .await
-            .map_err(lance_err)?;
-        let mut hashes = HashSet::new();
-        for batch in &batches {
-            let column = column::<UInt64Array>(batch, "doc_hash")?;
-            hashes.extend(column.iter().flatten());
-        }
-        Ok(hashes)
+        doc_hashes(&dataset).await
     }
 
     /// A flat scan with `k` = every chunk: exact, and no dearer than the
     /// top-k search, which without an ANN index scans every vector anyway.
-    async fn search_all(&self, query: &str, score_floor: f32) -> Result<Vec<ChunkHit>> {
+    /// The count, the scan and the membership set all read one snapshot, so
+    /// a refresh landing mid-query can neither push a chunk past `k` nor
+    /// list a document as indexed that the scan never scored.
+    async fn filter_scan(&self, query: &str, score_floor: f32) -> Result<FilterScan> {
+        let query_vector = self.embed_query(query).await?;
         let dataset = self.dataset.lock().await.clone();
         let chunks = dataset.count_rows(None).await.map_err(lance_err)?;
-        if chunks == 0 {
-            return Ok(Vec::new());
-        }
-        let params = SearchParams {
-            fetch_k: chunks,
-            score_floor,
-            ..self.params
+        let hits = if chunks == 0 {
+            Vec::new()
+        } else {
+            nearest_hits(&dataset, query_vector, chunks, score_floor).await?
         };
-        self.search(query, &params).await
+        let indexed = doc_hashes(&dataset).await?;
+        Ok(FilterScan { hits, indexed })
     }
 
     async fn search(&self, query: &str, params: &SearchParams) -> Result<Vec<ChunkHit>> {
-        let mut embedded = self.embedder.embed(vec![query.to_owned()]).await?;
-        let query_vector = embedded
-            .pop()
-            .filter(|v| v.len() == self.dim)
-            .ok_or_else(|| {
-                SemcastError::Index(format!(
-                    "embedder {} did not return a {}-dimensional query vector",
-                    self.embedder.id().0,
-                    self.dim
-                ))
-            })?;
+        let query_vector = self.embed_query(query).await?;
         let dataset = self.dataset.lock().await.clone();
-        let mut scan = dataset.scan();
-        scan.project(&["doc_hash", "chunk_index", "text"])
-            .map_err(lance_err)?;
-        scan.nearest("vector", &Float32Array::from(query_vector), params.fetch_k)
-            .map_err(lance_err)?;
-        scan.distance_metric(MetricType::Cosine);
-        let batches: Vec<RecordBatch> = scan
-            .try_into_stream()
-            .await
-            .map_err(lance_err)?
-            .try_collect()
-            .await
-            .map_err(lance_err)?;
-        let mut hits = Vec::new();
-        for batch in &batches {
-            let hashes = column::<UInt64Array>(batch, "doc_hash")?;
-            let chunk_indexes = column::<UInt32Array>(batch, "chunk_index")?;
-            let texts = column::<StringArray>(batch, "text")?;
-            let distances = column::<Float32Array>(batch, "_distance")?;
-            for i in 0..batch.num_rows() {
-                let score = 1.0 - distances.value(i);
-                if score >= params.score_floor {
-                    hits.push(ChunkHit {
-                        doc_hash: hashes.value(i),
-                        chunk_index: chunk_indexes.value(i) as usize,
-                        score,
-                        text: texts.value(i).to_owned(),
-                    });
-                }
-            }
-        }
-        Ok(hits)
+        nearest_hits(&dataset, query_vector, params.fetch_k, params.score_floor).await
     }
 
     /// Scan every chunk vector and average them per document.
