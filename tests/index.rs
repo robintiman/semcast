@@ -565,6 +565,120 @@ async fn calibrated_plan_explains_the_contract_not_a_number() {
     assert!(!display.contains("best-effort"), "plan:\n{display}");
 }
 
+// ---------------------------------------------------------------------------
+// The index changes cost, never the answer: a corpus with more matching
+// chunks than one search's `fetch_k` must still return every match. Before
+// the pre-filter scored every chunk, it kept the global top `fetch_k` and
+// pruned every other indexed document — a silent row drop that grew with
+// the corpus and was invisible on small eval sets.
+// ---------------------------------------------------------------------------
+
+const MANY_MATCHES: i64 = 40;
+const MANY_NEGATIVES: i64 = 20;
+
+/// `MANY_MATCHES` "sync N" transcripts plus `MANY_NEGATIVES` digit-only
+/// ones, indexed with a `fetch_k` far smaller than the number of matches.
+/// Embeds by theme, so every match scores 1.0 against 'sync' and every
+/// negative 0.0 — the index separates them perfectly, and any match lost is
+/// the cap's doing, not the embedding's.
+async fn oversubscribed_context(model: Arc<MockModel>) -> SessionContext {
+    let ctx = semcast_context(model);
+    let rows: Vec<String> = (1..=MANY_MATCHES)
+        .map(|id| format!("({id}, 'sync {id}')"))
+        .chain((1..=MANY_NEGATIVES).map(|n| format!("({}, '{:04}')", MANY_MATCHES + n, n * 7)))
+        .collect();
+    ctx.sql(&format!(
+        "CREATE TABLE meetings AS
+         SELECT * FROM (VALUES {}) AS t(meeting_id, transcript)",
+        rows.join(", "),
+    ))
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    create_semantic_index(
+        &ctx,
+        "meetings",
+        "transcript",
+        IndexOptions {
+            path: Some(dir.path().join("idx.lance")),
+            search: SearchParams {
+                fetch_k: 16,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    std::mem::forget(dir);
+    ctx
+}
+
+#[tokio::test]
+async fn index_returns_every_match_beyond_fetch_k() {
+    let model = Arc::new(MockModel::answering_yes_to(["sync"]).embedding_by_theme(["sync"]));
+    let ctx = oversubscribed_context(Arc::clone(&model)).await;
+
+    let ids = matching_ids(
+        &ctx,
+        "SELECT meeting_id FROM meetings WHERE transcript MEANS 'sync'",
+    )
+    .await;
+    assert_eq!(ids, (1..=MANY_MATCHES).collect::<Vec<_>>());
+    assert_eq!(
+        model.completion_calls(),
+        MANY_MATCHES as usize,
+        "every match verified, every negative still pruned by the index",
+    );
+}
+
+#[tokio::test]
+async fn calibrated_index_returns_matches_beyond_fetch_k() {
+    let model = Arc::new(MockModel::answering_yes_to(["sync"]).embedding_by_theme(["sync"]));
+    let ctx = oversubscribed_context(Arc::clone(&model)).await;
+
+    let ids = matching_ids(
+        &ctx,
+        "SELECT meeting_id FROM meetings WHERE transcript MEANS 'sync' WITH RECALL 0.95",
+    )
+    .await;
+    let floor = (0.95 * MANY_MATCHES as f64).ceil() as usize;
+    assert!(
+        ids.len() >= floor,
+        "recall 0.95 of {MANY_MATCHES} matches keeps at least {floor}, got {}",
+        ids.len(),
+    );
+}
+
+#[tokio::test]
+async fn uncertifiable_recall_target_prunes_nothing() {
+    let model = Arc::new(MockModel::answering_yes_to(["sync"]).embedding_by_theme(["sync"]));
+    let ctx = oversubscribed_context(Arc::clone(&model)).await;
+
+    // 40 positives cannot certify 99.9% recall at 99% confidence. Pruning on
+    // an uncertified floor would drop unsampled matches below it, so the
+    // pre-filter stands down: every row reaches verify, negatives included.
+    let ids = matching_ids(
+        &ctx,
+        "SELECT meeting_id FROM meetings WHERE transcript MEANS 'sync' \
+         WITH RECALL 0.999 WITH CONFIDENCE 0.99",
+    )
+    .await;
+    assert_eq!(ids, (1..=MANY_MATCHES).collect::<Vec<_>>());
+    let verified_negatives = model
+        .completion_inputs()
+        .iter()
+        .filter(|input| !input.contains("sync"))
+        .count();
+    assert_eq!(
+        verified_negatives, MANY_NEGATIVES as usize,
+        "no floor: each negative is verified rather than pruned",
+    );
+}
+
 #[tokio::test]
 async fn builder_index_root_hosts_ddl_created_indexes() {
     let dir = tempfile::tempdir().unwrap();
