@@ -16,8 +16,9 @@ use serde_json::{Value, json};
 /// keys: bump it and every cached extraction is honestly invalidated.
 pub const EXTRACT_PROMPT_VERSION: &str = "extract-v1";
 
-/// A named, versioned extraction spec. `version` participates in cache keys:
-/// editing one field's doc line invalidates exactly that field's entries.
+/// A named, versioned extraction spec. `version` identifies the type as a
+/// whole; cache keys use [`unit_hash`] instead, so editing one field's doc
+/// line invalidates exactly that field's unit and leaves its siblings valid.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Hash)]
 pub struct SemanticType {
     pub name: String,
