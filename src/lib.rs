@@ -178,6 +178,7 @@ pub struct SemcastContextBuilder {
     cache: Arc<dyn SemanticCache>,
     index_root: Option<std::path::PathBuf>,
     information_schema: bool,
+    memory_limit: Option<usize>,
 }
 
 impl SemcastContextBuilder {
@@ -189,6 +190,7 @@ impl SemcastContextBuilder {
             cache: Arc::new(InMemoryCache::default()),
             index_root: None,
             information_schema: false,
+            memory_limit: None,
         }
     }
 
@@ -231,6 +233,15 @@ impl SemcastContextBuilder {
         self
     }
 
+    /// Cap the memory operators may reserve, in bytes. Operators that buffer
+    /// (a sort, a `WITH RECALL` scan sampling its whole input) fail a query
+    /// that would exceed it with a resources-exhausted error, rather than
+    /// exhausting the process. Unbounded by default.
+    pub fn with_memory_limit(mut self, bytes: usize) -> Self {
+        self.memory_limit = Some(bytes);
+        self
+    }
+
     pub fn build(self) -> SessionContext {
         // One type registry, shared between the runtime (DDL dispatch) and the
         // marker UDFs (which resolve type fields at plan time).
@@ -261,9 +272,17 @@ impl SemcastContextBuilder {
         let config = SessionConfig::new()
             .with_extension(Arc::clone(&runtime))
             .with_information_schema(self.information_schema);
-        let state = SessionStateBuilder::new()
+        let mut state = SessionStateBuilder::new()
             .with_default_features()
-            .with_config(config)
+            .with_config(config);
+        if let Some(bytes) = self.memory_limit {
+            let runtime_env = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
+                .with_memory_limit(bytes, 1.0)
+                .build_arc()
+                .expect("a memory-limited runtime env always builds");
+            state = state.with_runtime_env(runtime_env);
+        }
+        let state = state
             .with_optimizer_rule(Arc::new(MeansRewriteRule::new(Arc::clone(&runtime))))
             .with_optimizer_rule(Arc::new(
                 crate::optimizer::extract::ExtractRewriteRule::new(Arc::clone(&types)),

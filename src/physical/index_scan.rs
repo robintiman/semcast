@@ -23,6 +23,7 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::Statistics;
 use datafusion::error::Result;
 use datafusion::execution::TaskContext;
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion::physical_expr::{Distribution, EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::{
@@ -272,7 +273,7 @@ impl ExecutionPlan for IndexScanExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let input = self.input.execute(partition, context)?;
+        let input = self.input.execute(partition, Arc::clone(&context))?;
         let scanner = Arc::new(Scanner {
             text: Arc::clone(&self.text),
             condition: self.condition.clone(),
@@ -290,10 +291,13 @@ impl ExecutionPlan for IndexScanExec {
                 .counter("calibration_model_calls", partition),
         });
         let stream: BoxStream<'_, Result<RecordBatch>> = if scanner.calibration.is_some() {
-            // Calibration needs sample rows before anything can be filtered:
-            // buffer up to sample_size rows, calibrate once, then run the
-            // buffered rows and the rest of the input through the filter.
-            futures::stream::once(scanner.calibrate_then_scan(input))
+            // Calibration samples the whole input before anything can be
+            // filtered: buffer it all, calibrate once, then filter the buffer.
+            // The buffer is charged to the session's memory pool, so a query
+            // too large for it fails cleanly instead of exhausting the process.
+            let reservation = MemoryConsumer::new(format!("IndexScanExec[{partition}]"))
+                .register(context.memory_pool());
+            futures::stream::once(scanner.calibrate_then_scan(input, reservation))
                 .try_flatten()
                 .boxed()
         } else {
@@ -416,11 +420,20 @@ impl Scanner {
     /// `required_input_distribution`), so the sample is drawn from every row
     /// the predicate will judge — a sample from the head of the stream would
     /// see only one end of any input sorted by something the score tracks.
+    ///
+    /// Every buffered batch is charged to `reservation` before it is kept;
+    /// the reservation lives as long as the output stream, which still holds
+    /// the buffer.
     async fn calibrate_then_scan(
         self: Arc<Self>,
-        input: SendableRecordBatchStream,
+        mut input: SendableRecordBatchStream,
+        reservation: MemoryReservation,
     ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
-        let buffered: Vec<RecordBatch> = input.try_collect().await?;
+        let mut buffered: Vec<RecordBatch> = Vec::new();
+        while let Some(batch) = input.try_next().await? {
+            reservation.try_grow(batch.get_array_memory_size())?;
+            buffered.push(batch);
+        }
         let result = self
             .evidence
             .cell
@@ -433,6 +446,8 @@ impl Scanner {
             .and_then(move |batch| {
                 let scanner = Arc::clone(&scanner);
                 let result = Arc::clone(&result);
+                // Moved in so the charge is released only when the stream is.
+                let _reservation = &reservation;
                 async move { scanner.scan_batch(&result, batch) }
             })
             .boxed())
@@ -601,37 +616,40 @@ impl Scanner {
     /// batches, at most `sample_size`, in draw order: the documents with the
     /// smallest [`sample_priority`]. Any prefix is itself a uniform sample,
     /// which is what lets certification label it a tranche at a time.
+    ///
+    /// Only hashes and row positions are kept while drawing; text is copied
+    /// for the drawn documents alone, so the sample costs memory in its own
+    /// size, not the input's.
     fn sample_documents(
         &self,
         buffered: &[RecordBatch],
         sample_size: usize,
     ) -> Result<Vec<String>> {
-        let mut documents: HashMap<u64, String> = HashMap::new();
-        for batch in buffered {
-            if batch.num_rows() == 0 {
-                continue;
-            }
-            let texts = self.evaluate_texts(batch)?;
-            let texts = texts
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .expect("array was just cast to Utf8");
-            for row in 0..texts.len() {
-                if texts.is_valid(row) {
-                    let text = texts.value(row);
-                    documents
-                        .entry(doc_hash(text))
-                        .or_insert_with(|| text.to_owned());
+        let texts: Vec<Arc<dyn Array>> = buffered
+            .iter()
+            .map(|batch| self.evaluate_texts(batch))
+            .collect::<Result<_>>()?;
+        let mut first_seen: HashMap<u64, (usize, usize)> = HashMap::new();
+        for (batch, array) in texts.iter().enumerate() {
+            let array = as_strings(array);
+            for row in 0..array.len() {
+                if array.is_valid(row) {
+                    first_seen
+                        .entry(doc_hash(array.value(row)))
+                        .or_insert((batch, row));
                 }
             }
         }
-        let mut drawn: Vec<(u64, String)> = documents
+        let mut drawn: Vec<(u64, (usize, usize))> = first_seen
             .into_iter()
-            .map(|(hash, text)| (sample_priority(hash), text))
+            .map(|(hash, position)| (sample_priority(hash), position))
             .collect();
         drawn.sort_unstable_by_key(|(priority, _)| *priority);
         drawn.truncate(sample_size);
-        Ok(drawn.into_iter().map(|(_, text)| text).collect())
+        Ok(drawn
+            .into_iter()
+            .map(|(_, (batch, row))| as_strings(&texts[batch]).value(row).to_owned())
+            .collect())
     }
 
     /// Ground-truth labels for the sample: the model reads each document's
@@ -684,6 +702,14 @@ impl Scanner {
         }
         labels
     }
+}
+
+/// The Utf8 view of an array [`Scanner::evaluate_texts`] produced.
+fn as_strings(array: &Arc<dyn Array>) -> &StringArray {
+    array
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("array was cast to Utf8")
 }
 
 /// Bucket search hits into per-document evidence: chunks scoring at least

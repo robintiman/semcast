@@ -764,6 +764,63 @@ async fn calibration_samples_the_whole_input_not_its_head() {
     assert!(hard_kept > 0, "hard matches must not all be pruned");
 }
 
+/// A calibrated scan buffers its whole input to sample it. That buffer is
+/// charged to the session's memory pool: over the limit, the query fails
+/// with a clear error instead of exhausting the process. The same query
+/// without `WITH RECALL` streams and still succeeds.
+#[tokio::test]
+async fn calibration_buffer_respects_the_memory_limit() {
+    let model = Arc::new(MockModel::answering_yes_to(["sync"]));
+    let ctx = semcast::SemcastContextBuilder::new(model)
+        .with_memory_limit(16 * 1024)
+        .build();
+    let padding = "x".repeat(1000);
+    let rows: Vec<String> = (1..=100)
+        .map(|id| format!("({id}, 'sync {id} {padding}')"))
+        .collect();
+    ctx.sql(&format!(
+        "CREATE TABLE meetings AS
+         SELECT * FROM (VALUES {}) AS t(meeting_id, transcript)",
+        rows.join(", "),
+    ))
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    create_semantic_index(&ctx, "meetings", "transcript", index_options(&dir))
+        .await
+        .unwrap();
+
+    let streaming = semcast::sql(
+        &ctx,
+        "SELECT meeting_id FROM meetings WHERE transcript MEANS 'sync'",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await;
+    assert!(
+        streaming.is_ok(),
+        "uncalibrated scan streams: {streaming:?}"
+    );
+
+    let error = semcast::sql(
+        &ctx,
+        "SELECT meeting_id FROM meetings WHERE transcript MEANS 'sync' WITH RECALL 0.9",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .expect_err("100 KB of input cannot fit a 16 KB pool");
+    assert!(
+        error.to_string().contains("Resources exhausted"),
+        "error: {error}",
+    );
+}
+
 #[tokio::test]
 async fn builder_index_root_hosts_ddl_created_indexes() {
     let dir = tempfile::tempdir().unwrap();
