@@ -95,8 +95,9 @@ pub struct SampledScores {
 ///
 /// `confidence` picks the reading: `None` estimates, `Some(c)` certifies at
 /// `c`. The sample is the authority either way: no clamping toward
-/// `default_floor`, which is only the fallback when the sample says nothing
-/// (no positives at all, or none the floor can affect).
+/// `default_floor`, which is only the fallback when the sample has no known
+/// positive to set a floor by — lowered, if failed labels sit below it, until
+/// it keeps them.
 pub fn calibrate_threshold(
     target_recall: f64,
     confidence: Option<f64>,
@@ -118,26 +119,32 @@ pub fn calibrate_threshold(
     }
 
     let recall_at = |floor: f32| recall_at(floor, &positive, scores);
-    let threshold = match confidence {
-        None => {
-            // The floor the known labels support, lowered past failed labels
-            // until the worst case for them still meets the target.
-            let floor =
-                point_estimate_floor(target_recall, default_floor, &positive, scores, known);
-            let (kept, total) = recall_at(floor);
-            if meets_target(kept, total, target_recall) {
-                floor
-            } else {
-                candidate_floors(&positive, scores)
-                    .into_iter()
-                    .filter(|candidate| *candidate < floor)
-                    .find(|candidate| {
-                        let (kept, total) = recall_at(*candidate);
-                        meets_target(kept, total, target_recall)
-                    })
-                    .unwrap_or(f32::NEG_INFINITY)
-            }
+    // The floor the known labels support, lowered past failed labels until
+    // the worst case for them still meets the target.
+    let estimated_floor = || {
+        let floor = point_estimate_floor(target_recall, default_floor, &positive, scores, known);
+        let (kept, total) = recall_at(floor);
+        if meets_target(kept, total, target_recall) {
+            floor
+        } else {
+            candidate_floors(&positive, scores)
+                .into_iter()
+                .filter(|candidate| *candidate < floor)
+                .find(|candidate| {
+                    let (kept, total) = recall_at(*candidate);
+                    meets_target(kept, total, target_recall)
+                })
+                .unwrap_or(f32::NEG_INFINITY)
         }
+    };
+    let threshold = match confidence {
+        None => estimated_floor(),
+        // No known positive, only failed labels: nothing to certify against,
+        // so take the estimate's floor, which keeps every failure and is
+        // vacuously exact. Searching the failures' scores for a certified
+        // floor would find none (each keeps zero of zero or loses one) and
+        // turn pruning off over a single failed call.
+        Some(_) if known == 0 => estimated_floor(),
         Some(confidence) => {
             // Nothing certifies: prune nothing. A floor at the lowest sampled
             // positive would still drop every unsampled match below it, on a
@@ -448,8 +455,42 @@ mod tests {
             assert_eq!(calibration.threshold, 0.4);
             assert_eq!(calibration.estimated_recall, 1.0);
 
-            let certified = calibrate_threshold(0.8, Some(0.9), 0.35, &sample);
-            assert!(certified.threshold <= 0.4, "{certified:?}");
+            // Certified: 30 positives at 0.9 and two failures at 0.4. At a 0.9
+            // floor the failures are lost and 30/32 does not certify 0.9; at
+            // 0.4 they are kept and 30/30 does.
+            let sample = SampledScores {
+                positive_scores: vec![0.9; 30],
+                unverified_scores: vec![0.4, 0.4],
+                sampled: 40,
+                ..Default::default()
+            };
+            let certified = calibrate_threshold(0.9, Some(0.9), 0.35, &sample);
+            assert_eq!(certified.threshold, 0.4, "{certified:?}");
+            assert!(certified.meets(0.9));
+        }
+
+        /// A sample with no known positive and one failed label says nothing
+        /// to certify against. Both readings keep the default floor, lowered
+        /// only if the failure sits below it, rather than turning pruning off
+        /// over one failed call.
+        #[test]
+        fn a_lone_failed_label_does_not_turn_pruning_off() {
+            for failed_score in [0.8_f32, 0.2] {
+                let sample = SampledScores {
+                    unverified_scores: vec![failed_score],
+                    sampled: 64,
+                    ..Default::default()
+                };
+                let expected = failed_score.min(0.35);
+                for confidence in [None, Some(0.9)] {
+                    let calibration = calibrate_threshold(0.9, confidence, 0.35, &sample);
+                    assert_eq!(
+                        calibration.threshold, expected,
+                        "failed score {failed_score}, confidence {confidence:?}",
+                    );
+                    assert!(calibration.meets(0.9));
+                }
+            }
         }
 
         /// A failed label the floor keeps anyway is no miss: at worst it is a
