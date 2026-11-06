@@ -63,8 +63,15 @@ pub struct SqliteCache {
 }
 
 impl SqliteCache {
-    /// Open (or create) the store at `path`. Safe to call from several
-    /// processes or contexts on the same file at once.
+    /// Open (or create) the store at `path`. Several processes or contexts
+    /// may open the same file at once, and all of them read and write it.
+    ///
+    /// "First evaluation wins" holds within one `SqliteCache`. Two instances
+    /// sharing a file that ask the model about the same input at the same
+    /// moment can each return their own answer; the file keeps whichever
+    /// commits first, and the other instance logs the disagreement. Making
+    /// them agree would mean claiming each key on disk before asking the
+    /// model — a blocking write on every miss.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let mut writer = Connection::open(path).map_err(store_err)?;
@@ -187,13 +194,27 @@ fn write_loop(
                 Err(_) => break,
             }
         }
-        if let Err(error) = write_batch(&mut connection, &batch) {
-            tracing::warn!(
-                target: "semcast::store",
-                %error,
-                rows = batch.len(),
-                "store write failed; these verdicts stay uncached",
-            );
+        match write_batch(&mut connection, &batch) {
+            Ok(conflicts) => {
+                for row in conflicts {
+                    tracing::warn!(
+                        target: "semcast::store",
+                        condition = %row.type_version,
+                        field = %row.field,
+                        model = %row.model_id,
+                        "another process stored a different verdict for this input first; \
+                         this process returned its own, later reads return the stored one",
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "semcast::store",
+                    %error,
+                    rows = batch.len(),
+                    "store write failed; these verdicts stay uncached",
+                );
+            }
         }
         // Committed (or given up on): reads go to disk from here.
         let mut pending = pending.lock().expect("store lock poisoned");
@@ -203,7 +224,14 @@ fn write_loop(
     }
 }
 
-fn write_batch(connection: &mut Connection, batch: &[Row]) -> rusqlite::Result<()> {
+/// Commit `batch`, returning the rows whose key already held a different
+/// verdict — written by another instance sharing the file, since this one
+/// never puts a key it holds pending or committed.
+fn write_batch<'a>(
+    connection: &mut Connection,
+    batch: &'a [Row],
+) -> rusqlite::Result<Vec<&'a Row>> {
+    let mut conflicts = Vec::new();
     let transaction = connection.transaction()?;
     {
         // First evaluation wins, as in memory: a re-run never overwrites the
@@ -213,8 +241,10 @@ fn write_batch(connection: &mut Connection, batch: &[Row]) -> rusqlite::Result<(
                  (key, type_version, field, model_id, prompt_version, is_error, value)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )?;
+        let mut stored =
+            transaction.prepare_cached("SELECT is_error, value FROM verdicts WHERE key = ?1")?;
         for row in batch {
-            insert.execute(params![
+            let inserted = insert.execute(params![
                 row.key,
                 row.type_version,
                 row.field,
@@ -223,9 +253,17 @@ fn write_batch(connection: &mut Connection, batch: &[Row]) -> rusqlite::Result<(
                 row.is_error,
                 row.value,
             ])?;
+            if inserted == 0 {
+                let (is_error, value): (bool, String) =
+                    stored.query_row(params![row.key], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                if is_error != row.is_error || value != row.value {
+                    conflicts.push(row);
+                }
+            }
         }
     }
-    transaction.commit()
+    transaction.commit()?;
+    Ok(conflicts)
 }
 
 /// The row key: a digest of every field of the [`CacheKey`], so two keys
@@ -432,6 +470,39 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         cache.put(key("a"), CachedValue::Value("no".to_owned()));
+        assert_eq!(
+            cache.get(&key("a")),
+            Some(CachedValue::Value("yes".to_owned()))
+        );
+    }
+
+    /// Two instances on one file: the first commit wins on disk, and the
+    /// instance that lost reports the disagreement rather than hiding it.
+    #[test]
+    fn a_conflicting_commit_from_another_instance_is_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        let mut connection = Connection::open(&path).unwrap();
+        drop(SqliteCache::open(&path).unwrap());
+        let row = |value: &str| Row {
+            key: row_key(&key("a")),
+            type_version: "the customer is angry".to_owned(),
+            field: "means".to_owned(),
+            model_id: "mock".to_owned(),
+            prompt_version: "means-v2".to_owned(),
+            is_error: false,
+            value: value.to_owned(),
+        };
+        let first = [row("yes")];
+        assert!(write_batch(&mut connection, &first).unwrap().is_empty());
+        let same = [row("yes")];
+        assert!(
+            write_batch(&mut connection, &same).unwrap().is_empty(),
+            "agreeing is fine"
+        );
+        let other = [row("no")];
+        assert_eq!(write_batch(&mut connection, &other).unwrap().len(), 1);
+        let cache = SqliteCache::open(&path).unwrap();
         assert_eq!(
             cache.get(&key("a")),
             Some(CachedValue::Value("yes".to_owned()))
