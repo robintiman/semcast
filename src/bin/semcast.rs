@@ -139,11 +139,16 @@ async fn main() -> std::io::Result<()> {
     if let Some(dir) = &args.index_dir {
         builder = builder.with_index_root(dir);
     }
+    // Kept beside the context so shutdown can flush it: connections hold the
+    // session, so the cache is never dropped while the server runs.
+    let mut store = None;
     if let Some(path) = &args.store {
-        let store = semcast::cache::sqlite::SqliteCache::open(path).map_err(|error| {
+        let opened = semcast::cache::sqlite::SqliteCache::open(path).map_err(|error| {
             std::io::Error::other(format!("opening {}: {error}", path.display()))
         })?;
-        builder = builder.with_cache(Arc::new(store));
+        let opened = Arc::new(opened);
+        builder = builder.with_cache(Arc::clone(&opened) as Arc<dyn semcast::cache::SemanticCache>);
+        store = Some(opened);
     }
     let ctx = Arc::new(builder.build());
 
@@ -171,5 +176,42 @@ async fn main() -> std::io::Result<()> {
         args.host,
         args.port,
     );
-    serve(listener, engine).await
+    tokio::select! {
+        result = serve(listener, engine) => result,
+        () = shutdown_signal() => {
+            tracing::info!("semcast: shutting down");
+            if let Some(store) = store {
+                // Commit verdicts still queued, so a query answered just
+                // before shutdown is free after the restart too.
+                tokio::task::spawn_blocking(move || store.flush())
+                    .await
+                    .map_err(std::io::Error::other)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Ctrl-C, or SIGTERM where there is one (what a service manager sends).
+async fn shutdown_signal() {
+    let interrupt = async {
+        if tokio::signal::ctrl_c().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                terminate.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        () = interrupt => {}
+        () = terminate => {}
+    }
 }

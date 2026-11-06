@@ -363,14 +363,20 @@ impl Extractor {
                 scalar_from_normalized(&spec.ty, normalized);
         }
         // Cache the unit atomically: only when every member validated, so a
-        // transient partial failure never permanently NULLs a sibling.
+        // transient partial failure never permanently NULLs a sibling, and
+        // as one group, so a durable cache never holds half a unit.
         if all_valid {
-            for (spec, normalized) in &decoded {
-                self.cache.put(
-                    self.cache_key(unit, &spec.name, &pending_row.text),
-                    CachedValue::Value(normalized.to_string()),
-                );
-            }
+            self.cache.put_many(
+                decoded
+                    .iter()
+                    .map(|(spec, normalized)| {
+                        (
+                            self.cache_key(unit, &spec.name, &pending_row.text),
+                            CachedValue::Value(normalized.to_string()),
+                        )
+                    })
+                    .collect(),
+            );
         }
     }
 

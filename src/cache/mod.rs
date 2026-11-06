@@ -57,6 +57,15 @@ pub enum CachedValue {
 pub trait SemanticCache: std::fmt::Debug + Send + Sync {
     fn get(&self, key: &CacheKey) -> Option<CachedValue>;
     fn put(&self, key: CacheKey, value: CachedValue);
+
+    /// Store verdicts that only make sense together (an extraction unit's
+    /// fields). A durable cache commits them atomically, so a crash never
+    /// leaves part of a group behind to be mixed with a later run's answers.
+    fn put_many(&self, entries: Vec<(CacheKey, CachedValue)>) {
+        for (key, value) in entries {
+            self.put(key, value);
+        }
+    }
 }
 
 /// Process-local cache — enough for tests and single-session use. For one

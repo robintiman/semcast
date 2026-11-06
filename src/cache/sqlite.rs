@@ -44,6 +44,15 @@ const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 type RowKey = [u8; 16];
 
+/// What the writer thread is asked to do.
+enum Message {
+    /// Rows to commit together: never split across transactions, so a group
+    /// (an extraction unit's fields) is on disk whole or not at all.
+    Rows(Vec<Row>),
+    /// Reply once everything sent before this message is committed.
+    Flush(Sender<()>),
+}
+
 /// One verdict on its way to disk.
 #[derive(Debug)]
 struct Row {
@@ -64,7 +73,7 @@ pub struct SqliteCache {
     /// win within the instance whatever happens on disk.
     stored: Mutex<HashMap<RowKey, CachedValue>>,
     /// `None` only while dropping, so the writer sees its channel close.
-    rows: Option<Sender<Row>>,
+    messages: Option<Sender<Message>>,
     writer: Option<JoinHandle<()>>,
 }
 
@@ -142,7 +151,7 @@ impl SqliteCache {
 
         let reader = Connection::open(path).map_err(store_err)?;
         reader.busy_timeout(BUSY_TIMEOUT).map_err(store_err)?;
-        let (rows, received) = mpsc::channel();
+        let (messages, received) = mpsc::channel();
         let writer = std::thread::Builder::new()
             .name("semcast-store-writer".to_owned())
             .spawn(move || write_loop(writer, received))
@@ -150,7 +159,7 @@ impl SqliteCache {
         Ok(Self {
             reader: Mutex::new(reader),
             stored: Mutex::new(HashMap::new()),
-            rows: Some(rows),
+            messages: Some(messages),
             writer: Some(writer),
         })
     }
@@ -167,12 +176,66 @@ impl SqliteCache {
     pub fn is_empty(&self) -> Result<bool> {
         Ok(self.len()? == 0)
     }
+
+    /// Block until every verdict stored so far is committed to disk. For a
+    /// clean shutdown when the cache itself can't be dropped (a server whose
+    /// connections still hold the session). Blocking: call it off the async
+    /// threads.
+    pub fn flush(&self) {
+        let (done, wait) = mpsc::channel();
+        if let Some(messages) = &self.messages
+            && messages.send(Message::Flush(done)).is_ok()
+        {
+            // An error means the writer is gone; nothing more will commit.
+            let _ = wait.recv();
+        }
+    }
+
+    /// Store several verdicts that belong together, committed in one
+    /// transaction. First evaluation wins per key, as for `put`.
+    fn store(&self, entries: Vec<(CacheKey, CachedValue)>) {
+        let mut rows = Vec::with_capacity(entries.len());
+        {
+            // A key this instance has stored keeps its verdict. No disk read
+            // here — a put follows a get that missed, and the map, not the
+            // disk, is what this instance has returned.
+            let mut stored = self.stored.lock().expect("store lock poisoned");
+            for (key, value) in entries {
+                let row_key = row_key(&key);
+                if stored.contains_key(&row_key) {
+                    continue;
+                }
+                stored.insert(row_key, value.clone());
+                let (is_error, value) = match value {
+                    CachedValue::Value(value) => (false, value),
+                    CachedValue::Error(error) => (true, error),
+                };
+                rows.push(Row {
+                    key: row_key,
+                    type_version: key.type_version,
+                    field: key.field,
+                    model_id: key.model_id.0,
+                    prompt_version: key.prompt_version,
+                    is_error,
+                    value,
+                });
+            }
+        }
+        if rows.is_empty() {
+            return;
+        }
+        if let Some(messages) = &self.messages
+            && messages.send(Message::Rows(rows)).is_err()
+        {
+            tracing::warn!(target: "semcast::store", "store writer is gone; verdicts stay uncached");
+        }
+    }
 }
 
 impl Drop for SqliteCache {
     /// Close the channel and wait for the writer to commit the backlog.
     fn drop(&mut self) {
-        self.rows.take();
+        self.messages.take();
         if let Some(writer) = self.writer.take()
             && writer.join().is_err()
         {
@@ -181,40 +244,61 @@ impl Drop for SqliteCache {
     }
 }
 
-/// Commit rows as they arrive, as many per transaction as are waiting (up to
-/// [`MAX_BATCH`]), until the cache is dropped.
-fn write_loop(mut connection: Connection, rows: Receiver<Row>) {
-    while let Ok(first) = rows.recv() {
-        let mut batch = vec![first];
-        while batch.len() < MAX_BATCH {
-            match rows.try_recv() {
-                Ok(row) => batch.push(row),
-                Err(_) => break,
-            }
-        }
-        match write_batch(&mut connection, &batch) {
-            Ok(conflicts) => {
-                for row in conflicts {
-                    tracing::warn!(
-                        target: "semcast::store",
-                        condition = %row.type_version,
-                        field = %row.field,
-                        model = %row.model_id,
-                        "another process stored a different verdict for this input first; \
-                         this process keeps returning its own until it restarts, then \
-                         the stored one",
-                    );
+/// Commit groups of rows as they arrive, as many per transaction as are
+/// waiting (up to about [`MAX_BATCH`] rows; a group is never split), and
+/// answer flush requests once what came before them is committed. Runs until
+/// the cache is dropped.
+fn write_loop(mut connection: Connection, messages: Receiver<Message>) {
+    while let Ok(first) = messages.recv() {
+        let mut batch: Vec<Row> = Vec::new();
+        let mut flushes: Vec<Sender<()>> = Vec::new();
+        let mut next = Some(first);
+        while let Some(message) = next.take() {
+            match message {
+                Message::Rows(rows) => batch.extend(rows),
+                Message::Flush(done) => {
+                    // Commit what precedes the flush before answering it.
+                    flushes.push(done);
+                    break;
                 }
             }
-            Err(error) => {
+            if batch.len() >= MAX_BATCH {
+                break;
+            }
+            next = messages.try_recv().ok();
+        }
+        if !batch.is_empty() {
+            commit(&mut connection, &batch);
+        }
+        for done in flushes {
+            let _ = done.send(());
+        }
+    }
+}
+
+fn commit(connection: &mut Connection, batch: &[Row]) {
+    match write_batch(connection, batch) {
+        Ok(conflicts) => {
+            for row in conflicts {
                 tracing::warn!(
                     target: "semcast::store",
-                    %error,
-                    rows = batch.len(),
-                    "store write failed; these verdicts are kept in memory for this \
-                     process only",
+                    condition = %row.type_version,
+                    field = %row.field,
+                    model = %row.model_id,
+                    "another process stored a different verdict for this input first; \
+                     this process keeps returning its own until it restarts, then \
+                     the stored one",
                 );
             }
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: "semcast::store",
+                %error,
+                rows = batch.len(),
+                "store write failed; these verdicts are kept in memory for this \
+                 process only",
+            );
         }
     }
 }
@@ -324,35 +408,11 @@ impl SemanticCache for SqliteCache {
     }
 
     fn put(&self, key: CacheKey, value: CachedValue) {
-        let row_key = row_key(&key);
-        {
-            // First evaluation wins: a key this instance has stored keeps its
-            // verdict. No disk read here — a put follows a get that missed,
-            // and the map, not the disk, is what this instance has returned.
-            let mut stored = self.stored.lock().expect("store lock poisoned");
-            if stored.contains_key(&row_key) {
-                return;
-            }
-            stored.insert(row_key, value.clone());
-        }
-        let (is_error, value) = match value {
-            CachedValue::Value(value) => (false, value),
-            CachedValue::Error(error) => (true, error),
-        };
-        let row = Row {
-            key: row_key,
-            type_version: key.type_version,
-            field: key.field,
-            model_id: key.model_id.0,
-            prompt_version: key.prompt_version,
-            is_error,
-            value,
-        };
-        if let Some(rows) = &self.rows
-            && rows.send(row).is_err()
-        {
-            tracing::warn!(target: "semcast::store", "store writer is gone; the verdict stays uncached");
-        }
+        self.store(vec![(key, value)]);
+    }
+
+    fn put_many(&self, entries: Vec<(CacheKey, CachedValue)>) {
+        self.store(entries);
     }
 }
 
@@ -531,6 +591,24 @@ mod tests {
             cache.get(&key("a")),
             Some(CachedValue::Value("no".to_owned()))
         );
+    }
+
+    /// A group is committed whole: after a flush, every member is on disk.
+    #[test]
+    fn put_many_commits_a_group_together_and_flush_waits_for_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        let cache = SqliteCache::open(&path).unwrap();
+        cache.put_many(
+            (0..10)
+                .map(|i| (key(&i.to_string()), CachedValue::Value("yes".to_owned())))
+                .collect(),
+        );
+        cache.flush();
+        assert_eq!(cache.len().unwrap(), 10);
+        // A second instance sees all of it without the first being dropped.
+        let other = SqliteCache::open(&path).unwrap();
+        assert_eq!(other.len().unwrap(), 10);
     }
 
     /// A write the database refuses must not make this instance forget a
