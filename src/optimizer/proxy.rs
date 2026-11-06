@@ -94,8 +94,16 @@ impl LearnedProxy {
             vector.iter().map(|x| f64::from(*x)).collect(),
         )
         .ok()?;
-        // The positive class is 1, the larger of the two labels fitted.
-        Some(self.model.predict_probabilities(&row)[0] as f32)
+        // linfa reports the probability of whichever class it made positive:
+        // the more frequent one in training, ties going to the first seen —
+        // not "matched". Ask which it was rather than assume.
+        let p = self.model.predict_probabilities(&row)[0];
+        let p_matched = if self.model.labels().pos.class == 1 {
+            p
+        } else {
+            1.0 - p
+        };
+        Some(p_matched as f32)
     }
 }
 
@@ -135,6 +143,33 @@ mod tests {
             "matched {matched}, unmatched {unmatched}",
         );
         assert!(matched > unmatched);
+    }
+
+    /// Calibration samples are random, so the training half is rarely
+    /// balanced and rarely starts with a match. The score must mean "matched"
+    /// whichever class is more frequent and whichever comes first.
+    #[test]
+    fn scores_mean_matched_whatever_the_class_balance_and_order() {
+        let mut examples = separable(40);
+        // Drop most matches: 6 matched against 20 unmatched.
+        let mut kept_matches = 0;
+        examples.retain(|(_, matched)| {
+            !*matched || {
+                kept_matches += 1;
+                kept_matches <= 6
+            }
+        });
+        for first_matched in [true, false] {
+            let mut ordered = examples.clone();
+            ordered.sort_by_key(|(_, matched)| *matched != first_matched);
+            let proxy = LearnedProxy::fit(&borrow(&ordered)).expect("separable data fits");
+            let matched = proxy.score(&vec![1.0, 0.0, 0.0, 0.0]).unwrap();
+            let unmatched = proxy.score(&vec![0.0, 1.0, 0.0, 0.0]).unwrap();
+            assert!(
+                matched > unmatched,
+                "first_matched={first_matched}: matched {matched}, unmatched {unmatched}",
+            );
+        }
     }
 
     #[test]

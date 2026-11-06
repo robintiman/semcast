@@ -699,6 +699,128 @@ async fn uncertifiable_recall_target_prunes_nothing() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// The calibration sample must be random over the whole input, not its first
+// rows: on input sorted by anything that correlates with the score, a
+// first-N sample sees one end of the distribution and sets the floor for
+// the other end blind.
+// ---------------------------------------------------------------------------
+
+const EASY_MATCHES: i64 = 80;
+const HARD_MATCHES: i64 = 40;
+
+/// Every row matches 'sync'. The first `EASY_MATCHES` are short ("sync07",
+/// cosine ~0.95 against 'sync' under the mock's positional byte embedding);
+/// the last `HARD_MATCHES` are padded to 16 bytes ("sync zzzzzzzzz07",
+/// ~0.5). Sorted easy-first, so the default 64-row sample, if taken from
+/// the front, contains no hard match at all.
+async fn sorted_matches_context(model: Arc<MockModel>) -> SessionContext {
+    let ctx = semcast_context(model);
+    let rows: Vec<String> = (1..=EASY_MATCHES)
+        .map(|id| format!("({id}, 'sync{id:02}')"))
+        .chain((1..=HARD_MATCHES).map(|n| {
+            let id = EASY_MATCHES + n;
+            format!("({id}, 'sync zzzzzzzzz{n:02}')")
+        }))
+        .collect();
+    ctx.sql(&format!(
+        "CREATE TABLE meetings AS
+         SELECT * FROM (VALUES {}) AS t(meeting_id, transcript)",
+        rows.join(", "),
+    ))
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    create_semantic_index(&ctx, "meetings", "transcript", index_options(&dir))
+        .await
+        .unwrap();
+    std::mem::forget(dir);
+    ctx
+}
+
+#[tokio::test]
+async fn calibration_samples_the_whole_input_not_its_head() {
+    let model = Arc::new(MockModel::answering_yes_to(["sync"]));
+    let ctx = sorted_matches_context(model).await;
+
+    let ids = matching_ids(
+        &ctx,
+        "SELECT meeting_id FROM meetings WHERE transcript MEANS 'sync' WITH RECALL 0.9",
+    )
+    .await;
+    let total = (EASY_MATCHES + HARD_MATCHES) as usize;
+    // A head sample sees only easy matches, sets the floor among them and
+    // prunes every hard one: recall ~0.6. A random sample sees both kinds
+    // and lands near the 0.9 target; 0.85 leaves room for sampling error.
+    assert!(
+        ids.len() * 100 >= total * 85,
+        "recall target 0.9, kept {} of {total}",
+        ids.len(),
+    );
+    let hard_kept = ids.iter().filter(|id| **id > EASY_MATCHES).count();
+    assert!(hard_kept > 0, "hard matches must not all be pruned");
+}
+
+/// A calibrated scan buffers its whole input to sample it. That buffer is
+/// charged to the session's memory pool: over the limit, the query fails
+/// with a clear error instead of exhausting the process. The same query
+/// without `WITH RECALL` streams and still succeeds.
+#[tokio::test]
+async fn calibration_buffer_respects_the_memory_limit() {
+    let model = Arc::new(MockModel::answering_yes_to(["sync"]));
+    let ctx = semcast::SemcastContextBuilder::new(model)
+        .with_memory_limit(16 * 1024)
+        .build();
+    let padding = "x".repeat(1000);
+    let rows: Vec<String> = (1..=100)
+        .map(|id| format!("({id}, 'sync {id} {padding}')"))
+        .collect();
+    ctx.sql(&format!(
+        "CREATE TABLE meetings AS
+         SELECT * FROM (VALUES {}) AS t(meeting_id, transcript)",
+        rows.join(", "),
+    ))
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    create_semantic_index(&ctx, "meetings", "transcript", index_options(&dir))
+        .await
+        .unwrap();
+
+    let streaming = semcast::sql(
+        &ctx,
+        "SELECT meeting_id FROM meetings WHERE transcript MEANS 'sync'",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await;
+    assert!(
+        streaming.is_ok(),
+        "uncalibrated scan streams: {streaming:?}"
+    );
+
+    let error = semcast::sql(
+        &ctx,
+        "SELECT meeting_id FROM meetings WHERE transcript MEANS 'sync' WITH RECALL 0.9",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .expect_err("100 KB of input cannot fit a 16 KB pool");
+    assert!(
+        error.to_string().contains("Resources exhausted"),
+        "error: {error}",
+    );
+}
+
 #[tokio::test]
 async fn builder_index_root_hosts_ddl_created_indexes() {
     let dir = tempfile::tempdir().unwrap();
