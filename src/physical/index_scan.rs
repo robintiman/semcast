@@ -4,8 +4,8 @@
 //! Sits between the free predicates and [`VerifyExec`], pruning rows whose
 //! indexed document scored below the floor against the embedded condition.
 //! Uncalibrated, it costs one embed call per query and zero completion
-//! calls; under `WITH RECALL`, the first poll additionally labels a small
-//! sample of input rows (full-text model calls, shared with the verdict
+//! calls; under `WITH RECALL`, it buffers its input and labels a random
+//! sample of its documents (full-text model calls, shared with the verdict
 //! cache) to set the floor at the recall target — thresholding either raw
 //! similarity or a classifier fitted to those labels, whichever the sample
 //! supports.
@@ -23,7 +23,7 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::Statistics;
 use datafusion::error::Result;
 use datafusion::execution::TaskContext;
-use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
+use datafusion::physical_expr::{Distribution, EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::{
     Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
@@ -73,6 +73,22 @@ fn score_labels(
         }
     }
     scores
+}
+
+/// Seeds the calibration sample's document order. Fixed, so repeat queries
+/// draw the same sample and their labels come from the verdict cache.
+const SAMPLE_SEED: u64 = 0x5eed_ca1b_0000_0001;
+
+/// A document's place in the calibration sample's draw order: SplitMix64 of
+/// its [`doc_hash`] mixed with the seed. Taking the documents with the
+/// smallest priorities is a uniform sample without replacement, and it
+/// depends on nothing but the set of documents — not on input order, not on
+/// partitioning.
+fn sample_priority(doc_hash: u64) -> u64 {
+    let mut z = (doc_hash ^ SAMPLE_SEED).wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
 }
 
 /// What one index search learned, shared from the scan to the verify stage.
@@ -223,6 +239,17 @@ impl ExecutionPlan for IndexScanExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input]
+    }
+
+    /// A calibrated scan samples its whole input, so it must see all of it
+    /// in one stream; DataFusion merges the partitions below. Uncalibrated,
+    /// each partition filters on its own.
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        if self.calibration.is_some() {
+            vec![Distribution::SinglePartition]
+        } else {
+            vec![Distribution::UnspecifiedDistribution]
+        }
     }
 
     fn with_new_children(
@@ -383,31 +410,17 @@ impl Scanner {
         }))
     }
 
-    /// The calibrated path (`WITH RECALL`): buffer up to `sample_size` input
-    /// rows, calibrate the floor on them, then filter the buffered rows and
-    /// the rest of the input as usual. One calibration globally — the sample
-    /// comes from whichever partition's stream initializes the evidence
-    /// cell first; later partitions just flow through the result.
+    /// The calibrated path (`WITH RECALL`): buffer the whole input, draw a
+    /// random sample of its documents, calibrate the floor on it, then filter
+    /// the buffered rows. The input is a single partition (see
+    /// `required_input_distribution`), so the sample is drawn from every row
+    /// the predicate will judge — a sample from the head of the stream would
+    /// see only one end of any input sorted by something the score tracks.
     async fn calibrate_then_scan(
         self: Arc<Self>,
-        mut input: SendableRecordBatchStream,
+        input: SendableRecordBatchStream,
     ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
-        let budget = self
-            .calibration
-            .as_ref()
-            .expect("calibrated path requires a config")
-            .label_budget();
-        let mut buffered: Vec<RecordBatch> = Vec::new();
-        let mut buffered_rows = 0;
-        while buffered_rows < budget {
-            match input.try_next().await? {
-                Some(batch) => {
-                    buffered_rows += batch.num_rows();
-                    buffered.push(batch);
-                }
-                None => break,
-            }
-        }
+        let buffered: Vec<RecordBatch> = input.try_collect().await?;
         let result = self
             .evidence
             .cell
@@ -417,7 +430,6 @@ impl Scanner {
         let result = Arc::clone(result);
         let scanner = self;
         Ok(futures::stream::iter(buffered.into_iter().map(Ok))
-            .chain(input)
             .and_then(move |batch| {
                 let scanner = Arc::clone(&scanner);
                 let result = Arc::clone(&result);
@@ -585,15 +597,17 @@ impl Scanner {
         (calibrate_with(per_doc_best, labels), per_doc_best.clone())
     }
 
-    /// The distinct documents of the buffered batches, at most `sample_size`.
+    /// A uniform random sample of the distinct documents in the buffered
+    /// batches, at most `sample_size`, in draw order: the documents with the
+    /// smallest [`sample_priority`]. Any prefix is itself a uniform sample,
+    /// which is what lets certification label it a tranche at a time.
     fn sample_documents(
         &self,
         buffered: &[RecordBatch],
         sample_size: usize,
     ) -> Result<Vec<String>> {
-        let mut sample = Vec::new();
-        let mut seen = HashSet::new();
-        'batches: for batch in buffered {
+        let mut documents: HashMap<u64, String> = HashMap::new();
+        for batch in buffered {
             if batch.num_rows() == 0 {
                 continue;
             }
@@ -603,19 +617,21 @@ impl Scanner {
                 .downcast_ref::<StringArray>()
                 .expect("array was just cast to Utf8");
             for row in 0..texts.len() {
-                if !texts.is_valid(row) {
-                    continue;
-                }
-                let text = texts.value(row);
-                if seen.insert(doc_hash(text)) {
-                    sample.push(text.to_owned());
-                    if sample.len() >= sample_size {
-                        break 'batches;
-                    }
+                if texts.is_valid(row) {
+                    let text = texts.value(row);
+                    documents
+                        .entry(doc_hash(text))
+                        .or_insert_with(|| text.to_owned());
                 }
             }
         }
-        Ok(sample)
+        let mut drawn: Vec<(u64, String)> = documents
+            .into_iter()
+            .map(|(hash, text)| (sample_priority(hash), text))
+            .collect();
+        drawn.sort_unstable_by_key(|(priority, _)| *priority);
+        drawn.truncate(sample_size);
+        Ok(drawn.into_iter().map(|(_, text)| text).collect())
     }
 
     /// Ground-truth labels for the sample: the model reads each document's
