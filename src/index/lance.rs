@@ -221,6 +221,22 @@ impl SemanticIndex for LanceIndex {
         Ok(hashes)
     }
 
+    /// A flat scan with `k` = every chunk: exact, and no dearer than the
+    /// top-k search, which without an ANN index scans every vector anyway.
+    async fn search_all(&self, query: &str, score_floor: f32) -> Result<Vec<ChunkHit>> {
+        let dataset = self.dataset.lock().await.clone();
+        let chunks = dataset.count_rows(None).await.map_err(lance_err)?;
+        if chunks == 0 {
+            return Ok(Vec::new());
+        }
+        let params = SearchParams {
+            fetch_k: chunks,
+            score_floor,
+            ..self.params
+        };
+        self.search(query, &params).await
+    }
+
     async fn search(&self, query: &str, params: &SearchParams) -> Result<Vec<ChunkHit>> {
         let mut embedded = self.embedder.embed(vec![query.to_owned()]).await?;
         let query_vector = embedded
