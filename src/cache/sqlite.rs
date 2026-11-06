@@ -201,7 +201,8 @@ fn write_loop(mut connection: Connection, rows: Receiver<Row>) {
                         field = %row.field,
                         model = %row.model_id,
                         "another process stored a different verdict for this input first; \
-                         this process returned its own, later reads return the stored one",
+                         this process keeps returning its own until it restarts, then \
+                         the stored one",
                     );
                 }
             }
@@ -307,7 +308,19 @@ impl SemanticCache for SqliteCache {
         {
             return Some(value.clone());
         }
-        self.committed(&row_key)
+        let committed = self.committed(&row_key)?;
+        // Remember what was returned, so a put racing in later for the same
+        // key backs off and this instance never answers two ways. If a put
+        // landed between the two lookups, the map's verdict is the one this
+        // instance has already returned, so that is the one to keep.
+        Some(
+            self.stored
+                .lock()
+                .expect("store lock poisoned")
+                .entry(row_key)
+                .or_insert(committed)
+                .clone(),
+        )
     }
 
     fn put(&self, key: CacheKey, value: CachedValue) {
@@ -495,6 +508,28 @@ mod tests {
         assert_eq!(
             cache.get(&key("a")),
             Some(CachedValue::Value("yes".to_owned()))
+        );
+    }
+
+    /// A verdict read from disk is what this instance returned: a put for the
+    /// same key afterwards, from a query that missed earlier, must lose to it.
+    #[test]
+    fn a_verdict_read_from_disk_wins_over_a_later_put() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        {
+            let other = SqliteCache::open(&path).unwrap();
+            other.put(key("a"), CachedValue::Value("no".to_owned()));
+        }
+        let cache = SqliteCache::open(&path).unwrap();
+        assert_eq!(
+            cache.get(&key("a")),
+            Some(CachedValue::Value("no".to_owned()))
+        );
+        cache.put(key("a"), CachedValue::Value("yes".to_owned()));
+        assert_eq!(
+            cache.get(&key("a")),
+            Some(CachedValue::Value("no".to_owned()))
         );
     }
 
