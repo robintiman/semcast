@@ -74,8 +74,8 @@ pub struct SampledScores {
     /// Positive documents the index has never seen — the scan passes them
     /// through to verify at any floor, so they help recall for free.
     pub positive_unindexed: usize,
-    /// Positive documents that are indexed but have no score — lost at any
-    /// floor. The pre-filter scores every chunk, so it reports none.
+    /// Positive documents that are indexed but fell outside the search's
+    /// `fetch_k` — lost at any floor.
     pub positive_lost: usize,
     /// Total documents labeled, positive and negative.
     pub sampled: usize,
@@ -111,11 +111,13 @@ pub fn calibrate_threshold(
     let threshold = match confidence {
         None => point_estimate_floor(target_recall, default_floor, &positive, scores, total),
         Some(confidence) => {
-            // Nothing certifies: prune nothing. A floor at the lowest sampled
-            // positive would still drop every unsampled match below it, on a
-            // bound the sample just failed to support.
-            certified_floor(target_recall, confidence, &positive, scores, total)
-                .unwrap_or(f32::NEG_INFINITY)
+            certified_floor(target_recall, confidence, &positive, scores, total).unwrap_or_else(
+                || {
+                    // Nothing certifies: keep every positive the floor can
+                    // reach and report the shortfall honestly.
+                    positive.last().copied().unwrap_or(default_floor)
+                },
+            )
         }
     };
 
@@ -147,9 +149,9 @@ fn point_estimate_floor(
         // license to prune aggressively.
         default_floor
     } else if needed > positive.len() {
-        // Unachievable: lost positives are gone at any floor. Prune nothing
-        // rather than pile pruning losses on top, and report the shortfall.
-        f32::NEG_INFINITY
+        // Unachievable: positives beyond fetch_k are lost at any floor.
+        // Keep every scored positive and report the shortfall honestly.
+        positive.last().copied().unwrap_or(default_floor)
     } else {
         // Survival downstream is `score >= threshold`, so the needed-th
         // highest positive score keeps at least `needed` positives; ties
@@ -355,7 +357,7 @@ mod tests {
 
         #[test]
         fn lost_positives_make_the_target_unachievable_but_honest() {
-            // 1 scored + 3 lost: best achievable recall is 0.25.
+            // 1 scored + 3 lost beyond fetch_k: best achievable recall is 0.25.
             let sample = SampledScores {
                 positive_scores: vec![0.8],
                 positive_lost: 3,
@@ -363,11 +365,7 @@ mod tests {
                 ..Default::default()
             };
             let calibration = calibrate_threshold(0.9, None, 0.35, &sample);
-            assert_eq!(
-                calibration.threshold,
-                f32::NEG_INFINITY,
-                "an unreachable target prunes nothing",
-            );
+            assert_eq!(calibration.threshold, 0.8);
             assert_eq!(calibration.estimated_recall, 0.25);
             assert!(!calibration.meets(0.9));
         }
@@ -423,17 +421,14 @@ mod tests {
         }
 
         /// Three positives cannot certify 90% recall at 95% confidence, so
-        /// the floor drops away entirely rather than claiming a bound: a
-        /// floor at the lowest sampled positive would still prune unsampled
-        /// matches below it.
+        /// the floor drops to keep them all rather than claiming a bound.
         #[test]
         fn a_tiny_sample_certifies_nothing_and_prunes_nothing() {
             let sample = scores(&[0.98, 0.97, 0.96]);
             let calibration = calibrate_threshold(0.9, Some(0.95), 0.35, &sample);
             assert_eq!(
-                calibration.threshold,
-                f32::NEG_INFINITY,
-                "no floor when nothing certifies",
+                calibration.threshold, 0.96,
+                "every positive kept when nothing certifies",
             );
             assert!(!calibration.meets(0.9), "and it says so");
         }

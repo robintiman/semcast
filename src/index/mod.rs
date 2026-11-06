@@ -68,8 +68,7 @@ pub struct ChunkHit {
 /// RECALL` (roadmap step 3) will derive `score_floor` from a sample.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SearchParams {
-    /// Chunk hits a top-k [`SemanticIndex::search`] fetches before the floor
-    /// is applied. The `MEANS` pre-filter ignores it: it scores every chunk.
+    /// Chunk hits fetched from the vector scan before the floor is applied.
     pub fetch_k: usize,
     /// Minimum cosine similarity for a chunk to count as a hit.
     pub score_floor: f32,
@@ -107,15 +106,8 @@ pub trait SemanticIndex: std::fmt::Debug + Send + Sync {
     async fn indexed_doc_hashes(&self) -> Result<HashSet<u64>>;
 
     /// Chunk hits scoring at least `params.score_floor` against the embedded
-    /// query, best first, at most `params.fetch_k`. Top-k retrieval: right
-    /// for ranking, where the cut is the point, wrong for filtering.
+    /// query, best first, at most `params.fetch_k`.
     async fn search(&self, query: &str, params: &SearchParams) -> Result<Vec<ChunkHit>>;
-
-    /// Every chunk scoring at least `score_floor` against the embedded query,
-    /// best first, with no cap. A filter must judge each indexed document on
-    /// its own score: a top-k cut would prune matches for rank alone, a row
-    /// drop that grows with the corpus.
-    async fn search_all(&self, query: &str, score_floor: f32) -> Result<Vec<ChunkHit>>;
 
     /// One unit vector per indexed document — the mean of its chunk vectors,
     /// renormalized.
