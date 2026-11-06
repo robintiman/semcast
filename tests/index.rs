@@ -442,11 +442,11 @@ async fn create_on_plain_datafusion_context_is_a_clear_error() {
 // the query 'sync', doc 1 scores 1.0 and the long doc 2 ~0.87 — the default
 // floor keeps both, a calibrated one only doc 1.
 //
-// Doc sizes are load-bearing for the call counts. Doc 1 is a single chunk,
-// so its chunked-verify input equals its full text — the same cache key its
-// calibration label wrote, making its verify free. Doc 2 spans multiple
-// chunks, so if it survives to verify, that's a separately-keyed (and
-// therefore countable) model call.
+// Doc sizes are load-bearing for the call counts. Doc 1 is a single chunk:
+// its chunked-verify input equals its full text, but the chunked prompt
+// differs, so it is keyed apart from its calibration label and costs its own
+// call. Doc 2 spans multiple chunks, so if it survives to verify, that's a
+// separately-keyed (and therefore countable) model call too.
 // ---------------------------------------------------------------------------
 
 async fn calibration_context(model: Arc<MockModel>) -> SessionContext {
@@ -484,11 +484,11 @@ async fn calibration_raises_the_floor_and_prunes_the_near_miss() {
 
     let embeds_before = model.embed_calls();
     assert_eq!(matching_ids(&ctx, CALIBRATED_QUERY).await, vec![1]);
-    // 2 label calls (docs 1 and 2, full text); doc 1's verify hits the
-    // cache entry its label wrote. Doc 2 scores ~0.87 — above the default
-    // floor, below the calibrated one (1.0, doc 1's score) — so it never
-    // reaches verify; surviving would cost a countable third call.
-    assert_eq!(model.completion_calls(), 2);
+    // 2 label calls (docs 1 and 2, full text) + doc 1's chunked verify. Doc 2
+    // scores ~0.87 — above the default floor, below the calibrated one (1.0,
+    // doc 1's score) — so it never reaches verify; surviving would cost a
+    // countable fourth call.
+    assert_eq!(model.completion_calls(), 3);
     assert_eq!(
         model.embed_calls() - embeds_before,
         1,
@@ -525,10 +525,10 @@ async fn unindexed_rows_still_pass_through_under_recall() {
         .unwrap();
 
     assert_eq!(matching_ids(&ctx, CALIBRATED_QUERY).await, vec![1, 4]);
-    // 3 labels (docs 1, 2, 4); every verify is then free — doc 1's chunk
-    // equals its full text, and doc 4's passthrough verify is full text,
-    // the same cache key its label wrote. Doc 2 is pruned.
-    assert_eq!(model.completion_calls(), 3);
+    // 3 labels (docs 1, 2, 4) + doc 1's chunked verify. Doc 4's passthrough
+    // verify is full text through the full-text prompt, the same request its
+    // label made, so it is free. Doc 2 is pruned.
+    assert_eq!(model.completion_calls(), 4);
 }
 
 #[tokio::test]
@@ -541,9 +541,9 @@ async fn all_negative_sample_falls_back_to_the_default_floor() {
         Vec::<i64>::new()
     );
     // With no positives the floor stays at the default 0.35, which both
-    // docs clear: 2 labels + doc 2's multi-chunk verify (doc 1's verify is
-    // a cache hit). A wrongly raised floor would prune doc 2 → 2 calls.
-    assert_eq!(model.completion_calls(), 3);
+    // docs clear: 2 labels + both chunked verifies. A wrongly raised floor
+    // would prune doc 2 → 3 calls.
+    assert_eq!(model.completion_calls(), 4);
 }
 
 #[tokio::test]
@@ -694,8 +694,10 @@ async fn uncertifiable_recall_target_prunes_nothing() {
         .filter(|input| !input.contains("sync"))
         .count();
     assert_eq!(
-        verified_negatives, MANY_NEGATIVES as usize,
-        "no floor: each negative is verified rather than pruned",
+        verified_negatives,
+        2 * MANY_NEGATIVES as usize,
+        "no floor: each negative is labeled on full text, then verified on \
+         its chunk rather than pruned",
     );
 }
 

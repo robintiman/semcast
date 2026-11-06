@@ -23,7 +23,7 @@ use datafusion::physical_plan::{
 };
 use futures::TryStreamExt;
 
-use crate::cache::{CacheKey, CachedValue, SemanticCache};
+use crate::cache::{CacheKey, CachedValue, SemanticCache, stable_digest};
 use crate::index::doc_hash;
 use crate::model::{CompletionRequest, ModelId, ModelProvider};
 use crate::physical::index_scan::ChunkEvidence;
@@ -31,6 +31,12 @@ use crate::physical::index_scan::ChunkEvidence;
 /// Version of the synthesized `MEANS` verify prompt. Participates in cache
 /// keys: bump it and every cached verdict is honestly invalidated.
 pub const MEANS_PROMPT_VERSION: &str = "means-v2";
+
+/// The prompt version of a verify that reads chunk evidence rather than the
+/// full text. Its own constant because the prompt differs: a one-chunk
+/// document sends the same input either way, and sharing a key would serve a
+/// full-text verdict for a chunked question.
+pub const MEANS_CHUNKED_PROMPT_VERSION: &str = "means-v2-chunked";
 
 /// Separates chunks in a chunked verify input; part of the cache-keyed
 /// input, so changing it invalidates exactly the chunked verdicts.
@@ -269,7 +275,7 @@ impl Verifier {
         // never reach it either — first evaluation wins.
         let mut keep = vec![false; batch.num_rows()];
         let mut requests = Vec::new();
-        let mut pending: Vec<(usize, String)> = Vec::new();
+        let mut pending: Vec<(usize, String, bool)> = Vec::new();
         for (row, keep_row) in keep.iter_mut().enumerate() {
             if !texts.is_valid(row) {
                 continue;
@@ -277,17 +283,20 @@ impl Verifier {
             let text = texts.value(row);
             // With index evidence, the model reads the document's best
             // chunks; without (no index, or an unindexed passthrough row),
-            // the full text. The cache keys the input actually sent, so the
-            // two kinds of verdict never collide.
-            let (input, prompt) = match self
+            // the full text. The cache keys the input and the prompt version
+            // actually sent, so the two kinds of verdict never collide — not
+            // even for a one-chunk document, whose input is the same.
+            let (input, prompt, chunked) = match self
                 .evidence
                 .as_deref()
                 .and_then(|evidence| evidence.chunks_for(doc_hash(text)))
             {
-                Some(chunks) => (chunks.join(CHUNK_SEPARATOR), &self.chunked_prompt),
-                None => (text.to_owned(), &self.prompt),
+                Some(chunks) => (chunks.join(CHUNK_SEPARATOR), &self.chunked_prompt, true),
+                None => (text.to_owned(), &self.prompt, false),
             };
-            if let Some(CachedValue::Value(verdict)) = self.cache.get(&self.cache_key(&input)) {
+            if let Some(CachedValue::Value(verdict)) =
+                self.cache.get(&self.cache_key(&input, chunked))
+            {
                 self.cache_hits.add(1);
                 *keep_row = verdict == "yes";
                 continue;
@@ -298,20 +307,20 @@ impl Verifier {
                 max_tokens: 8,
                 schema: None,
             });
-            pending.push((row, input));
+            pending.push((row, input, chunked));
         }
         self.model_calls.add(requests.len());
 
         let verdicts = self.model.complete(requests).await;
         debug_assert_eq!(verdicts.len(), pending.len());
-        for ((row, input), verdict) in pending.iter().zip(&verdicts) {
+        for ((row, input, chunked), verdict) in pending.iter().zip(&verdicts) {
             match verdict.as_ref().map(|c| parse_verdict(&c.text)) {
                 Ok(Some(matched)) => {
                     keep[*row] = matched;
                     // Only successful verdicts are cached: a transient model
                     // failure must not permanently exclude a row.
                     self.cache.put(
-                        self.cache_key(input),
+                        self.cache_key(input, *chunked),
                         CachedValue::Value(if matched { "yes" } else { "no" }.to_owned()),
                     );
                 }
@@ -322,8 +331,13 @@ impl Verifier {
         Ok(filter_record_batch(&batch, &BooleanArray::from(keep))?)
     }
 
-    fn cache_key(&self, input: &str) -> CacheKey {
-        means_cache_key(&self.condition, input, &self.model_id, MEANS_PROMPT_VERSION)
+    fn cache_key(&self, input: &str, chunked: bool) -> CacheKey {
+        let prompt_version = if chunked {
+            MEANS_CHUNKED_PROMPT_VERSION
+        } else {
+            MEANS_PROMPT_VERSION
+        };
+        means_cache_key(&self.condition, input, &self.model_id, prompt_version)
     }
 }
 
@@ -343,13 +357,10 @@ pub(crate) fn means_cache_key(
     model_id: &ModelId,
     prompt_version: &str,
 ) -> CacheKey {
-    use std::hash::{DefaultHasher, Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    input.hash(&mut hasher);
     CacheKey {
         type_version: condition.to_owned(),
         field: "means".to_owned(),
-        input_hash: hasher.finish(),
+        input_digest: stable_digest(&[input.as_bytes()]),
         model_id: model_id.clone(),
         prompt_version: prompt_version.to_owned(),
     }

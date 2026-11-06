@@ -102,9 +102,10 @@ assembled in the physical planner, not there.
 
 ### Invariants worth not breaking
 
-- `index::doc_hash` is FNV-1a and must never change: index entries outlive the
-  process. `DefaultHasher` (the in-memory verdict cache) is only stable within one
-  binary and must not leak into the index.
+- `index::doc_hash` (FNV-1a) and `cache::stable_digest` (BLAKE3, 128-bit) must
+  never change: index and cache entries outlive the process, and golden tests
+  pin both. `DefaultHasher` is only stable within one binary and must not key
+  anything durable.
 - Cache keys carry a prompt version (`MEANS_PROMPT_VERSION`,
   `EXTRACT_PROMPT_VERSION`, `SemanticType::version`). Change a synthesized prompt
   and bump its constant, so stale verdicts are invalidated honestly.
