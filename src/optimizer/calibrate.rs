@@ -77,11 +77,15 @@ pub struct SampledScores {
     /// Positive documents that are indexed but have no score — lost at any
     /// floor. The pre-filter scores every chunk, so it reports none.
     pub positive_lost: usize,
-    /// Documents whose label failed — a model error or an unparseable
-    /// answer. Their truth is unknown, so they count as the worst case: a
-    /// match the scan cannot vouch for. Dropping them from the sample instead
-    /// would bias it toward whatever the model answers reliably.
-    pub positive_unverified: usize,
+    /// Best chunk score of each scored document whose label failed — a model
+    /// error or an unparseable answer. Its truth is unknown, so each floor
+    /// assumes the worst for it: below the floor, a match the floor loses;
+    /// at or above it, kept, so a non-match that changes nothing. Dropping
+    /// them from the sample instead would bias it toward whatever the model
+    /// answers reliably. (A failed document the index has never seen passes
+    /// through at any floor and is left out; one indexed but unscored counts
+    /// in `positive_lost`.)
+    pub unverified_scores: Vec<f32>,
     /// Total documents labeled, positive and negative.
     pub sampled: usize,
 }
@@ -101,11 +105,8 @@ pub fn calibrate_threshold(
 ) -> Calibration {
     let mut positive = scores.positive_scores.clone();
     positive.sort_by(|a, b| b.total_cmp(a));
-    let total = positive.len()
-        + scores.positive_unindexed
-        + scores.positive_lost
-        + scores.positive_unverified;
-    if total == 0 {
+    let known = positive.len() + scores.positive_unindexed + scores.positive_lost;
+    if known == 0 && scores.unverified_scores.is_empty() {
         // No evidence to raise the floor with — keep the default; recall is
         // vacuously met.
         return Calibration {
@@ -116,19 +117,45 @@ pub fn calibrate_threshold(
         };
     }
 
+    let recall_at = |floor: f32| recall_at(floor, &positive, scores);
     let threshold = match confidence {
-        None => point_estimate_floor(target_recall, default_floor, &positive, scores, total),
+        None => {
+            // The floor the known labels support, lowered past failed labels
+            // until the worst case for them still meets the target.
+            let floor =
+                point_estimate_floor(target_recall, default_floor, &positive, scores, known);
+            let (kept, total) = recall_at(floor);
+            if meets_target(kept, total, target_recall) {
+                floor
+            } else {
+                candidate_floors(&positive, scores)
+                    .into_iter()
+                    .filter(|candidate| *candidate < floor)
+                    .find(|candidate| {
+                        let (kept, total) = recall_at(*candidate);
+                        meets_target(kept, total, target_recall)
+                    })
+                    .unwrap_or(f32::NEG_INFINITY)
+            }
+        }
         Some(confidence) => {
             // Nothing certifies: prune nothing. A floor at the lowest sampled
             // positive would still drop every unsampled match below it, on a
             // bound the sample just failed to support.
-            certified_floor(target_recall, confidence, &positive, scores, total)
+            certified_floor(target_recall, confidence, &positive, scores)
                 .unwrap_or(f32::NEG_INFINITY)
         }
     };
 
-    let surviving = positive.iter().filter(|score| **score >= threshold).count();
-    let kept = surviving + scores.positive_unindexed;
+    let (kept, total) = recall_at(threshold);
+    if total == 0 {
+        return Calibration {
+            threshold,
+            sampled_rows: scores.sampled,
+            estimated_recall: 1.0,
+            certified_recall: confidence.map(|_| 1.0),
+        };
+    }
     Calibration {
         threshold,
         sampled_rows: scores.sampled,
@@ -136,6 +163,38 @@ pub fn calibrate_threshold(
         certified_recall: confidence
             .map(|confidence| wilson_lower_bound(kept, total, 1.0 - confidence)),
     }
+}
+
+/// Positives kept, and positives in all, at `floor`, assuming the worst for
+/// failed labels: those below the floor are lost matches, those at or above
+/// it are kept non-matches and count for nothing.
+fn recall_at(floor: f32, positive: &[f32], scores: &SampledScores) -> (usize, usize) {
+    let kept = positive.iter().filter(|score| **score >= floor).count() + scores.positive_unindexed;
+    let unverified_missed = scores
+        .unverified_scores
+        .iter()
+        .filter(|score| **score < floor)
+        .count();
+    let total =
+        positive.len() + scores.positive_unindexed + scores.positive_lost + unverified_missed;
+    (kept, total)
+}
+
+fn meets_target(kept: usize, total: usize, target_recall: f64) -> bool {
+    total == 0 || kept as f64 / total as f64 >= target_recall
+}
+
+/// Every floor that changes what survives: each distinct score of a positive
+/// or of a failed label, highest first.
+fn candidate_floors(positive: &[f32], scores: &SampledScores) -> Vec<f32> {
+    let mut candidates: Vec<f32> = positive
+        .iter()
+        .chain(&scores.unverified_scores)
+        .copied()
+        .collect();
+    candidates.sort_by(|a, b| b.total_cmp(a));
+    candidates.dedup();
+    candidates
 }
 
 /// The floor that hits the target on the sample, counted exactly.
@@ -179,15 +238,8 @@ fn certified_floor(
     confidence: f64,
     positive: &[f32],
     scores: &SampledScores,
-    total: usize,
 ) -> Option<f32> {
-    // Descending and deduped: `positive` is already sorted high to low.
-    let mut candidates: Vec<f32> = Vec::new();
-    for score in positive {
-        if candidates.last() != Some(score) {
-            candidates.push(*score);
-        }
-    }
+    let candidates = candidate_floors(positive, scores);
     if candidates.is_empty() {
         return None;
     }
@@ -195,8 +247,7 @@ fn certified_floor(
 
     // Highest floor first: the first that certifies prunes the most.
     candidates.into_iter().find(|floor| {
-        let kept =
-            positive.iter().filter(|score| *score >= floor).count() + scores.positive_unindexed;
+        let (kept, total) = recall_at(*floor, positive, scores);
         wilson_lower_bound(kept, total, alpha) >= target_recall
     })
 }
@@ -380,28 +431,49 @@ mod tests {
             assert!(!calibration.meets(0.9));
         }
 
-        /// A label the model failed to produce is a possible match the scan
-        /// cannot vouch for. Counted as one, ten good positives and two
-        /// failures cannot reach 90%, so pruning stands down. Dropped from the
-        /// sample instead, the same ten would have claimed full recall.
+        /// A failed label below the floor is a possible lost match, so the
+        /// floor drops until it keeps the failures too. Ten positives at 0.9
+        /// and two failures at 0.4: a 0.9 floor loses both (10/12 < 0.9), so
+        /// the floor falls to 0.4. Dropped from the sample instead, the 0.9
+        /// floor would have claimed full recall and pruned them.
         #[test]
-        fn failed_labels_count_against_the_target() {
+        fn failed_labels_below_the_floor_pull_it_down() {
             let sample = SampledScores {
                 positive_scores: vec![0.9; 10],
-                positive_unverified: 2,
+                unverified_scores: vec![0.4, 0.4],
                 sampled: 20,
                 ..Default::default()
             };
             let calibration = calibrate_threshold(0.9, None, 0.35, &sample);
-            assert_eq!(calibration.threshold, f32::NEG_INFINITY);
-            assert_eq!(calibration.estimated_recall, 10.0 / 12.0);
-            assert!(!calibration.meets(0.9));
+            assert_eq!(calibration.threshold, 0.4);
+            assert_eq!(calibration.estimated_recall, 1.0);
 
             let certified = calibrate_threshold(0.8, Some(0.9), 0.35, &sample);
-            assert!(
-                certified.certified_recall.unwrap() < 10.0 / 12.0,
-                "the bound is computed over all 12, failures included",
+            assert!(certified.threshold <= 0.4, "{certified:?}");
+        }
+
+        /// A failed label the floor keeps anyway is no miss: at worst it is a
+        /// non-match, which changes nothing. The floor stays where the known
+        /// labels put it.
+        #[test]
+        fn failed_labels_above_the_floor_change_nothing() {
+            let sample = SampledScores {
+                positive_scores: vec![0.9; 10],
+                unverified_scores: vec![0.95, 0.95],
+                sampled: 20,
+                ..Default::default()
+            };
+            let with_failures = calibrate_threshold(0.9, None, 0.35, &sample);
+            let without = calibrate_threshold(
+                0.9,
+                None,
+                0.35,
+                &SampledScores {
+                    unverified_scores: Vec::new(),
+                    ..sample.clone()
+                },
             );
+            assert_eq!(with_failures, without);
         }
 
         #[test]

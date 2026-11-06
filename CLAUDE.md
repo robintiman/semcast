@@ -111,7 +111,7 @@ assembled in the physical planner, not there.
 - Rows fail, queries don't: a row the model errors on is excluded from a
   filter (counted in `rows_dropped`) or falls through to `ELSE` in a `CASE`,
   rather than failing the statement. A failed calibration label stays in the
-  sample as a possible miss, so it counts against the recall certificate.
+  sample, assumed a lost match wherever the floor would prune it.
 - An index gap degrades, never drops: unindexed documents pass the pre-filter
   through to full-text verify; `SEMANTIC DISTINCT` falls back to exact-match
   dedupe. Never silently discard rows the index hasn't seen.

@@ -821,24 +821,45 @@ async fn calibration_buffer_respects_the_memory_limit() {
     );
 }
 
-/// A failed calibration label is a possible miss, not a document that was
-/// never drawn. Here the model fails on 11 of the 40 matches; counted as
-/// misses, they put the recall target out of reach, so the index prunes
-/// nothing and every negative is verified. Dropped from the sample instead,
-/// the remaining 29 matches would all score 1.0 and the floor would prune
-/// every negative on a sample that silently excluded a quarter of the
-/// matches.
-#[tokio::test]
-async fn failed_calibration_labels_count_as_misses() {
-    let model = Arc::new(
-        MockModel::answering_yes_to(["sync"])
-            .embedding_by_theme(["sync"])
-            .failing_on(["sync 1"]),
-    );
-    let ctx = oversubscribed_context(Arc::clone(&model)).await;
+/// 40 "sync N" matches and 10 digit-only negatives, plus `extra` rows, under
+/// theme embedding: "sync" docs score 1.0 against 'sync', everything else
+/// 0.0. Small enough that the 64-document calibration sample is all of it.
+async fn failure_context(model: Arc<MockModel>, extra: &[&str]) -> SessionContext {
+    let ctx = semcast_context(model);
+    let rows: Vec<String> = (1..=40)
+        .map(|id| format!("({id}, 'sync {id}')"))
+        .chain((41..=50).map(|id| format!("({id}, '{:04}')", id * 7)))
+        .chain(
+            extra
+                .iter()
+                .enumerate()
+                .map(|(i, text)| format!("({}, '{text}')", 51 + i)),
+        )
+        .collect();
+    ctx.sql(&format!(
+        "CREATE TABLE meetings AS
+         SELECT * FROM (VALUES {}) AS t(meeting_id, transcript)",
+        rows.join(", "),
+    ))
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    create_semantic_index(&ctx, "meetings", "transcript", index_options(&dir))
+        .await
+        .unwrap();
+    std::mem::forget(dir);
+    ctx
+}
 
+/// Runs the calibrated query and returns the scan's metrics.
+async fn calibrated_scan_metrics(
+    ctx: &SessionContext,
+) -> datafusion::physical_plan::metrics::MetricsSet {
     let plan = semcast::sql(
-        &ctx,
+        ctx,
         "SELECT meeting_id FROM meetings WHERE transcript MEANS 'sync' WITH RECALL 0.9",
     )
     .await
@@ -846,42 +867,64 @@ async fn failed_calibration_labels_count_as_misses() {
     .create_physical_plan()
     .await
     .unwrap();
-    let batches = datafusion::physical_plan::collect(Arc::clone(&plan), ctx.task_ctx())
+    datafusion::physical_plan::collect(Arc::clone(&plan), ctx.task_ctx())
         .await
         .unwrap();
-    let mut ids: Vec<i64> = batches
-        .iter()
-        .flat_map(|b| {
-            b.column(0)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap()
-                .values()
-                .to_vec()
-        })
-        .collect();
-    ids.sort_unstable();
+    find_node(&plan, "IndexScanExec")
+        .expect("the funnel planned a scan")
+        .metrics()
+        .unwrap()
+}
 
-    // Verify fails on the same 11 rows (ids 1 and 10-19), which drop out.
-    let expected: Vec<i64> = (1..=MANY_MATCHES)
-        .filter(|id| !id.to_string().starts_with('1'))
-        .collect();
-    assert_eq!(ids, expected);
-
-    let scan = find_node(&plan, "IndexScanExec").expect("the funnel planned a scan");
-    let metrics = scan.metrics().unwrap();
+/// A failed label the floor keeps anyway is no miss. The model fails on 11
+/// matches that all score 1.0: the floor keeps them, so the worst case for
+/// them is a kept non-match, and the index still prunes every negative.
+#[tokio::test]
+async fn failed_labels_the_floor_keeps_do_not_stop_pruning() {
+    let model = Arc::new(
+        MockModel::answering_yes_to(["sync"])
+            .embedding_by_theme(["sync"])
+            .failing_on(["sync 1"]),
+    );
+    let ctx = failure_context(model, &[]).await;
+    let metrics = calibrated_scan_metrics(&ctx).await;
     assert_eq!(
         metrics
             .sum_by_name("calibration_label_errors")
             .unwrap()
             .as_usize(),
         11,
-        "every failed label is reported",
+    );
+    assert_eq!(metrics.sum_by_name("rows_pruned").unwrap().as_usize(), 10);
+}
+
+/// A failed label below the floor is a possible lost match. Six documents
+/// the model fails on score 0.0, beside 40 known matches at 1.0. Dropped from
+/// the sample (the old behaviour), they were invisible: the floor sat at 1.0
+/// and pruned them with the negatives. Counted at worst as lost matches,
+/// they cap recall at 40/46 under a 1.0 floor, so the floor drops to keep
+/// them and nothing is pruned.
+#[tokio::test]
+async fn failed_labels_below_the_floor_stop_pruning() {
+    let model = Arc::new(
+        MockModel::answering_yes_to(["sync"])
+            .embedding_by_theme(["sync"])
+            .failing_on(["SYNC"]),
+    );
+    let extra = ["SYNC a", "SYNC b", "SYNC c", "SYNC d", "SYNC e", "SYNC f"];
+    let ctx = failure_context(model, &extra).await;
+    let metrics = calibrated_scan_metrics(&ctx).await;
+    assert_eq!(
+        metrics
+            .sum_by_name("calibration_label_errors")
+            .unwrap()
+            .as_usize(),
+        6,
     );
     assert_eq!(
         metrics.sum_by_name("rows_pruned").unwrap().as_usize(),
         0,
-        "failures put the target out of reach, so the index prunes nothing",
+        "the floor drops below the failed labels, keeping every row",
     );
 }
 

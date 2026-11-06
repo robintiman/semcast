@@ -42,8 +42,8 @@ pub struct FunnelCounts {
     pub rows_pruned: usize,
     pub calibration_sampled_rows: usize,
     pub calibration_model_calls: usize,
-    /// Sampled documents the model failed to label. Each counts against
-    /// the recall certificate as a possible miss.
+    /// Sampled documents the model failed to label. The certificate assumes
+    /// each is a lost match if the floor would prune it.
     pub calibration_label_errors: usize,
     pub has_verify: bool,
     pub model_calls: usize,
@@ -224,7 +224,7 @@ pub fn render(counts: &FunnelCounts) -> String {
             );
             if counts.calibration_label_errors > 0 {
                 calibration.push_str(&format!(
-                    ", {} label errors counted as misses",
+                    ", {} label errors (assumed lost where pruned)",
                     counts.calibration_label_errors,
                 ));
             }
@@ -358,8 +358,9 @@ mod tests {
 
         counts.calibration_label_errors = 3;
         assert!(
-            render(&counts)
-                .contains("64 rows labeled, 64 model calls, 3 label errors counted as misses"),
+            render(&counts).contains(
+                "64 rows labeled, 64 model calls, 3 label errors (assumed lost where pruned)"
+            ),
             "{}",
             render(&counts),
         );

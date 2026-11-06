@@ -57,8 +57,9 @@ type Label = (String, Option<bool>);
 /// (passes through at any floor, so it helps recall for free), or indexed but
 /// missing from the scores (lost at any floor — the scan is exhaustive and
 /// reads scores and membership from one snapshot, so it produces none). A
-/// document whose label failed counts as an unverified positive: the worst
-/// case, since the scan cannot vouch for a match it could not check.
+/// document whose label failed is recorded by its score, and the calibration
+/// assumes the worst for it at each floor (see
+/// [`SampledScores::unverified_scores`]).
 fn score_labels(
     labels: &[Label],
     per_doc_best: &HashMap<u64, f32>,
@@ -69,15 +70,21 @@ fn score_labels(
         ..Default::default()
     };
     for (text, label) in labels {
+        let hash = doc_hash(text);
         match label {
+            Some(false) => continue,
             None => {
-                scores.positive_unverified += 1;
+                match per_doc_best.get(&hash) {
+                    Some(&score) => scores.unverified_scores.push(score),
+                    None if indexed.contains(&hash) => scores.positive_lost += 1,
+                    // Never indexed: passes through at any floor, so it is
+                    // kept whatever its truth, and changes nothing.
+                    None => {}
+                }
                 continue;
             }
-            Some(false) => continue,
             Some(true) => {}
         }
-        let hash = doc_hash(text);
         match per_doc_best.get(&hash) {
             Some(&score) => scores.positive_scores.push(score),
             None if indexed.contains(&hash) => scores.positive_lost += 1,
