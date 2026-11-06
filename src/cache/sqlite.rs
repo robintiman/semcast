@@ -241,17 +241,9 @@ fn row_key(key: &CacheKey) -> RowKey {
     .to_le_bytes()
 }
 
-impl SemanticCache for SqliteCache {
-    fn get(&self, key: &CacheKey) -> Option<CachedValue> {
-        let row_key = row_key(key);
-        if let Some(value) = self
-            .pending
-            .lock()
-            .expect("store lock poisoned")
-            .get(&row_key)
-        {
-            return Some(value.clone());
-        }
+impl SqliteCache {
+    /// The verdict committed to disk under `row_key`, if any.
+    fn committed(&self, row_key: &RowKey) -> Option<CachedValue> {
         let reader = self.reader.lock().expect("store lock poisoned");
         let row = reader
             .query_row(
@@ -270,13 +262,32 @@ impl SemanticCache for SqliteCache {
             }
         }
     }
+}
+
+impl SemanticCache for SqliteCache {
+    fn get(&self, key: &CacheKey) -> Option<CachedValue> {
+        let row_key = row_key(key);
+        if let Some(value) = self
+            .pending
+            .lock()
+            .expect("store lock poisoned")
+            .get(&row_key)
+        {
+            return Some(value.clone());
+        }
+        self.committed(&row_key)
+    }
 
     fn put(&self, key: CacheKey, value: CachedValue) {
         let row_key = row_key(&key);
         {
+            // First evaluation wins, pending or committed. The pending lock
+            // is held across both checks: the writer removes a key from
+            // pending only after committing it, so a key in neither place
+            // is genuinely new, and no committed verdict can be shadowed.
             let mut pending = self.pending.lock().expect("store lock poisoned");
-            if pending.contains_key(&row_key) {
-                return; // first evaluation wins
+            if pending.contains_key(&row_key) || self.committed(&row_key).is_some() {
+                return;
             }
             pending.insert(row_key, value.clone());
         }
@@ -399,6 +410,32 @@ mod tests {
         for variant in variants {
             assert_ne!(row_key(&base), row_key(&variant), "{variant:?}");
         }
+    }
+
+    /// The writer commits a verdict and drops it from the pending map; a
+    /// later put for the same key must still lose to it.
+    #[test]
+    fn first_evaluation_wins_after_it_is_committed() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = SqliteCache::open(dir.path().join("store.db")).unwrap();
+        cache.put(key("a"), CachedValue::Value("yes".to_owned()));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while cache.len().unwrap() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "writer never committed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // Committed; the pending entry is gone once the writer clears it.
+        while !cache.pending.lock().unwrap().is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        cache.put(key("a"), CachedValue::Value("no".to_owned()));
+        assert_eq!(
+            cache.get(&key("a")),
+            Some(CachedValue::Value("yes".to_owned()))
+        );
     }
 
     #[test]
