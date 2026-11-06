@@ -31,6 +31,8 @@ pub struct MockModel {
     themes: Vec<String>,
     /// Artificial per-call delay; see [`MockModel::with_latency`].
     latency: Option<Duration>,
+    /// Inputs containing any of these fail; see [`MockModel::failing_on`].
+    failing: Vec<String>,
 }
 
 impl std::fmt::Debug for MockModel {
@@ -123,6 +125,18 @@ impl MockModel {
         self
     }
 
+    /// Fail the completion of any input containing one of `needles`, as a
+    /// provider outage or a refusal would. The failed request still counts
+    /// as a call: it was sent.
+    pub fn failing_on<I, S>(mut self, needles: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.failing = needles.into_iter().map(Into::into).collect();
+        self
+    }
+
     /// Sleep this long in every `complete` call. Real providers take seconds
     /// per batch; tests that need to observe a query *while it runs* — batch
     /// job progress, cancellation — need a mock that isn't instantaneous.
@@ -154,6 +168,11 @@ impl ModelProvider for MockModel {
         requests
             .into_iter()
             .map(|req| {
+                if self.failing.iter().any(|n| req.input.contains(n.as_str())) {
+                    return Err(crate::SemcastError::Model(
+                        "mock failure configured for this input".to_owned(),
+                    ));
+                }
                 let matched = || self.truthy.iter().any(|n| req.input.contains(n.as_str()));
                 let text = match (&self.json, &req.schema) {
                     (Some(responder), Some(_)) => responder(&req).to_string(),

@@ -42,6 +42,9 @@ pub struct FunnelCounts {
     pub rows_pruned: usize,
     pub calibration_sampled_rows: usize,
     pub calibration_model_calls: usize,
+    /// Sampled documents the model failed to label. The certificate assumes
+    /// each is a lost match if the floor would prune it.
+    pub calibration_label_errors: usize,
     pub has_verify: bool,
     pub model_calls: usize,
     pub cache_hits: usize,
@@ -123,6 +126,8 @@ pub fn snapshot(plan: &Arc<dyn ExecutionPlan>) -> FunnelCounts {
                         counter_total(&metrics, "calibration_sampled_rows");
                     counts.calibration_model_calls +=
                         counter_total(&metrics, "calibration_model_calls");
+                    counts.calibration_label_errors +=
+                        counter_total(&metrics, "calibration_label_errors");
                 }
             }
             "VerifyExec" => {
@@ -213,10 +218,17 @@ pub fn render(counts: &FunnelCounts) -> String {
             counts.index_hits, counts.rows_pruned,
         ));
         if counts.calibration_sampled_rows > 0 {
-            parts.push(format!(
+            let mut calibration = format!(
                 "calibration: {} rows labeled, {} model calls",
                 counts.calibration_sampled_rows, counts.calibration_model_calls,
-            ));
+            );
+            if counts.calibration_label_errors > 0 {
+                calibration.push_str(&format!(
+                    ", {} label errors (assumed lost where pruned)",
+                    counts.calibration_label_errors,
+                ));
+            }
+            parts.push(calibration);
         }
     }
     if counts.has_verify {
@@ -328,4 +340,29 @@ fn counter_total(metrics: &MetricsSet, name: &str) -> usize {
         .filter(|m| m.value().name() == name)
         .map(|m| m.value().as_usize())
         .sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_reports_failed_labels_only_when_there_are_some() {
+        let mut counts = FunnelCounts {
+            has_index_scan: true,
+            calibration_sampled_rows: 64,
+            calibration_model_calls: 64,
+            ..Default::default()
+        };
+        assert!(!render(&counts).contains("label errors"));
+
+        counts.calibration_label_errors = 3;
+        assert!(
+            render(&counts).contains(
+                "64 rows labeled, 64 model calls, 3 label errors (assumed lost where pruned)"
+            ),
+            "{}",
+            render(&counts),
+        );
+    }
 }

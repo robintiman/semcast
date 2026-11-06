@@ -108,8 +108,10 @@ assembled in the physical planner, not there.
 - Cache keys carry a prompt version (`MEANS_PROMPT_VERSION`,
   `EXTRACT_PROMPT_VERSION`, `SemanticType::version`). Change a synthesized prompt
   and bump its constant, so stale verdicts are invalidated honestly.
-- Rows fail, queries don't: a row the model errors on falls through
-  (`CachedValue::Error`) rather than failing the statement.
+- Rows fail, queries don't: a row the model errors on is excluded from a
+  filter (counted in `rows_dropped`) or falls through to `ELSE` in a `CASE`,
+  rather than failing the statement. A failed calibration label stays in the
+  sample, assumed a lost match wherever the floor would prune it.
 - An index gap degrades, never drops: unindexed documents pass the pre-filter
   through to full-text verify; `SEMANTIC DISTINCT` falls back to exact-match
   dedupe. Never silently discard rows the index hasn't seen.
