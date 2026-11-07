@@ -23,6 +23,8 @@ pub enum SemanticDdl {
     CreateIndex { table: String, column: String },
     /// `CREATE SEMANTIC TYPE Name AS (...)`
     CreateType(SemanticType),
+    /// `DROP SEMANTIC TYPE [IF EXISTS] Name`
+    DropType { name: String, if_exists: bool },
     /// `CREATE SEMANTIC PREDICATE name(params) AS template [CHEAP USING ...]`
     CreatePredicate {
         name: String,
@@ -54,6 +56,34 @@ pub fn parse_semantic_ddl(parser: &mut Parser) -> crate::Result<SemanticDdl> {
     }
 }
 
+/// Parse the tail of a `DROP SEMANTIC` statement — the leading `DROP
+/// SEMANTIC` is already consumed. Only types can be dropped: an index goes
+/// with its table.
+pub fn parse_semantic_drop(parser: &mut Parser) -> crate::Result<SemanticDdl> {
+    expect_word(parser, "TYPE").map_err(type_error)?;
+    let if_exists = parser.parse_keywords(&[
+        datafusion::sql::sqlparser::keywords::Keyword::IF,
+        datafusion::sql::sqlparser::keywords::Keyword::EXISTS,
+    ]);
+    let name = parser
+        .parse_identifier()
+        .map_err(|e| type_error(e.to_string()))?
+        .value;
+    let _ = parser.consume_token(&Token::SemiColon);
+    parser
+        .expect_token(&Token::EOF)
+        .map_err(|e| type_error(e.to_string()))?;
+    Ok(SemanticDdl::DropType { name, if_exists })
+}
+
+/// An identifier as DataFusion resolves it: unquoted folds to lowercase.
+fn normalized(ident: datafusion::sql::sqlparser::ast::Ident) -> String {
+    match ident.quote_style {
+        Some(_) => ident.value,
+        None => ident.value.to_lowercase(),
+    }
+}
+
 /// Parse the tail of `CREATE SEMANTIC INDEX ON table(column)` (the leading
 /// `CREATE SEMANTIC INDEX` is already consumed).
 fn parse_create_index(parser: &mut Parser) -> crate::Result<SemanticDdl> {
@@ -76,8 +106,8 @@ fn parse_create_index(parser: &mut Parser) -> crate::Result<SemanticDdl> {
         .map_err(|e| index_error(e.to_string()))?;
 
     Ok(SemanticDdl::CreateIndex {
-        table: table.value,
-        column: column.value,
+        table: normalized(table),
+        column: normalized(column),
     })
 }
 
@@ -387,10 +417,42 @@ mod tests {
         assert_eq!(
             ddl("  create Semantic INDEX on  Meetings ( Transcript ) ;"),
             SemanticDdl::CreateIndex {
+                table: "meetings".to_owned(),
+                column: "transcript".to_owned(),
+            },
+            "unquoted names fold to lowercase, as DataFusion resolves them",
+        );
+    }
+
+    #[test]
+    fn quoted_index_names_keep_their_case() {
+        assert_eq!(
+            ddl(r#"CREATE SEMANTIC INDEX ON "Meetings"("Transcript")"#),
+            SemanticDdl::CreateIndex {
                 table: "Meetings".to_owned(),
                 column: "Transcript".to_owned(),
             },
         );
+    }
+
+    #[test]
+    fn parses_drop_semantic_type() {
+        use crate::sql::statement::{SemcastStatement, parse_semcast_statement};
+        for (sql, if_exists) in [
+            ("DROP SEMANTIC TYPE Ticket", false),
+            ("drop semantic type if exists Ticket;", true),
+        ] {
+            let Ok(SemcastStatement::Ddl(ddl)) = parse_semcast_statement(sql) else {
+                panic!("{sql} is semantic DDL");
+            };
+            assert_eq!(
+                ddl,
+                SemanticDdl::DropType {
+                    name: "Ticket".to_owned(),
+                    if_exists
+                }
+            );
+        }
     }
 
     #[test]

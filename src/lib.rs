@@ -109,25 +109,53 @@ pub(crate) async fn run_sql(ctx: &SessionContext, text: &str, record: bool) -> R
                     Ok(DataFrame::new(ctx.state(), no_rows))
                 }
                 sql::ddl::SemanticDdl::CreateType(ty) => {
-                    let runtime = ctx
-                        .state()
-                        .config()
-                        .get_extension::<SemcastRuntime>()
-                        .ok_or_else(|| {
-                            DataFusionError::Plan("semcast runtime is not registered".to_owned())
-                        })?;
+                    let runtime = index::runtime(ctx)?;
+                    let catalog = runtime.catalog().filter(|_| record);
+                    let _guard = match catalog {
+                        Some(catalog) => Some(catalog.lock().await),
+                        None => None,
+                    };
                     let name = ty.name.to_lowercase();
                     runtime.type_registry().register(ty)?;
-                    if record {
-                        let change = catalog::Change::Put {
-                            entry: catalog::Entry {
-                                kind: catalog::EntryKind::SemanticType,
-                                name: name.clone(),
-                                definition: text.to_owned(),
-                            },
-                            replace: false,
+                    if let Some(catalog) = catalog {
+                        let entry = catalog::Entry {
+                            kind: catalog::EntryKind::SemanticType,
+                            name: name.clone(),
+                            definition: text.to_owned(),
                         };
-                        save(&runtime, vec![change], &format!("semantic type {name}")).await?;
+                        let failure = format!(
+                            "semantic type {name} is defined for this session but will be \
+                             gone after a restart"
+                        );
+                        catalog::save(catalog, vec![catalog::Change::Put(entry)], &failure).await?;
+                    }
+                    let no_rows = LogicalPlanBuilder::empty(false).build()?;
+                    Ok(DataFrame::new(ctx.state(), no_rows))
+                }
+                sql::ddl::SemanticDdl::DropType { name, if_exists } => {
+                    let runtime = index::runtime(ctx)?;
+                    let catalog = runtime.catalog().filter(|_| record);
+                    let _guard = match catalog {
+                        Some(catalog) => Some(catalog.lock().await),
+                        None => None,
+                    };
+                    let name = name.to_lowercase();
+                    if !runtime.type_registry().unregister(&name) && !if_exists {
+                        return Err(DataFusionError::Plan(format!(
+                            "semantic type {name} does not exist"
+                        ))
+                        .into());
+                    }
+                    if let Some(catalog) = catalog {
+                        let forget = catalog::Change::Forget {
+                            kind: catalog::EntryKind::SemanticType,
+                            name: name.clone(),
+                        };
+                        let failure = format!(
+                            "semantic type {name} is dropped for this session but will come \
+                             back after a restart"
+                        );
+                        catalog::save(catalog, vec![forget], &failure).await?;
                     }
                     let no_rows = LogicalPlanBuilder::empty(false).build()?;
                     Ok(DataFrame::new(ctx.state(), no_rows))
@@ -178,46 +206,10 @@ pub(crate) async fn run_sql(ctx: &SessionContext, text: &str, record: bool) -> R
     if let Some(similarity) = clauses.similarity {
         plan = optimizer::distinct::apply_similarity(plan, similarity)?;
     }
-    let changes = if record {
-        catalog::changes_for(ctx, &plan, text)
-    } else {
-        Vec::new()
-    };
-    let dropped = dropped_table(&plan);
-    let df = ctx.execute_logical_plan(plan).await?;
-    // DDL has run by now: `execute_logical_plan` executes it eagerly.
-    if let Some(runtime) = ctx.state().config().get_extension::<SemcastRuntime>() {
-        if let Some(table) = dropped {
-            runtime.unregister_indexes(&table);
-        }
-        save(&runtime, changes, "this definition").await?;
+    if matches!(plan, datafusion::logical_expr::LogicalPlan::Ddl(_)) {
+        return catalog::execute_ddl(ctx, plan, text, record).await;
     }
-    Ok(df)
-}
-
-/// The bare name of the table or view a `DROP` plan removes.
-fn dropped_table(plan: &datafusion::logical_expr::LogicalPlan) -> Option<String> {
-    use datafusion::logical_expr::{DdlStatement, LogicalPlan};
-    match plan {
-        LogicalPlan::Ddl(DdlStatement::DropTable(drop)) => Some(drop.name.table().to_owned()),
-        LogicalPlan::Ddl(DdlStatement::DropView(drop)) => Some(drop.name.table().to_owned()),
-        _ => None,
-    }
-}
-
-/// Apply `changes` to the session's catalog, if it has one. A statement
-/// whose definition the catalog refuses has still taken effect, so the
-/// error says so rather than implying nothing happened.
-async fn save(runtime: &SemcastRuntime, changes: Vec<catalog::Change>, what: &str) -> Result<()> {
-    let Some(catalog) = runtime.catalog() else {
-        return Ok(());
-    };
-    catalog.apply(changes).await.map_err(|error| {
-        SemcastError::Store(format!(
-            "{what} is defined for this session, but the store could not save \
-             it, so it will be gone after a restart: {error}"
-        ))
-    })
+    Ok(ctx.execute_logical_plan(plan).await?)
 }
 
 /// [`semcast_context`] with a caller-provided verdict cache.

@@ -177,6 +177,16 @@ pub async fn create_semantic_index(
     let index: Arc<dyn SemanticIndex> = Arc::new(index);
     runtime.register_index(table, column, Arc::clone(&index));
     if let Some(catalog) = runtime.catalog() {
+        let _guard = catalog.lock().await;
+        // An index over an in-memory table would come back without its
+        // table, and attach to whatever takes the name next.
+        if !catalog.has_relation_named(table).await? {
+            tracing::info!(
+                "semantic index on {table}({column}) is kept for this session only: \
+                 {table} is not a saved table"
+            );
+            return Ok(index);
+        }
         // Absolute, so a restart from another directory finds the dataset.
         let path =
             std::path::absolute(&path).map_err(|error| SemcastError::Index(error.to_string()))?;
@@ -188,20 +198,16 @@ pub async fn create_semantic_index(
             score_floor: options.search.score_floor,
             chunks_per_doc: options.search.chunks_per_doc,
         };
-        let change = crate::catalog::Change::Put {
-            entry: crate::catalog::Entry {
-                kind: crate::catalog::EntryKind::SemanticIndex,
-                name: crate::catalog::index_name(table, column),
-                definition: serde_json::to_string(&saved).expect("a saved index serializes"),
-            },
-            replace: true,
+        let entry = crate::catalog::Entry {
+            kind: crate::catalog::EntryKind::SemanticIndex,
+            name: crate::catalog::index_name(table, column),
+            definition: serde_json::to_string(&saved).expect("a saved index serializes"),
         };
-        catalog.apply(vec![change]).await.map_err(|error| {
-            SemcastError::Store(format!(
-                "the semantic index on {table}({column}) is built for this session, but \
-                 the store could not save it, so it will be gone after a restart: {error}"
-            ))
-        })?;
+        let failure = format!(
+            "the semantic index on {table}({column}) is built for this session but will be \
+             gone after a restart"
+        );
+        crate::catalog::save(catalog, vec![crate::catalog::Change::Put(entry)], &failure).await?;
     }
     Ok(index)
 }

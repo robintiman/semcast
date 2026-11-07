@@ -2,7 +2,7 @@
 //! types and indexes — is back after a restart, and indexes come back
 //! without embedding anything.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -295,4 +295,199 @@ async fn an_index_from_another_embedder_is_not_reattached() {
     assert_eq!(entry.kind, EntryKind::SemanticIndex);
     assert!(error.contains("another-embedder"), "{error}");
     assert!(runtime(&ctx).index_for("tickets", "body").is_none());
+}
+
+#[tokio::test]
+async fn a_drop_that_drops_nothing_forgets_nothing() {
+    let disk = Disk::new();
+    let first = disk.session(Arc::new(MockModel::default())).await;
+    run(&first, &disk.create_tickets()).await;
+    run(&first, "CREATE VIEW ids AS SELECT id FROM tickets").await;
+    run(&first, "CREATE SEMANTIC INDEX ON tickets(body)").await;
+    // Each succeeds without dropping anything: the type doesn't match.
+    run(&first, "DROP TABLE IF EXISTS ids").await;
+    run(&first, "DROP VIEW IF EXISTS tickets").await;
+    assert!(first.table_exist("ids").unwrap());
+    assert!(runtime(&first).index_for("tickets", "body").is_some());
+    assert_eq!(disk.entries().len(), 3);
+    drop(first);
+
+    let second = disk.session(Arc::new(MockModel::default())).await;
+    assert!(second.table_exist("ids").unwrap());
+    assert!(runtime(&second).index_for("tickets", "body").is_some());
+}
+
+#[tokio::test]
+async fn dropping_a_same_named_table_elsewhere_keeps_the_index() {
+    let disk = Disk::new();
+    let first = disk.session(Arc::new(MockModel::default())).await;
+    run(&first, &disk.create_tickets()).await;
+    run(&first, "CREATE SEMANTIC INDEX ON tickets(body)").await;
+    run(&first, "CREATE SCHEMA staging").await;
+    run(&first, "DROP TABLE IF EXISTS staging.tickets").await;
+    let staged = disk
+        .create_tickets()
+        .replacen("TABLE tickets", "TABLE staging.tickets", 1);
+    run(&first, &staged).await;
+    run(&first, "DROP TABLE staging.tickets").await;
+    assert!(
+        runtime(&first).index_for("tickets", "body").is_some(),
+        "public.tickets still has its index"
+    );
+    drop(first);
+
+    let second = disk.session(Arc::new(MockModel::default())).await;
+    assert!(runtime(&second).index_for("tickets", "body").is_some());
+}
+
+#[tokio::test]
+async fn if_not_exists_over_an_in_memory_table_saves_nothing() {
+    let disk = Disk::new();
+    let first = disk.session(Arc::new(MockModel::default())).await;
+    run(&first, "CREATE TABLE tickets AS VALUES (42)").await;
+    let if_not_exists =
+        disk.create_tickets()
+            .replacen("TABLE tickets", "TABLE IF NOT EXISTS tickets", 1);
+    run(&first, &if_not_exists).await;
+    assert_eq!(
+        disk.entries(),
+        vec![],
+        "the CSV definition never took effect"
+    );
+}
+
+#[tokio::test]
+async fn redefining_a_name_that_failed_to_restore_saves_the_new_definition() {
+    let disk = Disk::new();
+    let first = disk.session(Arc::new(MockModel::default())).await;
+    run(&first, &disk.create_tickets()).await;
+    drop(first);
+    let moved = disk.csv("moved");
+    std::fs::rename(disk.csv("tickets"), &moved).unwrap();
+
+    let ctx = SemcastContextBuilder::new(Arc::new(MockModel::default()))
+        .with_catalog(Catalog::open(disk.store()).unwrap())
+        .build();
+    let restored = semcast::restore_catalog(&ctx).await.unwrap();
+    assert_eq!(restored.failed.len(), 1);
+    run(
+        &ctx,
+        &format!(
+            "CREATE EXTERNAL TABLE IF NOT EXISTS tickets STORED AS CSV LOCATION '{}' \
+             OPTIONS ('format.has_header' 'true')",
+            moved.display()
+        ),
+    )
+    .await;
+    drop(ctx);
+
+    let third = disk.session(Arc::new(MockModel::default())).await;
+    assert!(
+        run(&third, "SELECT count(*) AS n FROM tickets")
+            .await
+            .contains("| 3 |")
+    );
+}
+
+#[tokio::test]
+async fn an_index_on_an_in_memory_table_is_not_saved() {
+    let disk = Disk::new();
+    let first = disk.session(Arc::new(MockModel::default())).await;
+    run(&first, "CREATE TABLE notes AS VALUES ('furious'), ('calm')").await;
+    run(&first, "CREATE SEMANTIC INDEX ON notes(column1)").await;
+    assert!(runtime(&first).index_for("notes", "column1").is_some());
+    assert_eq!(disk.entries(), vec![]);
+}
+
+#[tokio::test]
+async fn replacing_a_saved_table_with_an_in_memory_one_forgets_its_indexes() {
+    let disk = Disk::new();
+    let first = disk.session(Arc::new(MockModel::default())).await;
+    run(&first, &disk.create_tickets()).await;
+    run(&first, "CREATE SEMANTIC INDEX ON tickets(body)").await;
+    run(&first, "CREATE OR REPLACE TABLE tickets AS VALUES (1)").await;
+    assert_eq!(disk.entries(), vec![]);
+}
+
+#[tokio::test]
+async fn index_names_fold_case_like_datafusion() {
+    let disk = Disk::new();
+    let first = disk.session(Arc::new(MockModel::default())).await;
+    run(&first, &disk.create_tickets()).await;
+    run(&first, "CREATE SEMANTIC INDEX ON Tickets(Body)").await;
+    assert!(runtime(&first).index_for("tickets", "body").is_some());
+    run(&first, "DROP TABLE tickets").await;
+    assert_eq!(disk.entries(), vec![], "the drop forgets the index");
+}
+
+#[tokio::test]
+async fn a_dropped_semantic_type_stays_dropped() {
+    let disk = Disk::new();
+    let first = disk.session(Arc::new(MockModel::default())).await;
+    run(
+        &first,
+        "CREATE SEMANTIC TYPE Ticket AS (mood ONEOF(angry, calm) 'how the customer feels')",
+    )
+    .await;
+    run(&first, "DROP SEMANTIC TYPE ticket").await;
+    assert!(runtime(&first).type_registry().get("ticket").is_none());
+    assert!(
+        semcast::sql(&first, "DROP SEMANTIC TYPE Ticket")
+            .await
+            .is_err()
+    );
+    run(&first, "DROP SEMANTIC TYPE IF EXISTS Ticket").await;
+    assert_eq!(disk.entries(), vec![]);
+    drop(first);
+
+    let second = disk.session(Arc::new(MockModel::default())).await;
+    assert!(runtime(&second).type_registry().get("ticket").is_none());
+}
+
+#[tokio::test]
+async fn a_relative_location_is_saved_absolute() {
+    let disk = Disk::new();
+    let cwd = std::env::current_dir().unwrap();
+    let relative = pathdiff(&disk.csv("tickets"), &cwd);
+    let first = disk.session(Arc::new(MockModel::default())).await;
+    run(
+        &first,
+        &format!(
+            "CREATE EXTERNAL TABLE tickets STORED AS CSV LOCATION '{relative}' \
+             OPTIONS ('format.has_header' 'true')"
+        ),
+    )
+    .await;
+    let [entry] = Catalog::open(disk.store())
+        .unwrap()
+        .entries()
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let saved = entry.definition.split('\'').nth(1).unwrap();
+    assert!(Path::new(saved).is_absolute(), "{}", entry.definition);
+    assert_eq!(
+        std::fs::canonicalize(saved).unwrap(),
+        std::fs::canonicalize(disk.csv("tickets")).unwrap()
+    );
+}
+
+/// `path` relative to `base`, through `..` as needed.
+fn pathdiff(path: &Path, base: &Path) -> String {
+    let path = std::fs::canonicalize(path).unwrap();
+    let base = std::fs::canonicalize(base).unwrap();
+    let common = path
+        .components()
+        .zip(base.components())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let ups = base.components().count() - common;
+    let mut relative = std::path::PathBuf::new();
+    for _ in 0..ups {
+        relative.push("..");
+    }
+    for part in path.components().skip(common) {
+        relative.push(part);
+    }
+    relative.to_str().unwrap().to_owned()
 }

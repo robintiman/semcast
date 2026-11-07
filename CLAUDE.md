@@ -118,8 +118,10 @@ assembled in the physical planner, not there.
   through to full-text verify; `SEMANTIC DISTINCT` falls back to exact-match
   dedupe. Never silently discard rows the index hasn't seen.
 - A new statement that defines or drops something durable must also save
-  or forget it in the catalog (`catalog::changes_for`, or a `Change` from the
-  DDL branch of `run_sql`), or it silently vanishes on restart.
+  or forget it in the catalog (`catalog::execute_ddl` for planned DDL, a
+  `Change` in the semantic-DDL branch of `run_sql`), or it silently vanishes
+  on restart. Save what the statement did, not what it said: compare the name
+  before and after it runs.
 - Illegal marker positions (a `means()` under `OR`/`NOT`, in `GROUP BY`, …) are
   plan-time errors, not silent per-row model calls.
 

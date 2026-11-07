@@ -68,10 +68,12 @@ psql -h 127.0.0.1 -p 5433
 `--store`. Set `--store semcast.db` to keep state across restarts. A verdict
 paid for once is free after the restart. Schemas, external tables, views,
 semantic types and semantic indexes come back too. Indexes are reattached
-from `--index-dir` without re-embedding, so give it a directory that outlives
-the temp dir. Not kept: in-memory tables (`CREATE TABLE ... AS`) and
-`TEMPORARY` objects. A definition that fails to restore, such as a table whose
-file is gone, is logged and kept; `DROP ... IF EXISTS` forgets it.
+from where they were built, without re-embedding, so set `--index-dir` to a
+directory that outlives the temp dir. Not kept: in-memory tables (`CREATE
+TABLE ... AS`), `TEMPORARY` objects, and indexes over either. A definition
+that fails to restore, such as a table whose file is gone, is logged and
+kept until the name is defined again or dropped (`DROP ... IF EXISTS`).
+Remove a semantic type with `DROP SEMANTIC TYPE [IF EXISTS] Name`.
 
 Build from source:
 

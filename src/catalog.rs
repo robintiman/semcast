@@ -3,25 +3,38 @@
 //! The verdict store keeps what the model answered; this keeps what the
 //! user defined — schemas, external tables, views, semantic types and
 //! semantic indexes — in a `catalog` table of the same SQLite file. Each
-//! successful `CREATE` saves a row and each `DROP` deletes it; [`restore`]
-//! replays the rows into a fresh context at startup.
+//! `CREATE` that takes effect saves a row and each `DROP` that removes
+//! something deletes it; [`restore`] replays the rows into a fresh context
+//! at startup.
+//!
+//! What is saved follows what a statement *did*, not what it said: the
+//! name is looked up before and after the statement runs. `IF NOT EXISTS`
+//! on a defined name, or `DROP TABLE IF EXISTS` on a view, changes nothing
+//! in the session, so it changes nothing on disk either.
 //!
 //! A row holds the statement's own SQL text, replayed through
 //! [`crate::sql`], so a definition restores exactly as it was first planned.
-//! The exception is a semantic index: replaying `CREATE SEMANTIC INDEX`
-//! would embed the whole column again, so its row holds where the index
-//! lives on disk and [`restore`] reattaches it without an embedding call.
+//! A relative `LOCATION` is saved made absolute, so a server started from
+//! another directory reads the same file. The exception is a semantic
+//! index: replaying `CREATE SEMANTIC INDEX` would embed the whole column
+//! again, so its row holds where the index lives on disk and [`restore`]
+//! reattaches it without an embedding call.
 //!
 //! What is not saved: in-memory tables (`CREATE TABLE ... AS`, `INSERT`ed
-//! rows), whose data lives in the process, and anything `TEMPORARY`.
+//! rows), whose data lives in the process, anything `TEMPORARY`, and
+//! semantic indexes over either. Defining one of these under a saved name
+//! forgets the saved definition, which would otherwise replace it after a
+//! restart.
 //!
 //! An entry that fails to restore (its file is gone, the session embeds
 //! with another model) is logged and kept, so it comes back once the cause
-//! is fixed; `DROP ... IF EXISTS` forgets it for good.
+//! is fixed — or is overwritten when the name is defined again.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use datafusion::common::TableReference;
+use datafusion::dataframe::DataFrame;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{DdlStatement, LogicalPlan};
 use rusqlite::{Connection, params};
@@ -77,14 +90,15 @@ pub struct Entry {
 /// One edit to the catalog. A statement's edits commit together.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Change {
-    /// Save `entry`. With `replace`, a row of the same name is overwritten
-    /// and moves to the end of the replay order; without, an existing row
-    /// wins (`IF NOT EXISTS` on a name already defined changed nothing).
-    Put { entry: Entry, replace: bool },
+    /// Save `entry`, overwriting a row of the same name; it moves to the end
+    /// of the replay order, after whatever it reads.
+    Put(Entry),
     /// Delete the row of this kind and name, if any.
     Forget { kind: EntryKind, name: String },
-    /// Delete every row of this kind whose name starts with `prefix`.
-    ForgetPrefix { kind: EntryKind, prefix: String },
+    /// Delete the saved indexes on bare table name `table`, unless a saved
+    /// relation of that bare name remains — the index map is keyed by bare
+    /// name, so such a relation still owns them.
+    ForgetOrphanIndexes { table: String },
 }
 
 /// The catalog half of a store file opened with
@@ -93,6 +107,9 @@ pub(crate) enum Change {
 #[derive(Debug, Clone)]
 pub struct Catalog {
     connection: Arc<Mutex<Connection>>,
+    /// Held across a statement and its save, so concurrent DDL reaches the
+    /// disk in the order it took effect in memory.
+    ddl: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Catalog {
@@ -100,6 +117,7 @@ impl Catalog {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Ok(Self {
             connection: Arc::new(Mutex::new(open_store(path.as_ref())?)),
+            ddl: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -134,6 +152,31 @@ impl Catalog {
         Ok(entries)
     }
 
+    /// Serialize a definition change with its save. Hold the guard from
+    /// before the change takes effect until [`Catalog::apply`] returns.
+    pub(crate) async fn lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.ddl.lock().await
+    }
+
+    /// Whether a saved relation has bare table name `table`.
+    pub(crate) async fn has_relation_named(&self, table: &str) -> Result<bool> {
+        let connection = Arc::clone(&self.connection);
+        let suffix = format!(".{table}");
+        tokio::task::spawn_blocking(move || {
+            let connection = connection.lock().expect("catalog lock poisoned");
+            connection
+                .query_row(
+                    "SELECT EXISTS (SELECT 1 FROM catalog \
+                     WHERE kind = 'relation' AND substr(name, -length(?1)) = ?1)",
+                    params![suffix],
+                    |row| row.get(0),
+                )
+                .map_err(store_err)
+        })
+        .await
+        .map_err(|error| SemcastError::Store(error.to_string()))?
+    }
+
     /// Apply `changes` in one transaction, off the async threads: a busy
     /// file can make SQLite wait.
     pub(crate) async fn apply(&self, changes: Vec<Change>) -> Result<()> {
@@ -156,19 +199,16 @@ fn apply_changes(connection: &mut Connection, changes: &[Change]) -> Result<()> 
         .map_err(store_err)?;
     for change in changes {
         match change {
-            Change::Put { entry, replace } => {
-                if *replace {
-                    transaction
-                        .execute(
-                            "DELETE FROM catalog WHERE kind = ?1 AND name = ?2",
-                            params![entry.kind.as_str(), entry.name],
-                        )
-                        .map_err(store_err)?;
-                }
+            Change::Put(entry) => {
                 transaction
                     .execute(
-                        "INSERT OR IGNORE INTO catalog (kind, name, definition) \
-                         VALUES (?1, ?2, ?3)",
+                        "DELETE FROM catalog WHERE kind = ?1 AND name = ?2",
+                        params![entry.kind.as_str(), entry.name],
+                    )
+                    .map_err(store_err)?;
+                transaction
+                    .execute(
+                        "INSERT INTO catalog (kind, name, definition) VALUES (?1, ?2, ?3)",
                         params![entry.kind.as_str(), entry.name, entry.definition],
                     )
                     .map_err(store_err)?;
@@ -181,13 +221,17 @@ fn apply_changes(connection: &mut Connection, changes: &[Change]) -> Result<()> 
                     )
                     .map_err(store_err)?;
             }
-            Change::ForgetPrefix { kind, prefix } => {
+            Change::ForgetOrphanIndexes { table } => {
                 // substr, not LIKE: a name may hold `%` or `_`.
                 transaction
                     .execute(
                         "DELETE FROM catalog \
-                         WHERE kind = ?1 AND substr(name, 1, length(?2)) = ?2",
-                        params![kind.as_str(), prefix],
+                         WHERE kind = 'semantic_index' \
+                           AND substr(name, 1, length(?1)) = ?1 \
+                           AND NOT EXISTS (SELECT 1 FROM catalog \
+                               WHERE kind = 'relation' \
+                                 AND substr(name, -length(?2)) = ?2)",
+                        params![format!("{table}("), format!(".{table}")],
                     )
                     .map_err(store_err)?;
             }
@@ -201,90 +245,258 @@ pub(crate) fn index_name(table: &str, column: &str) -> String {
     format!("{table}({column})")
 }
 
-/// The edits a DDL plan makes to the catalog once it has run, or none for a
-/// plan that defines nothing durable. `sql` is the statement's text.
-pub(crate) fn changes_for(ctx: &SessionContext, plan: &LogicalPlan, sql: &str) -> Vec<Change> {
-    let LogicalPlan::Ddl(ddl) = plan else {
-        return Vec::new();
+/// Save `changes`, or say what the session and the disk now disagree on.
+pub(crate) async fn save(catalog: &Catalog, changes: Vec<Change>, failure: &str) -> Result<()> {
+    catalog.apply(changes).await.map_err(|error| {
+        SemcastError::Store(format!(
+            "{failure}: the store could not save the change: {error}"
+        ))
+    })
+}
+
+/// What a DDL plan would do to a name, read before it runs.
+enum Effect {
+    /// Defines a relation that is saved.
+    SaveRelation {
+        name: TableReference,
+        replaces: bool,
+        location: Option<String>,
+    },
+    /// Defines a relation that is not saved (in memory, or temporary).
+    UnsavedRelation {
+        name: TableReference,
+        replaces: bool,
+    },
+    SaveSchema {
+        name: String,
+    },
+    DropRelation {
+        name: TableReference,
+    },
+    /// Nothing the catalog keeps.
+    Other,
+}
+
+impl Effect {
+    fn of(plan: &LogicalPlan) -> Self {
+        let LogicalPlan::Ddl(ddl) = plan else {
+            return Self::Other;
+        };
+        match ddl {
+            DdlStatement::CreateExternalTable(create) if !create.temporary => Self::SaveRelation {
+                name: create.name.clone(),
+                replaces: create.or_replace,
+                location: Some(create.location.clone()),
+            },
+            DdlStatement::CreateView(create) if !create.temporary => Self::SaveRelation {
+                name: create.name.clone(),
+                replaces: create.or_replace,
+                location: None,
+            },
+            DdlStatement::CreateExternalTable(create) => Self::UnsavedRelation {
+                name: create.name.clone(),
+                replaces: create.or_replace,
+            },
+            DdlStatement::CreateView(create) => Self::UnsavedRelation {
+                name: create.name.clone(),
+                replaces: create.or_replace,
+            },
+            DdlStatement::CreateMemoryTable(create) => Self::UnsavedRelation {
+                name: create.name.clone(),
+                replaces: create.or_replace,
+            },
+            DdlStatement::CreateCatalogSchema(create) => Self::SaveSchema {
+                name: create.schema_name.clone(),
+            },
+            DdlStatement::DropTable(drop) => Self::DropRelation {
+                name: drop.name.clone(),
+            },
+            DdlStatement::DropView(drop) => Self::DropRelation {
+                name: drop.name.clone(),
+            },
+            // No `DropCatalogSchema`: DataFusion cannot deregister a schema.
+            _ => Self::Other,
+        }
+    }
+}
+
+/// Run a DDL `plan` and bring the session's indexes and catalog in line
+/// with what it did. `sql` is the statement's text; with `record` unset
+/// (replaying the catalog) nothing is saved.
+pub(crate) async fn execute_ddl(
+    ctx: &SessionContext,
+    plan: LogicalPlan,
+    sql: &str,
+    record: bool,
+) -> Result<DataFrame> {
+    let runtime = ctx
+        .state()
+        .config()
+        .get_extension::<crate::index::registry::SemcastRuntime>();
+    let catalog = runtime
+        .as_ref()
+        .and_then(|runtime| runtime.catalog().cloned())
+        .filter(|_| record);
+    let _guard = match &catalog {
+        Some(catalog) => Some(catalog.lock().await),
+        None => None,
     };
+    let effect = Effect::of(&plan);
+    // Before running: a location that can't be saved refuses the statement
+    // rather than define a table that is lost on restart.
+    let definition = match &effect {
+        Effect::SaveRelation {
+            location: Some(location),
+            ..
+        } if catalog.is_some() => absolute_location(sql, location)?,
+        _ => sql.to_owned(),
+    };
+    let existed = exists(ctx, &effect)?;
+    let df = ctx.execute_logical_plan(plan).await?;
+    // DDL has run by now: `execute_logical_plan` executes it eagerly.
+    let exists_now = exists(ctx, &effect)?;
+    let (changes, failure) = match effect {
+        // Defined, unless the name was there and nothing replaced it.
+        Effect::SaveRelation { name, replaces, .. } if !existed || replaces => {
+            let name = resolve(ctx, &name);
+            let failure =
+                format!("{name} is defined for this session but will be gone after a restart");
+            let entry = Entry {
+                kind: EntryKind::Relation,
+                name,
+                definition,
+            };
+            (vec![Change::Put(entry)], failure)
+        }
+        Effect::UnsavedRelation { name, replaces } if !existed || replaces => {
+            let table = name.table().to_owned();
+            let name = resolve(ctx, &name);
+            let failure = format!(
+                "{name} is defined for this session, but an earlier saved definition \
+                 will replace it after a restart"
+            );
+            let forget = Change::Forget {
+                kind: EntryKind::Relation,
+                name,
+            };
+            (vec![forget, Change::ForgetOrphanIndexes { table }], failure)
+        }
+        Effect::SaveSchema { name } if !existed => {
+            let name = qualified_schema(ctx, &name);
+            let failure = format!(
+                "schema {name} is defined for this session but will be gone after a restart"
+            );
+            let entry = Entry {
+                kind: EntryKind::Schema,
+                name,
+                definition,
+            };
+            (vec![Change::Put(entry)], failure)
+        }
+        // Forgotten only if the name is gone: `DROP TABLE IF EXISTS` on a
+        // view succeeds without dropping it. A name that was never live —
+        // a saved entry that failed to restore — is forgotten too.
+        Effect::DropRelation { name } if !exists_now => {
+            let table = name.table().to_owned();
+            if let Some(runtime) = &runtime
+                && !bare_name_in_use(ctx, &table)
+            {
+                runtime.unregister_indexes(&table);
+            }
+            let name = resolve(ctx, &name);
+            let failure =
+                format!("{name} is dropped for this session but will come back after a restart");
+            let forget = Change::Forget {
+                kind: EntryKind::Relation,
+                name,
+            };
+            (vec![forget, Change::ForgetOrphanIndexes { table }], failure)
+        }
+        _ => return Ok(df),
+    };
+    if let Some(catalog) = &catalog {
+        save(catalog, changes, &failure).await?;
+    }
+    Ok(df)
+}
+
+/// Whether the name `effect` is about exists in `ctx` right now.
+fn exists(ctx: &SessionContext, effect: &Effect) -> Result<bool> {
+    Ok(match effect {
+        Effect::SaveRelation { name, .. }
+        | Effect::UnsavedRelation { name, .. }
+        | Effect::DropRelation { name } => ctx.table_exist(name.clone())?,
+        Effect::SaveSchema { name } => {
+            let qualified = qualified_schema(ctx, name);
+            let (catalog, schema) = qualified
+                .split_once('.')
+                .expect("a qualified schema name has a dot");
+            ctx.catalog(catalog)
+                .is_some_and(|catalog| catalog.schema(schema).is_some())
+        }
+        Effect::Other => false,
+    })
+}
+
+/// Whether any schema of any catalog still has a table of bare name `table`.
+fn bare_name_in_use(ctx: &SessionContext, table: &str) -> bool {
+    ctx.catalog_names().iter().any(|name| {
+        ctx.catalog(name).is_some_and(|catalog| {
+            catalog.schema_names().iter().any(|schema| {
+                catalog
+                    .schema(schema)
+                    .is_some_and(|schema| schema.table_exist(table))
+            })
+        })
+    })
+}
+
+fn resolve(ctx: &SessionContext, name: &TableReference) -> String {
     let state = ctx.state();
     let options = &state.config().options().catalog;
-    let relation = |name: &datafusion::common::TableReference| {
-        name.clone()
-            .resolve(&options.default_catalog, &options.default_schema)
-            .to_string()
-    };
-    let schema = |name: &str| {
-        if name.contains('.') {
-            name.to_owned()
-        } else {
-            format!("{}.{name}", options.default_catalog)
-        }
-    };
-    let put = |kind, name, replace| Change::Put {
-        entry: Entry {
-            kind,
-            name,
-            definition: sql.to_owned(),
-        },
-        replace,
-    };
-    match ddl {
-        DdlStatement::CreateExternalTable(create) if !create.temporary => {
-            vec![put(
-                EntryKind::Relation,
-                relation(&create.name),
-                !create.if_not_exists,
-            )]
-        }
-        DdlStatement::CreateView(create) if !create.temporary => {
-            vec![put(EntryKind::Relation, relation(&create.name), true)]
-        }
-        // Not saved, but a `CREATE OR REPLACE` of a saved name replaced it:
-        // replaying the old definition would bring back what is gone.
-        DdlStatement::CreateExternalTable(create) => {
-            replaced(create.or_replace, relation(&create.name))
-        }
-        DdlStatement::CreateView(create) => replaced(create.or_replace, relation(&create.name)),
-        DdlStatement::CreateMemoryTable(create) => {
-            replaced(create.or_replace, relation(&create.name))
-        }
-        DdlStatement::CreateCatalogSchema(create) => vec![put(
-            EntryKind::Schema,
-            schema(&create.schema_name),
-            !create.if_not_exists,
-        )],
-        DdlStatement::DropTable(drop) => dropped_relation(&drop.name, relation(&drop.name)),
-        DdlStatement::DropView(drop) => dropped_relation(&drop.name, relation(&drop.name)),
-        // No `DropCatalogSchema`: DataFusion cannot deregister a schema.
-        _ => Vec::new(),
-    }
+    name.clone()
+        .resolve(&options.default_catalog, &options.default_schema)
+        .to_string()
 }
 
-fn replaced(or_replace: bool, name: String) -> Vec<Change> {
-    if or_replace {
-        vec![Change::Forget {
-            kind: EntryKind::Relation,
-            name,
-        }]
+fn qualified_schema(ctx: &SessionContext, name: &str) -> String {
+    if name.contains('.') {
+        name.to_owned()
     } else {
-        Vec::new()
+        let state = ctx.state();
+        format!(
+            "{}.{name}",
+            state.config().options().catalog.default_catalog
+        )
     }
 }
 
-/// A dropped relation takes its semantic indexes with it. The index map is
-/// keyed by bare table name, so the indexes are too.
-fn dropped_relation(table: &datafusion::common::TableReference, name: String) -> Vec<Change> {
-    vec![
-        Change::Forget {
-            kind: EntryKind::Relation,
-            name,
-        },
-        Change::ForgetPrefix {
-            kind: EntryKind::SemanticIndex,
-            prefix: format!("{}(", table.table()),
-        },
-    ]
+/// `sql` with its `LOCATION` made absolute, when it is a relative local
+/// path: DataFusion resolves one against the working directory, which a
+/// restarted server need not share.
+fn absolute_location(sql: &str, location: &str) -> Result<String> {
+    let path = Path::new(location);
+    if location.contains("://") || !path.is_relative() {
+        return Ok(sql.to_owned());
+    }
+    let mut absolute = std::path::absolute(path)
+        .map_err(|error| SemcastError::Store(format!("resolving {location}: {error}")))?
+        .to_str()
+        .ok_or_else(|| SemcastError::Store(format!("{location} is not valid UTF-8")))?
+        .to_owned();
+    // A trailing slash marks a directory of files to DataFusion.
+    if location.ends_with('/') && !absolute.ends_with('/') {
+        absolute.push('/');
+    }
+    let quote = |text: &str| format!("'{}'", text.replace('\'', "''"));
+    let literal = quote(location);
+    if sql.matches(&literal).count() != 1 {
+        return Err(SemcastError::Store(format!(
+            "cannot save LOCATION {location} as an absolute path; give an absolute \
+             path, so a restarted server finds the same file"
+        )));
+    }
+    Ok(sql.replacen(&literal, &quote(&absolute), 1))
 }
 
 /// What [`restore`] did.
@@ -346,5 +558,45 @@ async fn restore_entry(ctx: &SessionContext, entry: &Entry) -> Result<()> {
         _ => crate::run_sql(ctx, &entry.definition, false)
             .await
             .map(|_| ()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_relative_location_is_saved_absolute() {
+        let sql = "CREATE EXTERNAL TABLE t STORED AS CSV LOCATION 'data/t.csv'";
+        let saved = absolute_location(sql, "data/t.csv").unwrap();
+        let expected = std::path::absolute("data/t.csv").unwrap();
+        assert!(
+            saved.ends_with(&format!("LOCATION '{}'", expected.display())),
+            "{saved}"
+        );
+    }
+
+    #[test]
+    fn absolute_paths_and_urls_are_saved_as_written() {
+        for location in ["/data/t.csv", "s3://bucket/t.csv", "file:///data/t.csv"] {
+            let sql = format!("CREATE EXTERNAL TABLE t STORED AS CSV LOCATION '{location}'");
+            assert_eq!(absolute_location(&sql, location).unwrap(), sql);
+        }
+    }
+
+    #[test]
+    fn a_directory_location_keeps_its_trailing_slash() {
+        let sql = "CREATE EXTERNAL TABLE t STORED AS PARQUET LOCATION 'data/'";
+        assert!(
+            absolute_location(sql, "data/")
+                .unwrap()
+                .ends_with("/data/'")
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_location_is_refused_rather_than_guessed() {
+        let sql = "CREATE EXTERNAL TABLE t STORED AS CSV LOCATION 'a' OPTIONS ('x' 'a')";
+        assert!(absolute_location(sql, "a").is_err());
     }
 }
