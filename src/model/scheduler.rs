@@ -149,11 +149,19 @@ impl Scheduler {
                     .await
                     .expect("the scheduler never closes its semaphore");
                 sent.fetch_add(1, Ordering::Relaxed);
-                inner.complete(vec![request]).await.into_iter().next()
+                // A panic must end the call like any failure: `Shared` does
+                // not wake its other waiters when the future it drives
+                // panics, so a merged caller would hang forever.
+                std::panic::AssertUnwindSafe(inner.complete(vec![request]))
+                    .catch_unwind()
+                    .await
             };
             match answer {
-                Some(answer) => answer.map_err(error_text),
-                None => Err(format!("{} returned no result", inner.id())),
+                Ok(answers) => match answers.into_iter().next() {
+                    Some(answer) => answer.map_err(error_text),
+                    None => Err(format!("{} returned no result", inner.id())),
+                },
+                Err(panic) => Err(format!("{} panicked: {}", inner.id(), panic_text(&*panic))),
             }
         }
         .boxed()
@@ -183,6 +191,15 @@ impl Drop for ClearOnDrop {
             in_flight.remove(&self.key);
         }
     }
+}
+
+/// What a panic said, when it said it with a string.
+fn panic_text(panic: &(dyn std::any::Any + Send)) -> &str {
+    panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("no message")
 }
 
 /// An error's message, without the `model error:` prefix the caller will
@@ -424,15 +441,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_panicking_call_does_not_poison_its_request() {
-        let scheduler = Arc::new(Scheduler::new(Arc::new(PanicsOnce::default()), 1));
-        let first = {
-            let scheduler = Arc::clone(&scheduler);
-            tokio::spawn(async move { scheduler.complete(vec![request("x")]).await })
-        };
-        assert!(first.await.unwrap_err().is_panic());
+    async fn a_panicking_call_fails_its_row_and_does_not_poison_its_request() {
+        let scheduler = Scheduler::new(Arc::new(PanicsOnce::default()), 1);
+        let first = scheduler.complete(vec![request("x")]).await;
+        let error = first[0].as_ref().unwrap_err().to_string();
+        assert!(error.contains("panicked: provider bug"), "{error}");
         let again = scheduler.complete(vec![request("x")]).await;
         assert_eq!(again[0].as_ref().unwrap().text, "yes", "asked afresh");
+    }
+
+    /// Sleeps, then panics.
+    #[derive(Debug)]
+    struct SlowPanic;
+
+    #[async_trait]
+    impl ModelProvider for SlowPanic {
+        fn id(&self) -> ModelId {
+            ModelId("slow-panic".to_owned())
+        }
+
+        async fn complete(&self, _: Vec<CompletionRequest>) -> Vec<Result<Completion>> {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            panic!("provider bug");
+        }
+
+        async fn embed(&self, _: Vec<String>) -> Result<Vec<Embedding>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn every_caller_merged_onto_a_panicking_call_gets_an_error() {
+        let scheduler = Arc::new(Scheduler::new(Arc::new(SlowPanic), 4));
+        let callers = (0..4).map(|_| {
+            let scheduler = Arc::clone(&scheduler);
+            tokio::spawn(async move { scheduler.complete(vec![request("x")]).await })
+        });
+        let answers =
+            tokio::time::timeout(Duration::from_secs(5), futures::future::join_all(callers))
+                .await
+                .expect("no merged caller hangs");
+        for answer in answers {
+            assert!(answer.expect("no caller panics")[0].is_err());
+        }
     }
 
     #[tokio::test]
