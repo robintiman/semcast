@@ -223,6 +223,8 @@ impl ExecutionPlan for VerifyExec {
             cache: Arc::clone(&self.cache),
             evidence: self.evidence.clone(),
             model_calls: MetricBuilder::new(&self.metrics).counter("model_calls", partition),
+            model_calls_merged: MetricBuilder::new(&self.metrics)
+                .counter("model_calls_merged", partition),
             cache_hits: MetricBuilder::new(&self.metrics).counter("cache_hits", partition),
             rows_dropped: MetricBuilder::new(&self.metrics).counter("rows_dropped", partition),
         });
@@ -255,6 +257,9 @@ struct Verifier {
     cache: Arc<dyn SemanticCache>,
     evidence: Option<Arc<ChunkEvidence>>,
     model_calls: Count,
+    /// Of `model_calls`, those the scheduler answered from an identical
+    /// request already in flight: no call of their own.
+    model_calls_merged: Count,
     cache_hits: Count,
     rows_dropped: Count,
 }
@@ -310,8 +315,12 @@ impl Verifier {
             });
             pending.push((row, input, chunked));
         }
+        // Counted as sent, so progress shows calls while they run; merges
+        // are known only once they answer.
+        self.model_calls.add(requests.len());
         let verdicts = self.model.complete(requests).await;
-        self.model_calls.add(calls_made(&verdicts));
+        self.model_calls_merged
+            .add(crate::physical::verify::merged_calls(&verdicts));
         debug_assert_eq!(verdicts.len(), pending.len());
         for ((row, input, chunked), verdict) in pending.iter().zip(&verdicts) {
             match verdict
@@ -374,6 +383,12 @@ pub(crate) fn means_cache_key(
 /// Where a verdict's P("yes") is kept: the verdict's own key, another field.
 /// A separate entry rather than a richer value, so a build that predates it
 /// reads the verdict exactly as before.
+///
+/// The entry names the verdict it was measured with (`"yes 0.97"`). Each
+/// entry keeps its first value independently, so a verdict stored without a
+/// probability (an older build, a provider without logprobs) can later be
+/// joined by a probability from a different answer; naming the verdict
+/// lets [`cached_yes_probability`] refuse such a pair.
 pub(crate) fn yes_probability_key(verdict: &CacheKey) -> CacheKey {
     CacheKey {
         field: "means.yes_probability".to_owned(),
@@ -391,9 +406,10 @@ pub(crate) fn cache_verdict(
 ) {
     let mut entries = Vec::with_capacity(2);
     if let Some(probability) = yes_probability {
+        let verdict = if matched { "yes" } else { "no" };
         entries.push((
             yes_probability_key(&key),
-            CachedValue::Value(probability.to_string()),
+            CachedValue::Value(format!("{verdict} {probability}")),
         ));
     }
     entries.push((
@@ -403,12 +419,37 @@ pub(crate) fn cache_verdict(
     cache.put_many(entries);
 }
 
-/// The model calls a batch of completions cost: an answer merged onto an
-/// identical request already in flight cost none.
-pub(crate) fn calls_made(completions: &[crate::Result<crate::model::Completion>]) -> usize {
+/// The cached P("yes") for the verdict under `key`, if one was stored with
+/// that same verdict.
+// Read by `CONFIDENCE()`, which lands next; until then only tests call it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn cached_yes_probability(cache: &dyn SemanticCache, key: &CacheKey) -> Option<f32> {
+    let Some(CachedValue::Value(verdict)) = cache.get(key) else {
+        return None;
+    };
+    let Some(CachedValue::Value(entry)) = cache.get(&yes_probability_key(key)) else {
+        return None;
+    };
+    let (measured_with, probability) = entry.split_once(' ')?;
+    if measured_with != verdict {
+        return None;
+    }
+    probability
+        .parse()
+        .ok()
+        .filter(|p: &f32| (0.0..=1.0).contains(p))
+}
+
+/// The answers in a batch the scheduler merged onto an identical request
+/// already in flight — counted as sent, but they cost no call. Progress
+/// reports subtract them.
+pub(crate) fn merged_calls(completions: &[crate::Result<crate::model::Completion>]) -> usize {
     completions
         .iter()
-        .filter(|completion| !matches!(completion, Ok(c) if c.merged))
+        .filter(|completion| match completion {
+            Ok(completion) => completion.merged,
+            Err(error) => matches!(error, crate::SemcastError::MergedModel(_)),
+        })
         .count()
 }
 
@@ -421,5 +462,52 @@ pub(crate) fn parse_verdict(text: &str) -> Option<bool> {
         Some(false)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod yes_probability_cache_tests {
+    use super::*;
+    use crate::cache::InMemoryCache;
+
+    fn key() -> CacheKey {
+        means_cache_key(
+            "is angry",
+            "I am furious",
+            &ModelId("m".to_owned()),
+            MEANS_PROMPT_VERSION,
+        )
+    }
+
+    #[test]
+    fn a_probability_is_read_back_with_its_verdict() {
+        let cache = InMemoryCache::default();
+        cache_verdict(&cache, key(), true, Some(0.8));
+        assert_eq!(cached_yes_probability(&cache, &key()), Some(0.8));
+        assert_eq!(
+            cache.get(&key()),
+            Some(CachedValue::Value("yes".to_owned()))
+        );
+    }
+
+    #[test]
+    fn a_probability_from_another_answer_is_refused() {
+        let cache = InMemoryCache::default();
+        // The verdict came first, without a probability; a later answer's
+        // probability landed next to it.
+        cache_verdict(&cache, key(), true, None);
+        cache.put(
+            yes_probability_key(&key()),
+            CachedValue::Value("no 0.08".to_owned()),
+        );
+        assert_eq!(cached_yes_probability(&cache, &key()), None);
+    }
+
+    #[test]
+    fn no_verdict_or_no_probability_reads_as_none() {
+        let cache = InMemoryCache::default();
+        assert_eq!(cached_yes_probability(&cache, &key()), None);
+        cache_verdict(&cache, key(), false, None);
+        assert_eq!(cached_yes_probability(&cache, &key()), None);
     }
 }

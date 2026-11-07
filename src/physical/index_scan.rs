@@ -46,7 +46,7 @@ use crate::optimizer::calibrate::{
 };
 use crate::optimizer::proxy::LearnedProxy;
 use crate::physical::verify::{
-    MEANS_PROMPT_VERSION, cache_verdict, calls_made, means_cache_key, parse_verdict,
+    MEANS_PROMPT_VERSION, cache_verdict, means_cache_key, merged_calls, parse_verdict,
     synthesize_means_prompt,
 };
 
@@ -308,6 +308,8 @@ impl ExecutionPlan for IndexScanExec {
                 .counter("calibration_sampled_rows", partition),
             calibration_model_calls: MetricBuilder::new(&self.metrics)
                 .counter("calibration_model_calls", partition),
+            calibration_model_calls_merged: MetricBuilder::new(&self.metrics)
+                .counter("calibration_model_calls_merged", partition),
             calibration_label_errors: MetricBuilder::new(&self.metrics)
                 .counter("calibration_label_errors", partition),
         });
@@ -367,6 +369,8 @@ struct Scanner {
     passthrough_rows: Count,
     calibration_sampled_rows: Count,
     calibration_model_calls: Count,
+    /// Of `calibration_model_calls`, those merged onto an identical call.
+    calibration_model_calls_merged: Count,
     calibration_label_errors: Count,
 }
 
@@ -710,8 +714,10 @@ impl Scanner {
                 }
             }
         }
+        self.calibration_model_calls.add(requests.len());
         let completions = calibration.model.complete(requests).await;
-        self.calibration_model_calls.add(calls_made(&completions));
+        self.calibration_model_calls_merged
+            .add(merged_calls(&completions));
         debug_assert_eq!(completions.len(), misses.len());
         for (text, completion) in misses.into_iter().zip(&completions) {
             match completion

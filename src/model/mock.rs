@@ -141,9 +141,6 @@ impl MockModel {
         self
     }
 
-    /// Sleep this long in every `complete` call. Real providers take seconds
-    /// per batch; tests that need to observe a query *while it runs* — batch
-    /// job progress, cancellation — need a mock that isn't instantaneous.
     /// Report `probability(input)` as P("yes") for yes/no requests that ask
     /// for logprobs, instead of 0.9 for a yes and 0.1 for a no. The verdict
     /// itself still follows the needles.
@@ -155,6 +152,9 @@ impl MockModel {
         self
     }
 
+    /// Sleep this long in every `complete` call. Real providers take seconds
+    /// per batch; tests that need to observe a query *while it runs* — batch
+    /// job progress, cancellation — need a mock that isn't instantaneous.
     pub fn with_latency(mut self, latency: Duration) -> Self {
         self.latency = Some(latency);
         self

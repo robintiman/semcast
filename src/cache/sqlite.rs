@@ -221,7 +221,12 @@ fn write_loop(mut connection: Connection, messages: Receiver<Message>) {
 fn commit(connection: &mut Connection, batch: &[Row]) {
     match write_batch(connection, batch) {
         Ok(conflicts) => {
-            for row in conflicts {
+            // Two runs of one model can differ in a probability's last
+            // digits while agreeing on the verdict: not worth a warning.
+            for row in conflicts
+                .into_iter()
+                .filter(|row| !row.field.ends_with(".yes_probability"))
+            {
                 tracing::warn!(
                     target: "semcast::store",
                     condition = %row.type_version,

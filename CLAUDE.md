@@ -115,9 +115,12 @@ assembled in the physical planner, not there.
   and bump its constant, so stale verdicts are invalidated honestly.
 - A `MEANS` verdict is cached as `"yes"`/`"no"` under field `means`; the
   model's P("yes") for it, when the provider reports logprobs, goes in a
-  separate entry (`verify::cache_verdict`, field `means.yes_probability`), so
-  older builds never misread a verdict. Count model calls with
-  `verify::calls_made`: an answer the scheduler merged cost no call.
+  separate entry (`verify::cache_verdict`, field `means.yes_probability`,
+  value `"yes 0.97"`), so older builds never misread a verdict; read it back
+  with `verify::cached_yes_probability`, which refuses a probability measured
+  with a different verdict. Operators count `model_calls` as requests are
+  sent and `model_calls_merged` once answers show which the scheduler merged;
+  `progress.rs` reports the difference.
 - Rows fail, queries don't: a row the model errors on is excluded from a
   filter (counted in `rows_dropped`) or falls through to `ELSE` in a `CASE`,
   rather than failing the statement. A failed calibration label stays in the

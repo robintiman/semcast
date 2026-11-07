@@ -81,7 +81,8 @@ async fn a_verdict_is_cached_with_its_probability() {
     );
     assert_eq!(
         cache.values("means.yes_probability"),
-        ["0.3", "0.3", "0.8", "0.8"]
+        ["no 0.3", "no 0.3", "yes 0.8", "yes 0.8"],
+        "each probability names the verdict it was measured with"
     );
 }
 

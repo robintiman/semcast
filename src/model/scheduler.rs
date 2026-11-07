@@ -136,7 +136,13 @@ impl Scheduler {
                 merged,
                 ..completion
             })
-            .map_err(SemcastError::Model)
+            .map_err(|error| {
+                if merged {
+                    SemcastError::MergedModel(error)
+                } else {
+                    SemcastError::Model(error)
+                }
+            })
     }
 
     /// The call itself, as a future any number of callers can await. It
@@ -224,7 +230,7 @@ fn panic_text(panic: &(dyn std::any::Any + Send)) -> &str {
 /// add back when it wraps it.
 fn error_text(error: SemcastError) -> String {
     match error {
-        SemcastError::Model(message) => message,
+        SemcastError::Model(message) | SemcastError::MergedModel(message) => message,
         other => other.to_string(),
     }
 }

@@ -37,8 +37,7 @@ use crate::cache::{CacheKey, CachedValue, SemanticCache};
 use crate::model::{CompletionRequest, ModelId, ModelProvider};
 use crate::physical::extract::parse_json_object;
 use crate::physical::verify::{
-    MEANS_PROMPT_VERSION, cache_verdict, calls_made, means_cache_key, parse_verdict,
-    synthesize_means_prompt,
+    MEANS_PROMPT_VERSION, cache_verdict, means_cache_key, parse_verdict, synthesize_means_prompt,
 };
 
 /// Version of the *fused* prompt — the one that asks about several conditions
@@ -218,6 +217,8 @@ impl ExecutionPlan for SemClassifyExec {
             cache: Arc::clone(&self.cache),
             output_schema: Arc::clone(&self.output_schema),
             model_calls: MetricBuilder::new(&self.metrics).counter("model_calls", partition),
+            model_calls_merged: MetricBuilder::new(&self.metrics)
+                .counter("model_calls_merged", partition),
             cache_hits: MetricBuilder::new(&self.metrics).counter("cache_hits", partition),
             rows_gated: MetricBuilder::new(&self.metrics).counter("rows_gated", partition),
             rows_failed: MetricBuilder::new(&self.metrics).counter("rows_failed", partition),
@@ -261,6 +262,9 @@ struct Classifier {
     cache: Arc<dyn SemanticCache>,
     output_schema: SchemaRef,
     model_calls: Count,
+    /// Of `model_calls`, those the scheduler answered from an identical
+    /// request already in flight: no call of their own.
+    model_calls_merged: Count,
     cache_hits: Count,
     rows_gated: Count,
     rows_failed: Count,
@@ -325,8 +329,12 @@ impl Classifier {
                 pending,
             });
         }
+        // Counted as sent, so progress shows calls while they run; merges
+        // are known only once they answer.
+        self.model_calls.add(requests.len());
         let completions = self.model.complete(requests).await;
-        self.model_calls.add(calls_made(&completions));
+        self.model_calls_merged
+            .add(crate::physical::verify::merged_calls(&completions));
         debug_assert_eq!(completions.len(), pending_rows.len());
         for (pending_row, completion) in pending_rows.iter().zip(&completions) {
             let Ok(completion) = completion.as_ref() else {
