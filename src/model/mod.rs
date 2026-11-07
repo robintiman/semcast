@@ -65,8 +65,9 @@ pub struct Completion {
 
 pub type Embedding = Vec<f32>;
 
-/// A model endpoint. Batched by design: physical operators hand over whole
-/// record batches so providers can pipeline requests.
+/// A model endpoint. Operators hand over whole record batches; behind the
+/// session's [`Scheduler`], which paces and merges requests, a provider
+/// receives one request per `complete` call.
 ///
 /// `complete` returns one result per request — a single bad row must not fail
 /// the batch ("rows fail, queries don't").

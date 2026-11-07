@@ -22,8 +22,12 @@
 //! large batch takes turns with other queries instead of queueing all its
 //! rows ahead of them.
 //!
-//! The scheduler changes when requests are sent, never what is answered, so
-//! it reports its inner model's id and leaves cache keys alone. A fallback
+//! The scheduler changes when requests are sent, not what is answered, so
+//! it reports its inner model's id and leaves cache keys alone. One
+//! exception: a provider that panics fails that row (logged as an error)
+//! instead of the query — rows fail, queries don't. And the inner provider
+//! is handed one request per call, so a provider that packs a whole batch
+//! into one request gets no batches behind the scheduler. A fallback
 //! chain sits inside it and shares the one cap.
 
 use std::collections::HashMap;
@@ -152,7 +156,9 @@ impl Scheduler {
                 // A panic must end the call like any failure: `Shared` does
                 // not wake its other waiters when the future it drives
                 // panics, so a merged caller would hang forever.
-                std::panic::AssertUnwindSafe(inner.complete(vec![request]))
+                // Inside the guarded future, so a provider that panics before
+                // returning its future is caught too.
+                std::panic::AssertUnwindSafe(async { inner.complete(vec![request]).await })
                     .catch_unwind()
                     .await
             };
@@ -161,7 +167,13 @@ impl Scheduler {
                     Some(answer) => answer.map_err(error_text),
                     None => Err(format!("{} returned no result", inner.id())),
                 },
-                Err(panic) => Err(format!("{} panicked: {}", inner.id(), panic_text(&*panic))),
+                Err(panic) => {
+                    let message = format!("{} panicked: {}", inner.id(), panic_text(&*panic));
+                    // A row error is easy to miss in a result set; a provider
+                    // bug should not be.
+                    tracing::error!(target: "semcast::model", "{message}");
+                    Err(message)
+                }
             }
         }
         .boxed()
@@ -484,6 +496,11 @@ mod tests {
         for answer in answers {
             assert!(answer.expect("no caller panics")[0].is_err());
         }
+        assert_eq!(
+            scheduler.stats(),
+            SchedulerStats { sent: 1, merged: 3 },
+            "the callers shared one call"
+        );
     }
 
     #[tokio::test]
