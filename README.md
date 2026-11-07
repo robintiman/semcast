@@ -65,7 +65,9 @@ psql -h 127.0.0.1 -p 5433
 
 `semcast serve --help` lists the knobs: `--port` (5433), `--provider`,
 `--model`, `--embed-provider`, `--embed-model`, `--ollama-url`, `--index-dir`,
-`--store`. Set `--store semcast.db` to keep state across restarts. A verdict
+`--store`, `--max-in-flight`. `--max-in-flight` (8) caps the model requests
+sent at once across all queries, and a separate embedder gets the same cap of
+its own; identical requests in flight are sent once. Set `--store semcast.db` to keep state across restarts. A verdict
 paid for once is free after the restart. Databases, schemas, external
 tables, views, semantic types and semantic indexes come back too. Indexes are
 reattached from where they were built, without re-embedding, so set

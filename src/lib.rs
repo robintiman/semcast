@@ -234,6 +234,7 @@ pub struct SemcastContextBuilder {
     information_schema: bool,
     memory_limit: Option<usize>,
     catalog: Option<catalog::Catalog>,
+    max_in_flight: usize,
 }
 
 impl SemcastContextBuilder {
@@ -247,6 +248,7 @@ impl SemcastContextBuilder {
             information_schema: false,
             memory_limit: None,
             catalog: None,
+            max_in_flight: crate::model::DEFAULT_MAX_IN_FLIGHT,
         }
     }
 
@@ -306,6 +308,16 @@ impl SemcastContextBuilder {
         self
     }
 
+    /// Cap the model requests in flight at once, across every query the
+    /// session runs (default [`DEFAULT_MAX_IN_FLIGHT`]). The session model
+    /// and its fallbacks share the cap; a separate embedder gets its own.
+    ///
+    /// [`DEFAULT_MAX_IN_FLIGHT`]: crate::model::DEFAULT_MAX_IN_FLIGHT
+    pub fn with_max_in_flight(mut self, requests: usize) -> Self {
+        self.max_in_flight = requests;
+        self
+    }
+
     pub fn build(self) -> SessionContext {
         // One type registry, shared between the runtime (DDL dispatch) and the
         // marker UDFs (which resolve type fields at plan time).
@@ -320,10 +332,16 @@ impl SemcastContextBuilder {
                 self.fallbacks,
             ))
         };
+        // One queue per provider, in front of everything that calls it.
+        let model: Arc<dyn ModelProvider> =
+            Arc::new(crate::model::Scheduler::new(model, self.max_in_flight));
         let mut runtime =
             SemcastRuntime::new(Arc::clone(&model)).with_type_registry(Arc::clone(&types));
         if let Some(embedder) = self.embedder {
-            runtime = runtime.with_embedder(embedder);
+            runtime = runtime.with_embedder(Arc::new(crate::model::Scheduler::new(
+                embedder,
+                self.max_in_flight,
+            )));
         }
         if let Some(root) = self.index_root {
             runtime = runtime.with_index_root(root);
