@@ -89,65 +89,7 @@ impl SqliteCache {
     /// model — a blocking write on every miss.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let mut writer = Connection::open(path).map_err(store_err)?;
-        writer.busy_timeout(BUSY_TIMEOUT).map_err(store_err)?;
-        // WAL lets readers proceed while a write commits; NORMAL sync is
-        // durable across process crashes, which is the failure that matters
-        // for a cache (a lost tail costs re-asking the model, nothing more).
-        // Switching modes needs the file to itself and can't run in a
-        // transaction, and SQLite reports a contended switch as busy at once
-        // rather than through the busy handler, so retry it.
-        retry_while_busy(|| writer.pragma_update(None, "journal_mode", "WAL"))?;
-        writer
-            .pragma_update(None, "synchronous", "NORMAL")
-            .map_err(store_err)?;
-        // Schema setup takes the write lock up front (IMMEDIATE): two openers
-        // that both read first and then upgrade would deadlock, which SQLite
-        // also reports as busy at once. Claim the version if the file is new,
-        // then read whichever version won.
-        let version: i64 = {
-            let setup = writer
-                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                .map_err(store_err)?;
-            setup
-                .execute_batch(
-                    "CREATE TABLE IF NOT EXISTS meta (
-                         key   TEXT PRIMARY KEY,
-                         value INTEGER NOT NULL
-                     );
-                     CREATE TABLE IF NOT EXISTS verdicts (
-                         key            BLOB PRIMARY KEY,
-                         type_version   TEXT NOT NULL,
-                         field          TEXT NOT NULL,
-                         model_id       TEXT NOT NULL,
-                         prompt_version TEXT NOT NULL,
-                         is_error       INTEGER NOT NULL,
-                         value          TEXT NOT NULL,
-                         created_at     INTEGER NOT NULL DEFAULT (unixepoch())
-                     ) WITHOUT ROWID;",
-                )
-                .map_err(store_err)?;
-            setup
-                .execute(
-                    "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?1)",
-                    params![SCHEMA_VERSION],
-                )
-                .map_err(store_err)?;
-            let version = setup
-                .query_row(
-                    "SELECT value FROM meta WHERE key = 'schema_version'",
-                    [],
-                    |row| row.get(0),
-                )
-                .map_err(store_err)?;
-            setup.commit().map_err(store_err)?;
-            version
-        };
-        if version != SCHEMA_VERSION {
-            return Err(SemcastError::Store(format!(
-                "store schema version {version} is not the supported {SCHEMA_VERSION}"
-            )));
-        }
+        let writer = open_store(path)?;
 
         let reader = Connection::open(path).map_err(store_err)?;
         reader.busy_timeout(BUSY_TIMEOUT).map_err(store_err)?;
@@ -416,6 +358,80 @@ impl SemanticCache for SqliteCache {
     }
 }
 
+/// Open a connection to the store file at `path`, creating its tables on
+/// first use and refusing a file from another schema version. Both the
+/// verdict cache and the catalog open the file through here, so either may
+/// be the one that creates it.
+pub(crate) fn open_store(path: &Path) -> Result<Connection> {
+    let mut connection = Connection::open(path).map_err(store_err)?;
+    connection.busy_timeout(BUSY_TIMEOUT).map_err(store_err)?;
+    // WAL lets readers proceed while a write commits; NORMAL sync is
+    // durable across process crashes, which is the failure that matters
+    // for a cache (a lost tail costs re-asking the model, nothing more).
+    // Switching modes needs the file to itself and can't run in a
+    // transaction, and SQLite reports a contended switch as busy at once
+    // rather than through the busy handler, so retry it.
+    retry_while_busy(|| connection.pragma_update(None, "journal_mode", "WAL"))?;
+    connection
+        .pragma_update(None, "synchronous", "NORMAL")
+        .map_err(store_err)?;
+    // Schema setup takes the write lock up front (IMMEDIATE): two openers
+    // that both read first and then upgrade would deadlock, which SQLite
+    // also reports as busy at once. Claim the version if the file is new,
+    // then read whichever version won.
+    let version: i64 = {
+        let setup = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(store_err)?;
+        setup
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS meta (
+                     key   TEXT PRIMARY KEY,
+                     value INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS verdicts (
+                     key            BLOB PRIMARY KEY,
+                     type_version   TEXT NOT NULL,
+                     field          TEXT NOT NULL,
+                     model_id       TEXT NOT NULL,
+                     prompt_version TEXT NOT NULL,
+                     is_error       INTEGER NOT NULL,
+                     value          TEXT NOT NULL,
+                     created_at     INTEGER NOT NULL DEFAULT (unixepoch())
+                 ) WITHOUT ROWID;
+                 CREATE TABLE IF NOT EXISTS catalog (
+                     seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+                     kind       TEXT NOT NULL,
+                     name       TEXT NOT NULL,
+                     definition TEXT NOT NULL,
+                     UNIQUE (kind, name)
+                 );",
+            )
+            .map_err(store_err)?;
+        setup
+            .execute(
+                "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?1)",
+                params![SCHEMA_VERSION],
+            )
+            .map_err(store_err)?;
+        let version = setup
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(store_err)?;
+        setup.commit().map_err(store_err)?;
+        version
+    };
+    if version != SCHEMA_VERSION {
+        return Err(SemcastError::Store(format!(
+            "store schema version {version} is not the supported {SCHEMA_VERSION}"
+        )));
+    }
+    Ok(connection)
+}
+
 /// Run `attempt` until it stops reporting a busy database, for up to
 /// [`BUSY_TIMEOUT`].
 fn retry_while_busy(mut attempt: impl FnMut() -> rusqlite::Result<()>) -> Result<()> {
@@ -433,7 +449,7 @@ fn retry_while_busy(mut attempt: impl FnMut() -> rusqlite::Result<()>) -> Result
     }
 }
 
-fn store_err(error: rusqlite::Error) -> SemcastError {
+pub(crate) fn store_err(error: rusqlite::Error) -> SemcastError {
     SemcastError::Store(error.to_string())
 }
 

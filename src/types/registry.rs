@@ -37,6 +37,16 @@ impl TypeRegistry {
         Ok(())
     }
 
+    /// Remove the type registered under `name` (case-insensitive); whether
+    /// there was one.
+    pub fn unregister(&self, name: &str) -> bool {
+        self.types
+            .lock()
+            .expect("type registry poisoned")
+            .remove(&name.to_lowercase())
+            .is_some()
+    }
+
     /// The type registered under `name` (case-insensitive), if any.
     pub fn get(&self, name: &str) -> Option<Arc<SemanticType>> {
         self.types

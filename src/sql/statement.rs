@@ -60,6 +60,14 @@ pub fn parse_semcast_statement(query: &str) -> crate::Result<SemcastStatement> {
         parser.next_token(); // SEMANTIC
         return ddl::parse_semantic_ddl(parser).map(SemcastStatement::Ddl);
     }
+    if peek_nth_is_word(&df_parser.parser, 0, "DROP")
+        && peek_nth_is_word(&df_parser.parser, 1, "SEMANTIC")
+    {
+        let parser = &mut df_parser.parser;
+        parser.next_token(); // DROP
+        parser.next_token(); // SEMANTIC
+        return ddl::parse_semantic_drop(parser).map(SemcastStatement::Ddl);
+    }
 
     let statement = df_parser.parse_statement()?;
     let clauses = trailing_clauses(&mut df_parser.parser)?;

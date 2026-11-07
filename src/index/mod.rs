@@ -176,6 +176,84 @@ pub async fn create_semantic_index(
     index.add_documents(texts).await?;
     let index: Arc<dyn SemanticIndex> = Arc::new(index);
     runtime.register_index(table, column, Arc::clone(&index));
+    if let Some(catalog) = runtime.catalog() {
+        let _guard = catalog.lock().await;
+        // An index over an in-memory table would come back without its
+        // table, and attach to whatever takes the name next.
+        let state = ctx.state();
+        let defaults = &state.config().options().catalog;
+        let resolved = datafusion::common::TableReference::from(table)
+            .resolve(&defaults.default_catalog, &defaults.default_schema)
+            .to_string();
+        if !catalog.has_relation(&resolved).await? {
+            tracing::info!(
+                "semantic index on {table}({column}) is kept for this session only: \
+                 {table} is not a saved table"
+            );
+            return Ok(index);
+        }
+        // Absolute, so a restart from another directory finds the dataset.
+        let path =
+            std::path::absolute(&path).map_err(|error| SemcastError::Index(error.to_string()))?;
+        let saved = SavedIndex {
+            table: table.to_owned(),
+            column: column.to_owned(),
+            path,
+            fetch_k: options.search.fetch_k,
+            score_floor: options.search.score_floor,
+            chunks_per_doc: options.search.chunks_per_doc,
+        };
+        let entry = crate::catalog::Entry {
+            kind: crate::catalog::EntryKind::SemanticIndex,
+            name: crate::catalog::index_name(table, column),
+            definition: serde_json::to_string(&saved).expect("a saved index serializes"),
+        };
+        let failure = format!(
+            "the semantic index on {table}({column}) is built for this session but will be \
+             gone after a restart"
+        );
+        crate::catalog::save(catalog, vec![crate::catalog::Change::Put(entry)], &failure).await?;
+    }
+    Ok(index)
+}
+
+/// What the durable catalog keeps of a semantic index: enough to reopen it
+/// without embedding anything. Chunking and the embed model are recorded in
+/// the dataset itself.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct SavedIndex {
+    table: String,
+    column: String,
+    path: PathBuf,
+    fetch_k: usize,
+    score_floor: f32,
+    chunks_per_doc: usize,
+}
+
+/// Reopen a semantic index from its saved catalog `definition` and register
+/// it with the session — no documents are read and nothing is embedded.
+/// Fails when the dataset is gone or was built with another embed model
+/// than the session's. Documents added to the table since stay unindexed
+/// until a refresh, and pass through to full verification meanwhile.
+pub async fn reattach_semantic_index(
+    ctx: &SessionContext,
+    definition: &str,
+) -> Result<Arc<dyn SemanticIndex>> {
+    let runtime = runtime(ctx)?;
+    let saved: SavedIndex = serde_json::from_str(definition)
+        .map_err(|error| SemcastError::Index(format!("unreadable saved index: {error}")))?;
+    let uri = saved
+        .path
+        .to_str()
+        .ok_or_else(|| SemcastError::Index("index path is not valid UTF-8".to_owned()))?;
+    let search = SearchParams {
+        fetch_k: saved.fetch_k,
+        score_floor: saved.score_floor,
+        chunks_per_doc: saved.chunks_per_doc,
+    };
+    let index = LanceIndex::open(uri, Arc::clone(runtime.embedder()), search).await?;
+    let index: Arc<dyn SemanticIndex> = Arc::new(index);
+    runtime.register_index(&saved.table, &saved.column, Arc::clone(&index));
     Ok(index)
 }
 
@@ -199,7 +277,7 @@ pub async fn refresh_semantic_index(
     index.add_documents(new_texts).await
 }
 
-fn runtime(ctx: &SessionContext) -> Result<Arc<SemcastRuntime>> {
+pub(crate) fn runtime(ctx: &SessionContext) -> Result<Arc<SemcastRuntime>> {
     ctx.state()
         .config()
         .get_extension::<SemcastRuntime>()

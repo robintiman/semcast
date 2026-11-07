@@ -58,9 +58,10 @@ struct ServeArgs {
     /// Where semantic indexes are stored; temp dir if unset.
     #[arg(long)]
     index_dir: Option<PathBuf>,
-    /// SQLite file that stores model verdicts across restarts, created if
-    /// missing. A query answered once costs no model calls after the server
-    /// restarts. Verdicts live in memory only if unset.
+    /// SQLite file that keeps model verdicts and definitions (tables, views,
+    /// semantic types and indexes) across restarts, created if missing. A
+    /// restarted server has the same tables, and a query answered once costs
+    /// no model calls. Both live in memory only if unset.
     #[arg(long)]
     store: Option<PathBuf>,
     /// Where batch job state and results are stored; temp dir if unset.
@@ -149,6 +150,10 @@ async fn main() -> std::io::Result<()> {
         let opened = Arc::new(opened);
         builder = builder.with_cache(Arc::clone(&opened) as Arc<dyn semcast::cache::SemanticCache>);
         store = Some(opened);
+        let catalog = semcast::catalog::Catalog::open(path).map_err(|error| {
+            std::io::Error::other(format!("opening {}: {error}", path.display()))
+        })?;
+        builder = builder.with_catalog(catalog);
     }
     let ctx = Arc::new(builder.build());
 
@@ -166,6 +171,18 @@ async fn main() -> std::io::Result<()> {
         jobs_dir.display(),
         args.max_concurrent_jobs,
     );
+
+    // After everything is registered, so a saved view may read any of it.
+    let restored = semcast::restore_catalog(&ctx)
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    if args.store.is_some() {
+        tracing::info!(
+            "semcast: restored {} definitions from the store ({} could not be restored)",
+            restored.restored,
+            restored.failed.len(),
+        );
+    }
 
     let engine = Arc::new(QueryEngine::new(ctx).with_jobs(jobs));
 

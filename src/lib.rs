@@ -21,6 +21,7 @@
 //! [Apache DataFusion]: https://datafusion.apache.org/
 
 pub mod cache;
+pub mod catalog;
 pub mod error;
 pub mod index;
 pub mod logical;
@@ -51,7 +52,10 @@ use crate::optimizer::rank::RelevanceRewriteRule;
 use crate::optimizer::rewrite::MeansRewriteRule;
 use crate::physical::planner::SemcastQueryPlanner;
 
-pub use crate::index::{IndexOptions, create_semantic_index, refresh_semantic_index};
+pub use crate::catalog::restore as restore_catalog;
+pub use crate::index::{
+    IndexOptions, create_semantic_index, reattach_semantic_index, refresh_semantic_index,
+};
 
 /// Build a [`SessionContext`] with all semcast machinery registered:
 /// the `means()` UDF, the `MEANS`-rewrite optimizer rule, and a query
@@ -81,11 +85,18 @@ pub fn semcast_context(model: Arc<dyn ModelProvider>) -> SessionContext {
 /// only accepts sqlparser's built-in dialects, so the custom syntax needs its
 /// own entry point; queries that call `means()` directly work through either.
 pub async fn sql(ctx: &SessionContext, query: &str) -> Result<DataFrame> {
+    run_sql(ctx, query, true).await
+}
+
+/// [`sql`], saving what a DDL statement defines to the session's durable
+/// catalog when `record` is set. Restoring the catalog replays with it
+/// unset: the definitions are already saved.
+pub(crate) async fn run_sql(ctx: &SessionContext, text: &str, record: bool) -> Result<DataFrame> {
     // `SEMANTIC` qualifies a select modifier, where sqlparser has no dialect
     // hook — remove the word, then mark what it qualified in the AST. Safe to
     // run ahead of the DDL branch: it only fires on `SEMANTIC DISTINCT`, and
     // `CREATE SEMANTIC INDEX`/`TYPE` never is.
-    let (query, semantic_distinct) = sql::distinct::strip_semantic_distinct(query);
+    let (query, semantic_distinct) = sql::distinct::strip_semantic_distinct(text);
     // `CREATE SEMANTIC ...` is semcast syntax, not SQL. The statement parser
     // dispatches it on its own token stream; DDL is executed here rather than
     // planned, and yields an empty DataFrame like DataFusion's own DDL.
@@ -98,14 +109,54 @@ pub async fn sql(ctx: &SessionContext, query: &str) -> Result<DataFrame> {
                     Ok(DataFrame::new(ctx.state(), no_rows))
                 }
                 sql::ddl::SemanticDdl::CreateType(ty) => {
-                    let runtime = ctx
-                        .state()
-                        .config()
-                        .get_extension::<SemcastRuntime>()
-                        .ok_or_else(|| {
-                            DataFusionError::Plan("semcast runtime is not registered".to_owned())
-                        })?;
+                    let runtime = index::runtime(ctx)?;
+                    let catalog = runtime.catalog().filter(|_| record);
+                    let _guard = match catalog {
+                        Some(catalog) => Some(catalog.lock().await),
+                        None => None,
+                    };
+                    let name = ty.name.to_lowercase();
                     runtime.type_registry().register(ty)?;
+                    if let Some(catalog) = catalog {
+                        let entry = catalog::Entry {
+                            kind: catalog::EntryKind::SemanticType,
+                            name: name.clone(),
+                            definition: text.to_owned(),
+                        };
+                        let failure = format!(
+                            "semantic type {name} is defined for this session but will be \
+                             gone after a restart"
+                        );
+                        catalog::save(catalog, vec![catalog::Change::Put(entry)], &failure).await?;
+                    }
+                    let no_rows = LogicalPlanBuilder::empty(false).build()?;
+                    Ok(DataFrame::new(ctx.state(), no_rows))
+                }
+                sql::ddl::SemanticDdl::DropType { name, if_exists } => {
+                    let runtime = index::runtime(ctx)?;
+                    let catalog = runtime.catalog().filter(|_| record);
+                    let _guard = match catalog {
+                        Some(catalog) => Some(catalog.lock().await),
+                        None => None,
+                    };
+                    let name = name.to_lowercase();
+                    if !runtime.type_registry().unregister(&name) && !if_exists {
+                        return Err(DataFusionError::Plan(format!(
+                            "semantic type {name} does not exist"
+                        ))
+                        .into());
+                    }
+                    if let Some(catalog) = catalog {
+                        let forget = catalog::Change::Forget {
+                            kind: catalog::EntryKind::SemanticType,
+                            name: name.clone(),
+                        };
+                        let failure = format!(
+                            "semantic type {name} is dropped for this session but will come \
+                             back after a restart"
+                        );
+                        catalog::save(catalog, vec![forget], &failure).await?;
+                    }
                     let no_rows = LogicalPlanBuilder::empty(false).build()?;
                     Ok(DataFrame::new(ctx.state(), no_rows))
                 }
@@ -155,6 +206,9 @@ pub async fn sql(ctx: &SessionContext, query: &str) -> Result<DataFrame> {
     if let Some(similarity) = clauses.similarity {
         plan = optimizer::distinct::apply_similarity(plan, similarity)?;
     }
+    if matches!(plan, datafusion::logical_expr::LogicalPlan::Ddl(_)) {
+        return catalog::execute_ddl(ctx, plan, text, record).await;
+    }
     Ok(ctx.execute_logical_plan(plan).await?)
 }
 
@@ -179,6 +233,7 @@ pub struct SemcastContextBuilder {
     index_root: Option<std::path::PathBuf>,
     information_schema: bool,
     memory_limit: Option<usize>,
+    catalog: Option<catalog::Catalog>,
 }
 
 impl SemcastContextBuilder {
@@ -191,6 +246,7 @@ impl SemcastContextBuilder {
             index_root: None,
             information_schema: false,
             memory_limit: None,
+            catalog: None,
         }
     }
 
@@ -242,6 +298,14 @@ impl SemcastContextBuilder {
         self
     }
 
+    /// Save schemas, tables, views, semantic types and semantic indexes to
+    /// `catalog` as they are defined; [`restore_catalog`] brings them back
+    /// in the next process.
+    pub fn with_catalog(mut self, catalog: catalog::Catalog) -> Self {
+        self.catalog = Some(catalog);
+        self
+    }
+
     pub fn build(self) -> SessionContext {
         // One type registry, shared between the runtime (DDL dispatch) and the
         // marker UDFs (which resolve type fields at plan time).
@@ -263,6 +327,9 @@ impl SemcastContextBuilder {
         }
         if let Some(root) = self.index_root {
             runtime = runtime.with_index_root(root);
+        }
+        if let Some(catalog) = self.catalog {
+            runtime = runtime.with_catalog(catalog);
         }
         // One runtime, two holders: the session config (where the physical
         // planner and the public API find it) and the means rewrite rule,
