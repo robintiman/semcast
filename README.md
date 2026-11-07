@@ -70,7 +70,7 @@ paid for once is free after the restart. Databases, schemas, external
 tables, views, semantic types and semantic indexes come back too. Indexes are
 reattached from where they were built, without re-embedding, so set
 `--index-dir` to a directory that outlives the temp dir. Not kept: in-memory
-tables (`CREATE TABLE ... AS`) and indexes over them. A view must read files
+tables (`CREATE TABLE ... AS`) and the views and indexes over them. A view must read files
 by absolute path (`FROM '/data/t.csv'`) or through an external table. A definition
 that fails to restore, such as a table whose file is gone, is logged and
 kept until the name is defined again or dropped (`DROP ... IF EXISTS`).

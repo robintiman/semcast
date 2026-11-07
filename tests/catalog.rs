@@ -614,3 +614,51 @@ async fn a_slow_create_table_as_does_not_hold_up_other_ddl() {
     );
     slow.await.unwrap();
 }
+
+#[tokio::test]
+async fn a_failed_replace_forgets_the_definition_it_dropped() {
+    let disk = Disk::new();
+    let first = disk.session(Arc::new(MockModel::default())).await;
+    run(&first, &disk.create_tickets()).await;
+    run(&first, "CREATE SEMANTIC INDEX ON tickets(body)").await;
+    let broken = "CREATE OR REPLACE EXTERNAL TABLE tickets STORED AS CSV \
+                  LOCATION '/nonexistent/semcast/x.csv'";
+    assert!(semcast::sql(&first, broken).await.is_err());
+    // DataFusion dropped the old table before the new one failed to build.
+    assert!(!first.table_exist("tickets").unwrap());
+    assert!(runtime(&first).index_for("tickets", "body").is_none());
+    assert_eq!(
+        disk.entries(),
+        vec![],
+        "the session lost it, so the disk must"
+    );
+}
+
+#[tokio::test]
+async fn views_over_table_functions_are_saved() {
+    let disk = Disk::new();
+    let first = disk.session(Arc::new(MockModel::default())).await;
+    run(
+        &first,
+        "CREATE VIEW three AS SELECT * FROM generate_series(1, 3)",
+    )
+    .await;
+    drop(first);
+
+    let second = disk.session(Arc::new(MockModel::default())).await;
+    assert!(
+        run(&second, "SELECT count(*) AS n FROM three")
+            .await
+            .contains("| 3 |")
+    );
+}
+
+#[tokio::test]
+async fn a_view_over_an_in_memory_table_is_not_saved() {
+    let disk = Disk::new();
+    let first = disk.session(Arc::new(MockModel::default())).await;
+    run(&first, "CREATE TABLE scratch AS VALUES (1)").await;
+    run(&first, "CREATE VIEW direct AS SELECT * FROM scratch").await;
+    run(&first, "CREATE VIEW nested AS SELECT * FROM direct").await;
+    assert_eq!(disk.entries(), vec![], "neither view would restore");
+}

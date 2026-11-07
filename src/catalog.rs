@@ -23,7 +23,7 @@
 //!
 //! What is not saved: in-memory tables (`CREATE TABLE ... AS`, `INSERT`ed
 //! rows), whose data lives in the process, anything `TEMPORARY`, and
-//! semantic indexes over either. Defining one of these under a saved name
+//! the views and semantic indexes over either. Defining one of these under a saved name
 //! forgets the saved definition, which would otherwise replace it after a
 //! restart.
 //!
@@ -357,7 +357,21 @@ pub(crate) async fn execute_ddl(
         Some(catalog) if !slow => Some(catalog.lock().await),
         _ => None,
     };
-    let effect = Effect::of(&plan);
+    let mut effect = Effect::of(&plan);
+    // A view over an in-memory table would restore without it, and fail on
+    // every start: keep such a view for the session, like its table.
+    if let Effect::SaveRelation {
+        name,
+        replaces,
+        location: None,
+    } = &effect
+        && reads_memory_table(&plan)?
+    {
+        effect = Effect::UnsavedRelation {
+            name: name.clone(),
+            replaces: *replaces,
+        };
+    }
     // Before running: a definition that can't be saved faithfully refuses
     // the statement rather than define something lost on restart.
     let definition = match &effect {
@@ -372,15 +386,30 @@ pub(crate) async fn execute_ddl(
         _ => sql.to_owned(),
     };
     let existed = exists(ctx, &effect);
-    let df = ctx.execute_logical_plan(plan).await?;
+    let result = ctx.execute_logical_plan(plan).await;
     // DDL has run by now: `execute_logical_plan` executes it eagerly.
-    let exists_now = exists(ctx, &effect);
     if guard.is_none()
         && let Some(catalog) = &catalog
     {
         guard = Some(catalog.lock().await);
     }
     let _guard = guard;
+    let exists_now = exists(ctx, &effect);
+    let df = match result {
+        Ok(df) => df,
+        Err(error) => {
+            // DataFusion's `CREATE OR REPLACE` drops the old definition
+            // before building the new one; a failed build leaves the name
+            // gone. Forget it too, or a restart brings it back.
+            if existed
+                && !exists_now
+                && let Some(name) = effect.relation()
+            {
+                forget_relation(ctx, runtime.as_deref(), catalog.as_ref(), name).await?;
+            }
+            return Err(error.into());
+        }
+    };
     let (changes, failure) = match effect {
         // Defined, unless the name was there and nothing replaced it.
         Effect::SaveRelation { name, replaces, .. } if !existed || replaces => {
@@ -395,6 +424,11 @@ pub(crate) async fn execute_ddl(
             (vec![Change::Put(entry)], failure)
         }
         Effect::UnsavedRelation { name, replaces } if !existed || replaces => {
+            // Unlocked while it ran: another statement may have redefined
+            // the name since, and its save stands.
+            if slow && !is_memory_table(ctx, &name).await {
+                return Ok(df);
+            }
             let table = name.table().to_owned();
             // A replaced table's indexes described the old rows.
             if existed && let Some(runtime) = &runtime {
@@ -438,20 +472,8 @@ pub(crate) async fn execute_ddl(
         // view succeeds without dropping it. A name that was never live —
         // a saved entry that failed to restore — is forgotten too.
         Effect::DropRelation { name } if !exists_now => {
-            let table = name.table().to_owned();
-            if let Some(runtime) = &runtime
-                && !bare_name_in_use(ctx, &table)
-            {
-                runtime.unregister_indexes(&table);
-            }
-            let name = resolve(ctx, &name);
-            let failure =
-                format!("{name} is dropped for this session but will come back after a restart");
-            let forget = Change::Forget {
-                kind: EntryKind::Relation,
-                name,
-            };
-            (vec![forget, Change::ForgetOrphanIndexes { table }], failure)
+            forget_relation(ctx, runtime.as_deref(), catalog.as_ref(), &name).await?;
+            return Ok(df);
         }
         _ => return Ok(df),
     };
@@ -459,6 +481,94 @@ pub(crate) async fn execute_ddl(
         save(catalog, changes, &failure).await?;
     }
     Ok(df)
+}
+
+impl Effect {
+    /// The relation this statement defines or drops, if any.
+    fn relation(&self) -> Option<&TableReference> {
+        match self {
+            Self::SaveRelation { name, .. }
+            | Self::UnsavedRelation { name, .. }
+            | Self::DropRelation { name } => Some(name),
+            _ => None,
+        }
+    }
+}
+
+/// `name` is gone from the session: drop its indexes from the session
+/// unless a same-named table elsewhere still uses them, and from the
+/// catalog unless a saved one does.
+async fn forget_relation(
+    ctx: &SessionContext,
+    runtime: Option<&crate::index::registry::SemcastRuntime>,
+    catalog: Option<&Catalog>,
+    name: &TableReference,
+) -> Result<()> {
+    let table = name.table().to_owned();
+    if let Some(runtime) = runtime
+        && !bare_name_in_use(ctx, &table)
+    {
+        runtime.unregister_indexes(&table);
+    }
+    let Some(catalog) = catalog else {
+        return Ok(());
+    };
+    let name = resolve(ctx, name);
+    let failure = format!("{name} is gone from this session but will come back after a restart");
+    let forget = Change::Forget {
+        kind: EntryKind::Relation,
+        name,
+    };
+    save(
+        catalog,
+        vec![forget, Change::ForgetOrphanIndexes { table }],
+        &failure,
+    )
+    .await
+}
+
+/// Whether `name` is an in-memory table in `ctx` right now.
+async fn is_memory_table(ctx: &SessionContext, name: &TableReference) -> bool {
+    ctx.table_provider(name.clone())
+        .await
+        .is_ok_and(|provider| {
+            provider
+                .downcast_ref::<datafusion::datasource::MemTable>()
+                .is_some()
+        })
+}
+
+/// Whether `plan` reads an in-memory table, directly or through views.
+fn reads_memory_table(plan: &LogicalPlan) -> Result<bool> {
+    use datafusion::common::tree_node::TreeNodeRecursion;
+    let mut found = false;
+    let mut nested = Vec::new();
+    plan.apply_with_subqueries(|node| {
+        if let LogicalPlan::TableScan(scan) = node
+            && let Ok(provider) = datafusion::datasource::source_as_provider(&scan.source)
+        {
+            if provider
+                .downcast_ref::<datafusion::datasource::MemTable>()
+                .is_some()
+            {
+                found = true;
+                return Ok(TreeNodeRecursion::Stop);
+            }
+            if let Some(view) = provider.downcast_ref::<datafusion::datasource::ViewTable>() {
+                nested.push(view.logical_plan().clone());
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+    if found {
+        return Ok(true);
+    }
+    for view in nested {
+        if reads_memory_table(&view)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Whether the name `effect` is about exists in `ctx` right now. A name in
@@ -484,8 +594,9 @@ fn exists(ctx: &SessionContext, effect: &Effect) -> bool {
 
 /// Refuse a view that reads a file by relative path (`FROM 'data/t.csv'`):
 /// replayed from another working directory it would read another file, or
-/// none. Such a scan names no registered table, which is how it is told
-/// from a table that happens to have a path-like name.
+/// none. Such a scan reads a listing table under a name no table is
+/// registered as — which tells it from a table with a path-like name, and
+/// from a table function (`generate_series(1, 3)`), which reads no file.
 fn refuse_relative_paths(ctx: &SessionContext, plan: &LogicalPlan) -> Result<()> {
     use datafusion::common::tree_node::TreeNodeRecursion;
     let mut relative = None;
@@ -493,7 +604,14 @@ fn refuse_relative_paths(ctx: &SessionContext, plan: &LogicalPlan) -> Result<()>
         if let LogicalPlan::TableScan(scan) = node {
             let name = scan.table_name.table();
             let is_path = !name.contains("://") && Path::new(name).is_relative();
-            if is_path && !ctx.table_exist(scan.table_name.clone()).unwrap_or(false) {
+            let reads_files =
+                datafusion::datasource::source_as_provider(&scan.source).is_ok_and(|provider| {
+                    provider
+                        .downcast_ref::<datafusion::datasource::listing::ListingTable>()
+                        .is_some()
+                });
+            if is_path && reads_files && !ctx.table_exist(scan.table_name.clone()).unwrap_or(false)
+            {
                 relative = Some(name.to_owned());
                 return Ok(TreeNodeRecursion::Stop);
             }
@@ -636,6 +754,52 @@ async fn restore_entry(ctx: &SessionContext, entry: &Entry) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `CREATE TABLE ... AS` runs unlocked. If another statement
+    /// redefines its name before it gets the lock to save, that statement's
+    /// saved definition must stand.
+    #[tokio::test]
+    async fn a_create_table_as_does_not_forget_a_name_redefined_while_it_waited() {
+        let dir = tempfile::tempdir().unwrap();
+        let csv = dir.path().join("t.csv");
+        std::fs::write(&csv, "id\n1\n2\n3\n").unwrap();
+        let catalog = Catalog::open(dir.path().join("store.db")).unwrap();
+        let ctx = crate::SemcastContextBuilder::new(Arc::new(crate::model::MockModel::default()))
+            .with_catalog(catalog.clone())
+            .build();
+
+        let held = catalog.lock().await;
+        let ctas = {
+            let ctx = ctx.clone();
+            tokio::spawn(async move { crate::sql(&ctx, "CREATE TABLE t AS VALUES (1)").await })
+        };
+        while !ctx.table_exist("t").unwrap() {
+            tokio::task::yield_now().await;
+        }
+        // The competing statement, as it would run under the lock.
+        let external = format!(
+            "CREATE OR REPLACE EXTERNAL TABLE t STORED AS CSV LOCATION '{}' \
+             OPTIONS ('format.has_header' 'true')",
+            csv.display()
+        );
+        ctx.sql(&external).await.unwrap();
+        let entry = Entry {
+            kind: EntryKind::Relation,
+            name: "datafusion.public.t".to_owned(),
+            definition: external,
+        };
+        catalog.apply(vec![Change::Put(entry)]).await.unwrap();
+        drop(held);
+        ctas.await.unwrap().unwrap();
+
+        let saved: Vec<_> = catalog
+            .entries()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(saved, vec!["datafusion.public.t".to_owned()]);
+    }
 
     #[test]
     fn a_relative_location_is_saved_absolute() {
