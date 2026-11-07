@@ -21,6 +21,7 @@
 //! [Apache DataFusion]: https://datafusion.apache.org/
 
 pub mod cache;
+pub mod catalog;
 pub mod error;
 pub mod index;
 pub mod logical;
@@ -51,7 +52,10 @@ use crate::optimizer::rank::RelevanceRewriteRule;
 use crate::optimizer::rewrite::MeansRewriteRule;
 use crate::physical::planner::SemcastQueryPlanner;
 
-pub use crate::index::{IndexOptions, create_semantic_index, refresh_semantic_index};
+pub use crate::catalog::restore as restore_catalog;
+pub use crate::index::{
+    IndexOptions, create_semantic_index, reattach_semantic_index, refresh_semantic_index,
+};
 
 /// Build a [`SessionContext`] with all semcast machinery registered:
 /// the `means()` UDF, the `MEANS`-rewrite optimizer rule, and a query
@@ -81,11 +85,18 @@ pub fn semcast_context(model: Arc<dyn ModelProvider>) -> SessionContext {
 /// only accepts sqlparser's built-in dialects, so the custom syntax needs its
 /// own entry point; queries that call `means()` directly work through either.
 pub async fn sql(ctx: &SessionContext, query: &str) -> Result<DataFrame> {
+    run_sql(ctx, query, true).await
+}
+
+/// [`sql`], saving what a DDL statement defines to the session's durable
+/// catalog when `record` is set. Restoring the catalog replays with it
+/// unset: the definitions are already saved.
+pub(crate) async fn run_sql(ctx: &SessionContext, text: &str, record: bool) -> Result<DataFrame> {
     // `SEMANTIC` qualifies a select modifier, where sqlparser has no dialect
     // hook — remove the word, then mark what it qualified in the AST. Safe to
     // run ahead of the DDL branch: it only fires on `SEMANTIC DISTINCT`, and
     // `CREATE SEMANTIC INDEX`/`TYPE` never is.
-    let (query, semantic_distinct) = sql::distinct::strip_semantic_distinct(query);
+    let (query, semantic_distinct) = sql::distinct::strip_semantic_distinct(text);
     // `CREATE SEMANTIC ...` is semcast syntax, not SQL. The statement parser
     // dispatches it on its own token stream; DDL is executed here rather than
     // planned, and yields an empty DataFrame like DataFusion's own DDL.
@@ -105,7 +116,19 @@ pub async fn sql(ctx: &SessionContext, query: &str) -> Result<DataFrame> {
                         .ok_or_else(|| {
                             DataFusionError::Plan("semcast runtime is not registered".to_owned())
                         })?;
+                    let name = ty.name.to_lowercase();
                     runtime.type_registry().register(ty)?;
+                    if record {
+                        let change = catalog::Change::Put {
+                            entry: catalog::Entry {
+                                kind: catalog::EntryKind::SemanticType,
+                                name: name.clone(),
+                                definition: text.to_owned(),
+                            },
+                            replace: false,
+                        };
+                        save(&runtime, vec![change], &format!("semantic type {name}")).await?;
+                    }
                     let no_rows = LogicalPlanBuilder::empty(false).build()?;
                     Ok(DataFrame::new(ctx.state(), no_rows))
                 }
@@ -155,7 +178,46 @@ pub async fn sql(ctx: &SessionContext, query: &str) -> Result<DataFrame> {
     if let Some(similarity) = clauses.similarity {
         plan = optimizer::distinct::apply_similarity(plan, similarity)?;
     }
-    Ok(ctx.execute_logical_plan(plan).await?)
+    let changes = if record {
+        catalog::changes_for(ctx, &plan, text)
+    } else {
+        Vec::new()
+    };
+    let dropped = dropped_table(&plan);
+    let df = ctx.execute_logical_plan(plan).await?;
+    // DDL has run by now: `execute_logical_plan` executes it eagerly.
+    if let Some(runtime) = ctx.state().config().get_extension::<SemcastRuntime>() {
+        if let Some(table) = dropped {
+            runtime.unregister_indexes(&table);
+        }
+        save(&runtime, changes, "this definition").await?;
+    }
+    Ok(df)
+}
+
+/// The bare name of the table or view a `DROP` plan removes.
+fn dropped_table(plan: &datafusion::logical_expr::LogicalPlan) -> Option<String> {
+    use datafusion::logical_expr::{DdlStatement, LogicalPlan};
+    match plan {
+        LogicalPlan::Ddl(DdlStatement::DropTable(drop)) => Some(drop.name.table().to_owned()),
+        LogicalPlan::Ddl(DdlStatement::DropView(drop)) => Some(drop.name.table().to_owned()),
+        _ => None,
+    }
+}
+
+/// Apply `changes` to the session's catalog, if it has one. A statement
+/// whose definition the catalog refuses has still taken effect, so the
+/// error says so rather than implying nothing happened.
+async fn save(runtime: &SemcastRuntime, changes: Vec<catalog::Change>, what: &str) -> Result<()> {
+    let Some(catalog) = runtime.catalog() else {
+        return Ok(());
+    };
+    catalog.apply(changes).await.map_err(|error| {
+        SemcastError::Store(format!(
+            "{what} is defined for this session, but the store could not save \
+             it, so it will be gone after a restart: {error}"
+        ))
+    })
 }
 
 /// [`semcast_context`] with a caller-provided verdict cache.
@@ -179,6 +241,7 @@ pub struct SemcastContextBuilder {
     index_root: Option<std::path::PathBuf>,
     information_schema: bool,
     memory_limit: Option<usize>,
+    catalog: Option<catalog::Catalog>,
 }
 
 impl SemcastContextBuilder {
@@ -191,6 +254,7 @@ impl SemcastContextBuilder {
             index_root: None,
             information_schema: false,
             memory_limit: None,
+            catalog: None,
         }
     }
 
@@ -242,6 +306,14 @@ impl SemcastContextBuilder {
         self
     }
 
+    /// Save schemas, tables, views, semantic types and semantic indexes to
+    /// `catalog` as they are defined; [`restore_catalog`] brings them back
+    /// in the next process.
+    pub fn with_catalog(mut self, catalog: catalog::Catalog) -> Self {
+        self.catalog = Some(catalog);
+        self
+    }
+
     pub fn build(self) -> SessionContext {
         // One type registry, shared between the runtime (DDL dispatch) and the
         // marker UDFs (which resolve type fields at plan time).
@@ -263,6 +335,9 @@ impl SemcastContextBuilder {
         }
         if let Some(root) = self.index_root {
             runtime = runtime.with_index_root(root);
+        }
+        if let Some(catalog) = self.catalog {
+            runtime = runtime.with_catalog(catalog);
         }
         // One runtime, two holders: the session config (where the physical
         // planner and the public API find it) and the means rewrite rule,

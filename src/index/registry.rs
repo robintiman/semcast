@@ -30,6 +30,9 @@ pub struct SemcastRuntime {
     /// `CREATE SEMANTIC TYPE` definitions. Shared with the marker UDFs, which
     /// resolve a type's fields at plan time — hence an `Arc`, not inline.
     types: Arc<TypeRegistry>,
+    /// Where definitions are saved so they survive a restart; `None` keeps
+    /// them for the process only.
+    catalog: Option<crate::catalog::Catalog>,
 }
 
 impl SemcastRuntime {
@@ -40,6 +43,7 @@ impl SemcastRuntime {
             index_root: std::env::temp_dir().join("semcast-indexes"),
             indexes: Mutex::new(HashMap::new()),
             types: Arc::new(TypeRegistry::default()),
+            catalog: None,
         }
     }
 
@@ -77,11 +81,31 @@ impl SemcastRuntime {
         &self.index_root
     }
 
+    /// Save definitions to `catalog` as they are made.
+    pub fn with_catalog(mut self, catalog: crate::catalog::Catalog) -> Self {
+        self.catalog = Some(catalog);
+        self
+    }
+
+    /// The durable catalog, when the session has one.
+    pub fn catalog(&self) -> Option<&crate::catalog::Catalog> {
+        self.catalog.as_ref()
+    }
+
     pub fn register_index(&self, table: &str, column: &str, index: Arc<dyn SemanticIndex>) {
         self.indexes
             .lock()
             .expect("index registry poisoned")
             .insert((table.to_owned(), column.to_owned()), index);
+    }
+
+    /// Forget every index on `table` — the table was dropped, and an index
+    /// must not outlive it into a same-named table created later.
+    pub fn unregister_indexes(&self, table: &str) {
+        self.indexes
+            .lock()
+            .expect("index registry poisoned")
+            .retain(|(indexed, _), _| indexed != table);
     }
 
     pub fn index_for(&self, table: &str, column: &str) -> Option<Arc<dyn SemanticIndex>> {
