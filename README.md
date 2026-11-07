@@ -64,7 +64,12 @@ psql -h 127.0.0.1 -p 5433
 ```
 
 `semcast serve --help` lists the knobs: `--port` (5433), `--provider`,
-`--model`, `--embed-provider`, `--embed-model`, `--ollama-url`, `--index-dir`.
+`--model`, `--embed-provider`, `--embed-model`, `--ollama-url`, `--index-dir`,
+`--store`. Set `--store verdicts.db` to keep model verdicts across restarts:
+a verdict paid for once is free after the server restarts. Semantic indexes
+are not reattached on restart yet: recreate them with `CREATE SEMANTIC
+INDEX`, which re-embeds. Until then, `MEANS` over an indexed column verifies
+full texts, which the store has not seen if the index read chunks before.
 
 Build from source:
 

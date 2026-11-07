@@ -16,6 +16,9 @@ pub enum SemcastError {
 
     #[error("index error: {0}")]
     Index(String),
+
+    #[error("store error: {0}")]
+    Store(String),
 }
 
 pub type Result<T, E = SemcastError> = std::result::Result<T, E>;
