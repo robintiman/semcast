@@ -14,17 +14,26 @@
 //! waits for that one's answer instead. Same request, same answer — which is
 //! what "first evaluation wins" asks for anyway.
 //!
+//! A call lives only as long as someone waits for it: the map holds it
+//! weakly, so when every caller is gone (a cancelled query, an aborted job)
+//! the call is dropped, its permit comes back, and its entry is cleared.
+//!
+//! Each `complete` batch keeps at most the cap in the queue at a time, so a
+//! large batch takes turns with other queries instead of queueing all its
+//! rows ahead of them.
+//!
 //! The scheduler changes when requests are sent, never what is answered, so
-//! it reports its inner model's id and leaves cache keys alone.
+//! it reports its inner model's id and leaves cache keys alone. A fallback
+//! chain sits inside it and shares the one cap.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use async_trait::async_trait;
-use futures::FutureExt;
-use futures::future::{BoxFuture, Shared};
+use futures::future::{BoxFuture, Shared, WeakShared};
+use futures::{FutureExt, StreamExt};
 use tokio::sync::Semaphore;
 
 use super::{Completion, CompletionRequest, Embedding, ModelId, ModelProvider};
@@ -37,6 +46,16 @@ pub const DEFAULT_MAX_IN_FLIGHT: usize = 8;
 /// An answer shared by every caller that asked the same thing. The error is
 /// a string because it is cloned to each of them.
 type SharedAnswer = Shared<BoxFuture<'static, std::result::Result<Completion, String>>>;
+
+/// A call in flight, held weakly, with an id that tells it from a later
+/// call for the same key.
+type InFlight = HashMap<
+    u128,
+    (
+        u64,
+        WeakShared<BoxFuture<'static, std::result::Result<Completion, String>>>,
+    ),
+>;
 
 /// Counters for logs and tests.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -52,7 +71,8 @@ pub struct Scheduler {
     inner: Arc<dyn ModelProvider>,
     permits: Arc<Semaphore>,
     max_in_flight: usize,
-    in_flight: Arc<Mutex<HashMap<u128, SharedAnswer>>>,
+    in_flight: Arc<Mutex<InFlight>>,
+    next_call: AtomicU64,
     sent: Arc<AtomicUsize>,
     merged: AtomicUsize,
 }
@@ -75,6 +95,7 @@ impl Scheduler {
             permits: Arc::new(Semaphore::new(max_in_flight)),
             max_in_flight,
             in_flight: Arc::new(Mutex::new(HashMap::new())),
+            next_call: AtomicU64::new(0),
             sent: Arc::new(AtomicUsize::new(0)),
             merged: AtomicUsize::new(0),
         }
@@ -91,14 +112,16 @@ impl Scheduler {
         let key = request_key(&request);
         let answer = {
             let mut in_flight = self.in_flight.lock().expect("scheduler lock poisoned");
-            match in_flight.get(&key) {
+            match in_flight.get(&key).and_then(|(_, call)| call.upgrade()) {
                 Some(answer) => {
                     self.merged.fetch_add(1, Ordering::Relaxed);
-                    answer.clone()
+                    answer
                 }
                 None => {
-                    let answer = self.send(key, request);
-                    in_flight.insert(key, answer.clone());
+                    let call = self.next_call.fetch_add(1, Ordering::Relaxed);
+                    let answer = self.send(key, call, request);
+                    let weak = answer.downgrade().expect("a fresh call has not finished");
+                    in_flight.insert(key, (call, weak));
                     answer
                 }
             }
@@ -107,14 +130,19 @@ impl Scheduler {
     }
 
     /// The call itself, as a future any number of callers can await. It
-    /// removes its own entry when done, so a later identical request — one
-    /// the cache will answer, or a deliberate retry — is sent afresh.
-    fn send(&self, key: u128, request: CompletionRequest) -> SharedAnswer {
+    /// clears its own entry however it ends — answered, panicked, or dropped
+    /// with its last caller — so a later identical request is sent afresh.
+    fn send(&self, key: u128, call: u64, request: CompletionRequest) -> SharedAnswer {
         let inner = Arc::clone(&self.inner);
         let permits = Arc::clone(&self.permits);
-        let in_flight = Arc::clone(&self.in_flight);
+        let clear = ClearOnDrop {
+            in_flight: Arc::clone(&self.in_flight),
+            key,
+            call,
+        };
         let sent = Arc::clone(&self.sent);
         async move {
+            let _clear = clear;
             let answer = {
                 let _permit = permits
                     .acquire_owned()
@@ -123,17 +151,46 @@ impl Scheduler {
                 sent.fetch_add(1, Ordering::Relaxed);
                 inner.complete(vec![request]).await.into_iter().next()
             };
-            in_flight
-                .lock()
-                .expect("scheduler lock poisoned")
-                .remove(&key);
             match answer {
-                Some(answer) => answer.map_err(|error| error.to_string()),
+                Some(answer) => answer.map_err(error_text),
                 None => Err(format!("{} returned no result", inner.id())),
             }
         }
         .boxed()
         .shared()
+    }
+}
+
+/// Removes a call's entry when the call ends, unless a later call for the
+/// same key has taken its place.
+struct ClearOnDrop {
+    in_flight: Arc<Mutex<InFlight>>,
+    key: u128,
+    call: u64,
+}
+
+impl Drop for ClearOnDrop {
+    fn drop(&mut self) {
+        // Unwinding from a panic must not panic again on a poisoned lock.
+        let mut in_flight = match self.in_flight.lock() {
+            Ok(in_flight) => in_flight,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if in_flight
+            .get(&self.key)
+            .is_some_and(|(call, _)| *call == self.call)
+        {
+            in_flight.remove(&self.key);
+        }
+    }
+}
+
+/// An error's message, without the `model error:` prefix the caller will
+/// add back when it wraps it.
+fn error_text(error: SemcastError) -> String {
+    match error {
+        SemcastError::Model(message) => message,
+        other => other.to_string(),
     }
 }
 
@@ -159,13 +216,16 @@ impl ModelProvider for Scheduler {
     }
 
     /// One result per request, in order. Requests are sent one per call so
-    /// each takes its own place in the queue.
+    /// each takes its own place in the queue, and at most the cap of them
+    /// wait at once, so other batches get their turn.
     async fn complete(&self, requests: Vec<CompletionRequest>) -> Vec<Result<Completion>> {
-        futures::future::join_all(
+        futures::stream::iter(
             requests
                 .into_iter()
                 .map(|request| self.complete_one(request)),
         )
+        .buffered(self.max_in_flight)
+        .collect()
         .await
     }
 
@@ -298,6 +358,116 @@ mod tests {
         assert_eq!(answers[0].as_ref().unwrap().text, "yes");
         assert!(answers[1].is_err());
         assert_eq!(answers[2].as_ref().unwrap().text, "no");
+    }
+
+    /// A different request must still get through after a cancelled one,
+    /// whether the cancelled call was running or only queued.
+    #[tokio::test]
+    async fn a_cancelled_caller_gives_its_place_back() {
+        let model = Arc::new(MockModel::default().with_latency(Duration::from_millis(200)));
+        let scheduler = Arc::new(Scheduler::new(Arc::clone(&model) as _, 1));
+        let spawn = |input: &'static str| {
+            let scheduler = Arc::clone(&scheduler);
+            tokio::spawn(async move { scheduler.complete(vec![request(input)]).await })
+        };
+        let running = spawn("running");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let queued = spawn("queued");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        running.abort();
+        queued.abort();
+
+        let other = tokio::time::timeout(
+            Duration::from_secs(2),
+            scheduler.complete(vec![request("other")]),
+        )
+        .await
+        .expect("the permits came back");
+        assert!(other[0].is_ok());
+        assert!(
+            scheduler.in_flight.lock().unwrap().is_empty(),
+            "entries cleared"
+        );
+    }
+
+    /// Panics on its first call for an input, then answers.
+    #[derive(Debug, Default)]
+    struct PanicsOnce {
+        panicked: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl ModelProvider for PanicsOnce {
+        fn id(&self) -> ModelId {
+            ModelId("panics-once".to_owned())
+        }
+
+        async fn complete(&self, requests: Vec<CompletionRequest>) -> Vec<Result<Completion>> {
+            if !self.panicked.swap(true, Ordering::SeqCst) {
+                panic!("provider bug");
+            }
+            requests
+                .into_iter()
+                .map(|_| {
+                    Ok(Completion {
+                        text: "yes".to_owned(),
+                        input_tokens: 0,
+                        output_tokens: 0,
+                    })
+                })
+                .collect()
+        }
+
+        async fn embed(&self, _: Vec<String>) -> Result<Vec<Embedding>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_panicking_call_does_not_poison_its_request() {
+        let scheduler = Arc::new(Scheduler::new(Arc::new(PanicsOnce::default()), 1));
+        let first = {
+            let scheduler = Arc::clone(&scheduler);
+            tokio::spawn(async move { scheduler.complete(vec![request("x")]).await })
+        };
+        assert!(first.await.unwrap_err().is_panic());
+        let again = scheduler.complete(vec![request("x")]).await;
+        assert_eq!(again[0].as_ref().unwrap().text, "yes", "asked afresh");
+    }
+
+    #[tokio::test]
+    async fn a_model_error_is_not_prefixed_twice() {
+        let scheduler = Scheduler::new(Arc::new(MockModel::default().failing_on(["bad"])), 1);
+        let error = scheduler
+            .complete(vec![request("bad")])
+            .await
+            .remove(0)
+            .unwrap_err();
+        let text = error.to_string();
+        assert_eq!(text.matches("model error").count(), 1, "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_large_batch_takes_turns_with_other_queries() {
+        let model = Arc::new(MockModel::default().with_latency(Duration::from_millis(20)));
+        let scheduler = Arc::new(Scheduler::new(Arc::clone(&model) as _, 2));
+        let big = {
+            let scheduler = Arc::clone(&scheduler);
+            tokio::spawn(async move {
+                let requests = (0..100).map(|i| request(&format!("row {i}"))).collect();
+                scheduler.complete(requests).await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let started = std::time::Instant::now();
+        scheduler.complete(vec![request("interactive")]).await;
+        // Queued behind the whole batch it would wait ~50 × 20ms = 1s.
+        assert!(
+            started.elapsed() < Duration::from_millis(300),
+            "waited {:?}",
+            started.elapsed()
+        );
+        big.await.unwrap();
     }
 
     #[tokio::test]

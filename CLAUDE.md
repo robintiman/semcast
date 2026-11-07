@@ -62,7 +62,8 @@ SQL text
 Wiring lives in `SemcastContextBuilder::build` (`src/lib.rs`): registers the
 optimizer rules, the marker UDFs, and `SemcastQueryPlanner`, and wraps the
 session model (and any separate embedder) in a `model::Scheduler` — one cap on
-requests in flight per provider, with identical in-flight requests merged. `enable_url_table()`
+requests in flight for the session model, fallbacks included, and one for a
+separate embedder, with identical in-flight requests merged. `enable_url_table()`
 must stay the last call — it consumes and rebuilds the context.
 
 ### Two parse surfaces, and why `semcast::sql()` exists

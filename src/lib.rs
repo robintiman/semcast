@@ -309,8 +309,8 @@ impl SemcastContextBuilder {
     }
 
     /// Cap the model requests in flight at once, across every query the
-    /// session runs (default [`DEFAULT_MAX_IN_FLIGHT`]). A separate embedder
-    /// gets a cap of its own.
+    /// session runs (default [`DEFAULT_MAX_IN_FLIGHT`]). The session model
+    /// and its fallbacks share the cap; a separate embedder gets its own.
     ///
     /// [`DEFAULT_MAX_IN_FLIGHT`]: crate::model::DEFAULT_MAX_IN_FLIGHT
     pub fn with_max_in_flight(mut self, requests: usize) -> Self {
