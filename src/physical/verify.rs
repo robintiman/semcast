@@ -306,26 +306,31 @@ impl Verifier {
                 input: input.clone(),
                 max_tokens: 8,
                 schema: None,
+                logprobs: true,
             });
             pending.push((row, input, chunked));
         }
-        self.model_calls.add(requests.len());
-
         let verdicts = self.model.complete(requests).await;
+        self.model_calls.add(calls_made(&verdicts));
         debug_assert_eq!(verdicts.len(), pending.len());
         for ((row, input, chunked), verdict) in pending.iter().zip(&verdicts) {
-            match verdict.as_ref().map(|c| parse_verdict(&c.text)) {
-                Ok(Some(matched)) => {
+            match verdict
+                .as_ref()
+                .map(|c| (parse_verdict(&c.text), c.yes_probability))
+            {
+                Ok((Some(matched), yes_probability)) => {
                     keep[*row] = matched;
                     // Only successful verdicts are cached: a transient model
                     // failure must not permanently exclude a row.
-                    self.cache.put(
+                    cache_verdict(
+                        self.cache.as_ref(),
                         self.cache_key(input, *chunked),
-                        CachedValue::Value(if matched { "yes" } else { "no" }.to_owned()),
+                        matched,
+                        yes_probability,
                     );
                 }
                 // Row-level failure: exclude and count, don't fail the query.
-                Ok(None) | Err(_) => self.rows_dropped.add(1),
+                Ok((None, _)) | Err(_) => self.rows_dropped.add(1),
             }
         }
         Ok(filter_record_batch(&batch, &BooleanArray::from(keep))?)
@@ -364,6 +369,47 @@ pub(crate) fn means_cache_key(
         model_id: model_id.clone(),
         prompt_version: prompt_version.to_owned(),
     }
+}
+
+/// Where a verdict's P("yes") is kept: the verdict's own key, another field.
+/// A separate entry rather than a richer value, so a build that predates it
+/// reads the verdict exactly as before.
+pub(crate) fn yes_probability_key(verdict: &CacheKey) -> CacheKey {
+    CacheKey {
+        field: "means.yes_probability".to_owned(),
+        ..verdict.clone()
+    }
+}
+
+/// Cache a verdict, and the probability the model gave it when it reported
+/// one, together.
+pub(crate) fn cache_verdict(
+    cache: &dyn SemanticCache,
+    key: CacheKey,
+    matched: bool,
+    yes_probability: Option<f32>,
+) {
+    let mut entries = Vec::with_capacity(2);
+    if let Some(probability) = yes_probability {
+        entries.push((
+            yes_probability_key(&key),
+            CachedValue::Value(probability.to_string()),
+        ));
+    }
+    entries.push((
+        key,
+        CachedValue::Value(if matched { "yes" } else { "no" }.to_owned()),
+    ));
+    cache.put_many(entries);
+}
+
+/// The model calls a batch of completions cost: an answer merged onto an
+/// identical request already in flight cost none.
+pub(crate) fn calls_made(completions: &[crate::Result<crate::model::Completion>]) -> usize {
+    completions
+        .iter()
+        .filter(|completion| !matches!(completion, Ok(c) if c.merged))
+        .count()
 }
 
 /// `None` means the model didn't give a usable yes/no.

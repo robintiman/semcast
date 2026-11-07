@@ -270,6 +270,7 @@ impl Extractor {
                         .json_schema(&pending_fields)
                         .map_err(DataFusionError::from)?,
                 ),
+                logprobs: false,
             });
             pending.push(PendingRow {
                 row,
@@ -277,9 +278,9 @@ impl Extractor {
                 pending_units,
             });
         }
-        self.model_calls.add(requests.len());
-
         let completions = self.model.complete(requests).await;
+        self.model_calls
+            .add(crate::physical::verify::calls_made(&completions));
         debug_assert_eq!(completions.len(), pending.len());
         for (pending_row, completion) in pending.iter().zip(&completions) {
             let object = completion

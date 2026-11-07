@@ -1,7 +1,7 @@
 //! Deterministic in-process model for tests and the eval baseline.
 
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -33,7 +33,11 @@ pub struct MockModel {
     latency: Option<Duration>,
     /// Inputs containing any of these fail; see [`MockModel::failing_on`].
     failing: Vec<String>,
+    /// See [`MockModel::with_yes_probability`].
+    yes_probability: Option<YesProbability>,
 }
+
+type YesProbability = Arc<dyn Fn(&str) -> f32 + Send + Sync>;
 
 impl std::fmt::Debug for MockModel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -140,6 +144,17 @@ impl MockModel {
     /// Sleep this long in every `complete` call. Real providers take seconds
     /// per batch; tests that need to observe a query *while it runs* — batch
     /// job progress, cancellation — need a mock that isn't instantaneous.
+    /// Report `probability(input)` as P("yes") for yes/no requests that ask
+    /// for logprobs, instead of 0.9 for a yes and 0.1 for a no. The verdict
+    /// itself still follows the needles.
+    pub fn with_yes_probability(
+        mut self,
+        probability: impl Fn(&str) -> f32 + Send + Sync + 'static,
+    ) -> Self {
+        self.yes_probability = Some(Arc::new(probability));
+        self
+    }
+
     pub fn with_latency(mut self, latency: Duration) -> Self {
         self.latency = Some(latency);
         self
@@ -192,8 +207,19 @@ impl ModelProvider for MockModel {
                     },
                     _ => if matched() { "yes" } else { "no" }.to_owned(),
                 };
+                // A yes/no request with logprobs gets a probability that
+                // agrees with the verdict: 0.9 for yes, 0.1 for no, unless a
+                // test set its own.
+                let yes_probability =
+                    (req.logprobs && req.schema.is_none()).then(|| match &self.yes_probability {
+                        Some(probability) => probability(&req.input),
+                        None if matched() => 0.9,
+                        None => 0.1,
+                    });
                 Ok(Completion {
                     output_tokens: text.len() / 4 + 1,
+                    yes_probability,
+                    merged: false,
                     input_tokens: req.input.len() / 4,
                     text,
                 })
@@ -267,6 +293,7 @@ mod tests {
             input: input.to_owned(),
             max_tokens: 64,
             schema,
+            logprobs: false,
         }
     }
 

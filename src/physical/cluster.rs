@@ -357,12 +357,13 @@ impl Grouper {
                 input,
                 max_tokens: LABEL_MAX_TOKENS,
                 schema: Some(label_schema()),
+                logprobs: false,
             });
             pending.push((cluster, key));
         }
-        self.model_calls.add(requests.len());
-
         let completions = self.model.complete(requests).await;
+        self.model_calls
+            .add(crate::physical::verify::calls_made(&completions));
         debug_assert_eq!(completions.len(), pending.len());
         for ((cluster, key), completion) in pending.into_iter().zip(&completions) {
             match completion.as_ref().ok().and_then(|c| parse_label(&c.text)) {

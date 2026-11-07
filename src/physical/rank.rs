@@ -403,13 +403,14 @@ impl Ranker {
                     input: input.clone(),
                     max_tokens: 32,
                     schema: Some(score_schema()),
+                    logprobs: false,
                 });
                 pending.push((hash, input));
             }
         }
-        self.model_calls.add(requests.len());
-
         let completions = self.model.complete(requests).await;
+        self.model_calls
+            .add(crate::physical::verify::calls_made(&completions));
         debug_assert_eq!(completions.len(), pending.len());
         for ((hash, input), completion) in pending.iter().zip(&completions) {
             match completion.as_ref().map(|c| parse_score(&c.text)) {

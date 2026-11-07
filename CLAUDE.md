@@ -113,6 +113,11 @@ assembled in the physical planner, not there.
 - Cache keys carry a prompt version (`MEANS_PROMPT_VERSION`,
   `EXTRACT_PROMPT_VERSION`, `SemanticType::version`). Change a synthesized prompt
   and bump its constant, so stale verdicts are invalidated honestly.
+- A `MEANS` verdict is cached as `"yes"`/`"no"` under field `means`; the
+  model's P("yes") for it, when the provider reports logprobs, goes in a
+  separate entry (`verify::cache_verdict`, field `means.yes_probability`), so
+  older builds never misread a verdict. Count model calls with
+  `verify::calls_made`: an answer the scheduler merged cost no call.
 - Rows fail, queries don't: a row the model errors on is excluded from a
   filter (counted in `rows_dropped`) or falls through to `ELSE` in a `CASE`,
   rather than failing the statement. A failed calibration label stays in the

@@ -76,6 +76,8 @@ impl ModelProvider for KeywordModel {
                 };
                 Ok(Completion {
                     output_tokens: 1,
+                    yes_probability: None,
+                    merged: false,
                     input_tokens: req.input.len() / 4,
                     text,
                 })

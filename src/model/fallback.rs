@@ -200,6 +200,8 @@ mod tests {
                             text: self.name.to_owned(),
                             input_tokens: 0,
                             output_tokens: 0,
+                            yes_probability: None,
+                            merged: false,
                         })
                     }
                 })
@@ -222,6 +224,7 @@ mod tests {
                 input: (*input).to_owned(),
                 max_tokens: 8,
                 schema: None,
+                logprobs: false,
             })
             .collect()
     }
