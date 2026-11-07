@@ -200,9 +200,21 @@ struct ChatResponse {
     prompt_eval_count: usize,
     #[serde(default)]
     eval_count: usize,
-    /// One entry per generated token, when the request asked for them.
-    #[serde(default)]
+    /// One entry per generated token, when the request asked for them. A
+    /// shape we don't know (a look-alike server's) reads as none: a missing
+    /// probability must not cost the answer.
+    #[serde(default, deserialize_with = "lenient_logprobs")]
     logprobs: Option<Vec<TokenLogprobs>>,
+}
+
+fn lenient_logprobs<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Vec<TokenLogprobs>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).ok())
 }
 
 #[derive(Deserialize)]
@@ -306,6 +318,15 @@ mod tests {
             .collect();
         let p = crate::model::yes_probability(&alternatives).unwrap();
         assert!(p > 0.99, "{p}");
+    }
+
+    #[test]
+    fn logprobs_in_an_unknown_shape_cost_the_probability_not_the_answer() {
+        let json = r#"{"message": {"role": "assistant", "content": "yes"},
+                       "logprobs": {"content": [{"token": "yes", "logprob": -0.1}]}}"#;
+        let chat: ChatResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(chat.message.content, "yes");
+        assert!(chat.logprobs.is_none());
     }
 
     #[test]
