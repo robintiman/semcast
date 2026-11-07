@@ -13,8 +13,11 @@
 //! in the session, so it changes nothing on disk either.
 //!
 //! A row holds the statement's own SQL text, replayed through
-//! [`crate::sql`], so a definition restores exactly as it was first planned.
-//! A relative `LOCATION` is saved made absolute, so a server started from
+//! [`crate::sql`], so a restored definition looks its names up again. That
+//! differs from the session in one way: a DataFusion view keeps reading the
+//! table it was created over, even after that name is replaced; restored,
+//! it reads whatever the name means now — or fails, if the name became an
+//! in-memory table or was dropped. A relative `LOCATION` is saved made absolute, so a server started from
 //! another directory reads the same file, and a view that reads a file by
 //! relative path is refused. The exception is a semantic
 //! index: replaying `CREATE SEMANTIC INDEX` would embed the whole column
@@ -405,7 +408,13 @@ pub(crate) async fn execute_ddl(
                 && !exists_now
                 && let Some(name) = effect.relation()
             {
-                forget_relation(ctx, runtime.as_deref(), catalog.as_ref(), name).await?;
+                // Report the statement's own error first; a store failure
+                // on top of it is the second half of the message.
+                if let Err(store) =
+                    forget_relation(ctx, runtime.as_deref(), catalog.as_ref(), name).await
+                {
+                    return Err(SemcastError::Store(format!("{error}; then {store}")));
+                }
             }
             return Err(error.into());
         }

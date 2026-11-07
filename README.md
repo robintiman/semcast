@@ -72,8 +72,9 @@ reattached from where they were built, without re-embedding, so set
 `--index-dir` to a directory that outlives the temp dir. Not kept: in-memory
 tables (`CREATE TABLE ... AS`) and the views and indexes over them. A view must read files
 by absolute path (`FROM '/data/t.csv'`) or through an external table. A definition
-that fails to restore, such as a table whose file is gone, is logged and
-kept until the name is defined again or dropped (`DROP ... IF EXISTS`).
+that fails to restore, such as a table whose file is gone or a view whose
+table was dropped, is logged and kept until the name is defined again or
+dropped (`DROP ... IF EXISTS`).
 Remove a semantic type with `DROP SEMANTIC TYPE [IF EXISTS] Name`.
 
 Build from source:
