@@ -64,6 +64,11 @@ struct ServeArgs {
     /// no model calls. Both live in memory only if unset.
     #[arg(long)]
     store: Option<PathBuf>,
+    /// Most model requests in flight at once, across all queries; a separate
+    /// embedder gets the same cap of its own. Identical requests in flight
+    /// are sent once.
+    #[arg(long, default_value_t = semcast::model::DEFAULT_MAX_IN_FLIGHT)]
+    max_in_flight: usize,
     /// Where batch job state and results are stored; temp dir if unset.
     /// Jobs submitted with `SUBMIT` survive the connection that started
     /// them, and finished jobs stay queryable across restarts.
@@ -120,7 +125,9 @@ async fn main() -> std::io::Result<()> {
         }
     };
 
-    let mut builder = SemcastContextBuilder::new(model).with_information_schema(true);
+    let mut builder = SemcastContextBuilder::new(model)
+        .with_information_schema(true)
+        .with_max_in_flight(args.max_in_flight);
     match args.embed_provider {
         EmbedProvider::Voyage => {
             let voyage = VoyageProvider::from_env()

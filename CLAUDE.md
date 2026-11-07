@@ -60,7 +60,9 @@ SQL text
 | `CAST`/`EXTRACT` typed | `typed.rs`, `extract_udf.rs` | `extract.rs` | `sem_extract.rs` | `extract.rs` |
 
 Wiring lives in `SemcastContextBuilder::build` (`src/lib.rs`): registers the
-optimizer rules, the marker UDFs, and `SemcastQueryPlanner`. `enable_url_table()`
+optimizer rules, the marker UDFs, and `SemcastQueryPlanner`, and wraps the
+session model (and any separate embedder) in a `model::Scheduler` — one cap on
+requests in flight per provider, with identical in-flight requests merged. `enable_url_table()`
 must stay the last call — it consumes and rebuilds the context.
 
 ### Two parse surfaces, and why `semcast::sql()` exists

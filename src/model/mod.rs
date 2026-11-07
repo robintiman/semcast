@@ -12,12 +12,14 @@ mod anthropic;
 mod fallback;
 mod mock;
 mod ollama;
+mod scheduler;
 mod voyage;
 
 pub use anthropic::{AnthropicProvider, DEFAULT_ANTHROPIC_MODEL, DEFAULT_ANTHROPIC_URL};
 pub use fallback::FallbackProvider;
 pub use mock::MockModel;
 pub use ollama::{DEFAULT_CHAT_MODEL, DEFAULT_EMBED_MODEL, DEFAULT_OLLAMA_URL, OllamaProvider};
+pub use scheduler::{DEFAULT_MAX_IN_FLIGHT, Scheduler, SchedulerStats};
 pub use voyage::{DEFAULT_VOYAGE_MODEL, DEFAULT_VOYAGE_URL, VoyageProvider};
 
 use std::time::{Duration, SystemTime};
