@@ -491,3 +491,126 @@ fn pathdiff(path: &Path, base: &Path) -> String {
     }
     relative.to_str().unwrap().to_owned()
 }
+
+#[tokio::test]
+async fn drop_if_exists_in_a_missing_schema_succeeds() {
+    // With and without a store: DataFusion accepts it, so semcast must.
+    let plain = semcast::semcast_context(Arc::new(MockModel::default()));
+    run(&plain, "DROP TABLE IF EXISTS nosuch.t").await;
+    run(&plain, "DROP VIEW IF EXISTS nosuch.v").await;
+    let disk = Disk::new();
+    let stored = disk.session(Arc::new(MockModel::default())).await;
+    run(&stored, "DROP TABLE IF EXISTS nosuch.t").await;
+}
+
+#[tokio::test]
+async fn a_database_restores_before_the_schemas_and_tables_in_it() {
+    let disk = Disk::new();
+    let first = disk.session(Arc::new(MockModel::default())).await;
+    run(&first, "CREATE DATABASE crm").await;
+    run(&first, "CREATE SCHEMA crm.sales").await;
+    let in_crm = disk
+        .create_tickets()
+        .replacen("TABLE tickets", "TABLE crm.sales.tickets", 1);
+    run(&first, &in_crm).await;
+    drop(first);
+
+    let second = disk.session(Arc::new(MockModel::default())).await;
+    assert!(
+        run(&second, "SELECT count(*) AS n FROM crm.sales.tickets")
+            .await
+            .contains("| 3 |")
+    );
+}
+
+#[tokio::test]
+async fn a_view_over_a_relative_path_is_refused_when_saving() {
+    let disk = Disk::new();
+    let cwd = std::env::current_dir().unwrap();
+    let relative = pathdiff(&disk.csv("tickets"), &cwd);
+    let view = format!("CREATE VIEW raw AS SELECT * FROM '{relative}'");
+
+    let first = disk.session(Arc::new(MockModel::default())).await;
+    let error = semcast::sql(&first, &view).await.unwrap_err().to_string();
+    assert!(error.contains("relative path"), "{error}");
+    assert!(!first.table_exist("raw").unwrap(), "refused before it ran");
+
+    let absolute = std::fs::canonicalize(disk.csv("tickets")).unwrap();
+    run(
+        &first,
+        &format!("CREATE VIEW raw AS SELECT * FROM '{}'", absolute.display()),
+    )
+    .await;
+    run(&first, "CREATE VIEW ids AS SELECT id FROM raw").await;
+    assert_eq!(
+        disk.entries().len(),
+        2,
+        "absolute paths and tables are fine"
+    );
+
+    // Without a store there is nothing to replay, so nothing to refuse.
+    let plain = semcast::semcast_context(Arc::new(MockModel::default()));
+    run(&plain, &view).await;
+}
+
+#[tokio::test]
+async fn an_index_is_not_saved_for_a_same_named_table_in_another_schema() {
+    let disk = Disk::new();
+    let first = disk.session(Arc::new(MockModel::default())).await;
+    run(&first, "CREATE SCHEMA s").await;
+    let elsewhere = disk
+        .create_tickets()
+        .replacen("TABLE tickets", "TABLE s.tickets", 1);
+    run(&first, &elsewhere).await;
+    run(
+        &first,
+        "CREATE TABLE tickets AS SELECT column1 AS body FROM (VALUES ('furious'))",
+    )
+    .await;
+    run(&first, "CREATE SEMANTIC INDEX ON tickets(body)").await;
+    assert!(
+        !disk
+            .entries()
+            .iter()
+            .any(|(kind, _)| *kind == EntryKind::SemanticIndex),
+        "public.tickets is in memory: {:?}",
+        disk.entries()
+    );
+}
+
+#[tokio::test]
+async fn replacing_a_table_with_an_in_memory_one_unregisters_its_indexes() {
+    let disk = Disk::new();
+    let first = disk.session(Arc::new(MockModel::default())).await;
+    run(&first, &disk.create_tickets()).await;
+    run(&first, "CREATE SEMANTIC INDEX ON tickets(body)").await;
+    run(&first, "CREATE OR REPLACE TABLE tickets AS VALUES (1)").await;
+    assert!(runtime(&first).index_for("tickets", "body").is_none());
+}
+
+#[tokio::test]
+async fn a_slow_create_table_as_does_not_hold_up_other_ddl() {
+    let disk = Disk::new();
+    let latency = std::time::Duration::from_secs(2);
+    let model = MockModel::answering_yes_to(["furious"]).with_latency(latency);
+    let ctx = disk.session(Arc::new(model)).await;
+    run(&ctx, &disk.create_tickets()).await;
+
+    let slow_ctx = ctx.clone();
+    let slow = tokio::spawn(async move {
+        run(
+            &slow_ctx,
+            "CREATE TABLE angry AS SELECT id FROM tickets WHERE body MEANS 'angry'",
+        )
+        .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let started = std::time::Instant::now();
+    run(&ctx, "CREATE VIEW ids AS SELECT id FROM tickets").await;
+    assert!(
+        started.elapsed() < latency / 2,
+        "the view waited {:?} on the running query",
+        started.elapsed()
+    );
+    slow.await.unwrap();
+}

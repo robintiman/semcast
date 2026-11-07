@@ -1,8 +1,8 @@
 //! The durable catalog: definitions that outlive the process.
 //!
 //! The verdict store keeps what the model answered; this keeps what the
-//! user defined — schemas, external tables, views, semantic types and
-//! semantic indexes — in a `catalog` table of the same SQLite file. Each
+//! user defined — databases, schemas, external tables, views, semantic
+//! types and semantic indexes — in a `catalog` table of the same SQLite file. Each
 //! `CREATE` that takes effect saves a row and each `DROP` that removes
 //! something deletes it; [`restore`] replays the rows into a fresh context
 //! at startup.
@@ -15,7 +15,8 @@
 //! A row holds the statement's own SQL text, replayed through
 //! [`crate::sql`], so a definition restores exactly as it was first planned.
 //! A relative `LOCATION` is saved made absolute, so a server started from
-//! another directory reads the same file. The exception is a semantic
+//! another directory reads the same file, and a view that reads a file by
+//! relative path is refused. The exception is a semantic
 //! index: replaying `CREATE SEMANTIC INDEX` would embed the whole column
 //! again, so its row holds where the index lives on disk and [`restore`]
 //! reattaches it without an embedding call.
@@ -45,6 +46,8 @@ use crate::{Result, SemcastError};
 /// What a catalog row defines. Names are unique per kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryKind {
+    /// `CREATE DATABASE`, keyed by its name.
+    Catalog,
     /// `CREATE SCHEMA`, keyed `catalog.schema`.
     Schema,
     /// An external table or a view, keyed `catalog.schema.table`. One kind
@@ -59,6 +62,7 @@ pub enum EntryKind {
 impl EntryKind {
     fn as_str(self) -> &'static str {
         match self {
+            Self::Catalog => "catalog",
             Self::Schema => "schema",
             Self::Relation => "relation",
             Self::SemanticType => "semantic_type",
@@ -68,6 +72,7 @@ impl EntryKind {
 
     fn parse(kind: &str) -> Option<Self> {
         [
+            Self::Catalog,
             Self::Schema,
             Self::Relation,
             Self::SemanticType,
@@ -158,17 +163,17 @@ impl Catalog {
         self.ddl.lock().await
     }
 
-    /// Whether a saved relation has bare table name `table`.
-    pub(crate) async fn has_relation_named(&self, table: &str) -> Result<bool> {
+    /// Whether the relation of resolved name `name` is saved.
+    pub(crate) async fn has_relation(&self, name: &str) -> Result<bool> {
         let connection = Arc::clone(&self.connection);
-        let suffix = format!(".{table}");
+        let name = name.to_owned();
         tokio::task::spawn_blocking(move || {
             let connection = connection.lock().expect("catalog lock poisoned");
             connection
                 .query_row(
                     "SELECT EXISTS (SELECT 1 FROM catalog \
-                     WHERE kind = 'relation' AND substr(name, -length(?1)) = ?1)",
-                    params![suffix],
+                     WHERE kind = 'relation' AND name = ?1)",
+                    params![name],
                     |row| row.get(0),
                 )
                 .map_err(store_err)
@@ -270,6 +275,9 @@ enum Effect {
     SaveSchema {
         name: String,
     },
+    SaveCatalog {
+        name: String,
+    },
     DropRelation {
         name: TableReference,
     },
@@ -308,6 +316,9 @@ impl Effect {
             DdlStatement::CreateCatalogSchema(create) => Self::SaveSchema {
                 name: create.schema_name.clone(),
             },
+            DdlStatement::CreateCatalog(create) => Self::SaveCatalog {
+                name: create.catalog_name.clone(),
+            },
             DdlStatement::DropTable(drop) => Self::DropRelation {
                 name: drop.name.clone(),
             },
@@ -337,24 +348,39 @@ pub(crate) async fn execute_ddl(
         .as_ref()
         .and_then(|runtime| runtime.catalog().cloned())
         .filter(|_| record);
-    let _guard = match &catalog {
-        Some(catalog) => Some(catalog.lock().await),
-        None => None,
+    // `CREATE TABLE ... AS` runs its whole query, model calls included, and
+    // is never saved: lock only for its save, not while it runs. Everything
+    // else is quick, and holds the lock throughout so disk order matches
+    // the order the statements took effect.
+    let slow = matches!(&plan, LogicalPlan::Ddl(DdlStatement::CreateMemoryTable(_)));
+    let mut guard = match &catalog {
+        Some(catalog) if !slow => Some(catalog.lock().await),
+        _ => None,
     };
     let effect = Effect::of(&plan);
-    // Before running: a location that can't be saved refuses the statement
-    // rather than define a table that is lost on restart.
+    // Before running: a definition that can't be saved faithfully refuses
+    // the statement rather than define something lost on restart.
     let definition = match &effect {
         Effect::SaveRelation {
             location: Some(location),
             ..
         } if catalog.is_some() => absolute_location(sql, location)?,
+        Effect::SaveRelation { location: None, .. } if catalog.is_some() => {
+            refuse_relative_paths(ctx, &plan)?;
+            sql.to_owned()
+        }
         _ => sql.to_owned(),
     };
-    let existed = exists(ctx, &effect)?;
+    let existed = exists(ctx, &effect);
     let df = ctx.execute_logical_plan(plan).await?;
     // DDL has run by now: `execute_logical_plan` executes it eagerly.
-    let exists_now = exists(ctx, &effect)?;
+    let exists_now = exists(ctx, &effect);
+    if guard.is_none()
+        && let Some(catalog) = &catalog
+    {
+        guard = Some(catalog.lock().await);
+    }
+    let _guard = guard;
     let (changes, failure) = match effect {
         // Defined, unless the name was there and nothing replaced it.
         Effect::SaveRelation { name, replaces, .. } if !existed || replaces => {
@@ -370,6 +396,10 @@ pub(crate) async fn execute_ddl(
         }
         Effect::UnsavedRelation { name, replaces } if !existed || replaces => {
             let table = name.table().to_owned();
+            // A replaced table's indexes described the old rows.
+            if existed && let Some(runtime) = &runtime {
+                runtime.unregister_indexes(&table);
+            }
             let name = resolve(ctx, &name);
             let failure = format!(
                 "{name} is defined for this session, but an earlier saved definition \
@@ -388,6 +418,17 @@ pub(crate) async fn execute_ddl(
             );
             let entry = Entry {
                 kind: EntryKind::Schema,
+                name,
+                definition,
+            };
+            (vec![Change::Put(entry)], failure)
+        }
+        Effect::SaveCatalog { name } if !existed => {
+            let failure = format!(
+                "database {name} is defined for this session but will be gone after a restart"
+            );
+            let entry = Entry {
+                kind: EntryKind::Catalog,
                 name,
                 definition,
             };
@@ -420,12 +461,14 @@ pub(crate) async fn execute_ddl(
     Ok(df)
 }
 
-/// Whether the name `effect` is about exists in `ctx` right now.
-fn exists(ctx: &SessionContext, effect: &Effect) -> Result<bool> {
-    Ok(match effect {
+/// Whether the name `effect` is about exists in `ctx` right now. A name in
+/// a schema or catalog that doesn't exist doesn't exist either: `DROP TABLE
+/// IF EXISTS nosuch.t` succeeds in DataFusion, so it must here.
+fn exists(ctx: &SessionContext, effect: &Effect) -> bool {
+    match effect {
         Effect::SaveRelation { name, .. }
         | Effect::UnsavedRelation { name, .. }
-        | Effect::DropRelation { name } => ctx.table_exist(name.clone())?,
+        | Effect::DropRelation { name } => ctx.table_exist(name.clone()).unwrap_or(false),
         Effect::SaveSchema { name } => {
             let qualified = qualified_schema(ctx, name);
             let (catalog, schema) = qualified
@@ -434,8 +477,37 @@ fn exists(ctx: &SessionContext, effect: &Effect) -> Result<bool> {
             ctx.catalog(catalog)
                 .is_some_and(|catalog| catalog.schema(schema).is_some())
         }
+        Effect::SaveCatalog { name } => ctx.catalog(name).is_some(),
         Effect::Other => false,
-    })
+    }
+}
+
+/// Refuse a view that reads a file by relative path (`FROM 'data/t.csv'`):
+/// replayed from another working directory it would read another file, or
+/// none. Such a scan names no registered table, which is how it is told
+/// from a table that happens to have a path-like name.
+fn refuse_relative_paths(ctx: &SessionContext, plan: &LogicalPlan) -> Result<()> {
+    use datafusion::common::tree_node::TreeNodeRecursion;
+    let mut relative = None;
+    plan.apply_with_subqueries(|node| {
+        if let LogicalPlan::TableScan(scan) = node {
+            let name = scan.table_name.table();
+            let is_path = !name.contains("://") && Path::new(name).is_relative();
+            if is_path && !ctx.table_exist(scan.table_name.clone()).unwrap_or(false) {
+                relative = Some(name.to_owned());
+                return Ok(TreeNodeRecursion::Stop);
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+    match relative {
+        Some(path) => Err(SemcastError::Store(format!(
+            "this view reads '{path}' by relative path, which a restarted server \
+             would resolve from its own directory; give an absolute path, or \
+             read the file through CREATE EXTERNAL TABLE"
+        ))),
+        None => Ok(()),
+    }
 }
 
 /// Whether any schema of any catalog still has a table of bare name `table`.

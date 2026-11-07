@@ -180,7 +180,12 @@ pub async fn create_semantic_index(
         let _guard = catalog.lock().await;
         // An index over an in-memory table would come back without its
         // table, and attach to whatever takes the name next.
-        if !catalog.has_relation_named(table).await? {
+        let state = ctx.state();
+        let defaults = &state.config().options().catalog;
+        let resolved = datafusion::common::TableReference::from(table)
+            .resolve(&defaults.default_catalog, &defaults.default_schema)
+            .to_string();
+        if !catalog.has_relation(&resolved).await? {
             tracing::info!(
                 "semantic index on {table}({column}) is kept for this session only: \
                  {table} is not a saved table"

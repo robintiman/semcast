@@ -66,11 +66,12 @@ psql -h 127.0.0.1 -p 5433
 `semcast serve --help` lists the knobs: `--port` (5433), `--provider`,
 `--model`, `--embed-provider`, `--embed-model`, `--ollama-url`, `--index-dir`,
 `--store`. Set `--store semcast.db` to keep state across restarts. A verdict
-paid for once is free after the restart. Schemas, external tables, views,
-semantic types and semantic indexes come back too. Indexes are reattached
-from where they were built, without re-embedding, so set `--index-dir` to a
-directory that outlives the temp dir. Not kept: in-memory tables (`CREATE
-TABLE ... AS`), `TEMPORARY` objects, and indexes over either. A definition
+paid for once is free after the restart. Databases, schemas, external
+tables, views, semantic types and semantic indexes come back too. Indexes are
+reattached from where they were built, without re-embedding, so set
+`--index-dir` to a directory that outlives the temp dir. Not kept: in-memory
+tables (`CREATE TABLE ... AS`) and indexes over them. A view must read files
+by absolute path (`FROM '/data/t.csv'`) or through an external table. A definition
 that fails to restore, such as a table whose file is gone, is logged and
 kept until the name is defined again or dropped (`DROP ... IF EXISTS`).
 Remove a semantic type with `DROP SEMANTIC TYPE [IF EXISTS] Name`.
