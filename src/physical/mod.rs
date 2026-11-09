@@ -8,6 +8,8 @@ pub mod extract;
 pub mod index_scan;
 pub mod planner;
 pub mod rank;
+pub(crate) mod sample;
+pub mod score_scan;
 pub mod trace;
 pub mod verify;
 
@@ -17,4 +19,5 @@ pub use distinct::SemDistinctExec;
 pub use extract::SemExtractExec;
 pub use index_scan::IndexScanExec;
 pub use rank::SemRankExec;
+pub use score_scan::ScoreScanExec;
 pub use verify::VerifyExec;

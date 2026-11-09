@@ -25,8 +25,10 @@ use crate::logical::{
 use crate::model::ModelProvider;
 use crate::optimizer::calibrate::DEFAULT_CALIBRATION_SAMPLE;
 use crate::physical::index_scan::{CalibrationConfig, ChunkEvidence, IndexScanExec};
+use crate::physical::score_scan::ScorerHealth;
 use crate::physical::{
-    SemClassifyExec, SemClusterExec, SemDistinctExec, SemExtractExec, SemRankExec, VerifyExec,
+    ScoreScanExec, SemClassifyExec, SemClusterExec, SemDistinctExec, SemExtractExec, SemRankExec,
+    VerifyExec,
 };
 
 /// The default DataFusion planner plus semcast extension planning.
@@ -34,11 +36,23 @@ use crate::physical::{
 pub struct SemcastQueryPlanner {
     model: Arc<dyn ModelProvider>,
     cache: Arc<dyn SemanticCache>,
+    scorer: Option<(Arc<dyn ModelProvider>, Arc<ScorerHealth>)>,
 }
 
 impl SemcastQueryPlanner {
     pub fn new(model: Arc<dyn ModelProvider>, cache: Arc<dyn SemanticCache>) -> Self {
-        Self { model, cache }
+        Self {
+            model,
+            cache,
+            scorer: None,
+        }
+    }
+
+    /// A cheap model whose P("yes") pre-filters an unindexed `MEANS` under
+    /// `WITH RECALL`; see [`ScoreScanExec`].
+    pub fn with_scorer(mut self, scorer: Option<Arc<dyn ModelProvider>>) -> Self {
+        self.scorer = scorer.map(|scorer| (scorer, Arc::new(ScorerHealth::default())));
+        self
     }
 }
 
@@ -53,6 +67,7 @@ impl QueryPlanner for SemcastQueryPlanner {
             SemcastExtensionPlanner {
                 model: Arc::clone(&self.model),
                 cache: Arc::clone(&self.cache),
+                scorer: self.scorer.clone(),
             },
         )]);
         let plan = planner
@@ -73,6 +88,7 @@ impl QueryPlanner for SemcastQueryPlanner {
 struct SemcastExtensionPlanner {
     model: Arc<dyn ModelProvider>,
     cache: Arc<dyn SemanticCache>,
+    scorer: Option<(Arc<dyn ModelProvider>, Arc<ScorerHealth>)>,
 }
 
 #[async_trait]
@@ -126,8 +142,35 @@ impl ExtensionPlanner for SemcastExtensionPlanner {
                     params.chunks_per_doc,
                 ))));
             }
+            // No index, but a scorer and a recall target: the scorer reads
+            // every row, verify reads those above a calibrated floor. Without
+            // a target there is nothing to calibrate against, and the scorer
+            // stays out of the way.
+            let mut input = Arc::clone(&physical_inputs[0]);
+            // A scorer that is the session model would save nothing, and
+            // under one id its answers are the session model's verdicts.
+            let scorer = self
+                .scorer
+                .as_ref()
+                .filter(|(scorer, _)| scorer.id() != self.model.id());
+            if let (Some((scorer, health)), Some(target_recall)) = (scorer, filter.recall) {
+                input = Arc::new(ScoreScanExec::new(
+                    input,
+                    Arc::clone(&text),
+                    filter.condition.clone(),
+                    Arc::clone(scorer),
+                    Arc::clone(health),
+                    CalibrationConfig {
+                        target_recall,
+                        confidence: filter.confidence,
+                        sample_size: DEFAULT_CALIBRATION_SAMPLE,
+                        model: Arc::clone(&self.model),
+                        cache: Arc::clone(&self.cache),
+                    },
+                ));
+            }
             return Ok(Some(Arc::new(VerifyExec::new(
-                Arc::clone(&physical_inputs[0]),
+                input,
                 text,
                 filter.condition.clone(),
                 Arc::clone(&self.model),

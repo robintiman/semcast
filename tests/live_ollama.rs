@@ -512,3 +512,59 @@ async fn confidence_against_live_ollama() {
     assert!(angry > 0.5, "{angry}");
     assert!(happy < 0.5, "{happy}");
 }
+
+/// The scorer role against real logprobs: a second Ollama model scores every
+/// row, the session model labels a sample and verifies the rows above the
+/// calibrated floor. Defaults to gemma4:e4b for both; to see a cheap scorer
+/// spare a bigger model:
+///
+/// ```sh
+/// SEMCAST_OLLAMA_MODEL=gemma4:31b SEMCAST_OLLAMA_SCORER=gemma4:e4b \
+///   cargo test --test live_ollama scorer -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore = "requires a running Ollama server with a pulled model"]
+async fn scorer_against_live_ollama() {
+    use datafusion::arrow::array::Int64Array;
+
+    let model = std::env::var("SEMCAST_OLLAMA_MODEL").unwrap_or_else(|_| "gemma4:e4b".to_owned());
+    let scorer = std::env::var("SEMCAST_OLLAMA_SCORER").unwrap_or_else(|_| model.clone());
+    let ctx = semcast::SemcastContextBuilder::new(Arc::new(OllamaProvider::new(model)))
+        .with_scorer(Arc::new(OllamaProvider::new(scorer)))
+        .build();
+    ctx.sql(
+        "CREATE TABLE tickets AS SELECT * FROM (VALUES
+             (1, 'Third outage this week. I am furious and want a refund.'),
+             (2, 'Thanks, the fix works great.'),
+             (3, 'How do I export my data to CSV?'),
+             (4, 'This is unacceptable, your support has ignored me for days!'),
+             (5, 'Love the new dashboard.'),
+             (6, 'Can you add dark mode?')
+         ) AS t(id, body)",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    let batches = semcast::sql(
+        &ctx,
+        "SELECT id FROM tickets WHERE body MEANS 'the customer is angry' WITH RECALL 0.9",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+    let mut ids: Vec<i64> = batches
+        .iter()
+        .flat_map(|b| {
+            let column = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+            column.iter().map(|v| v.unwrap()).collect::<Vec<_>>()
+        })
+        .collect();
+    ids.sort_unstable();
+    println!("live ollama scorer kept {ids:?}");
+    assert_eq!(ids, [1, 4]);
+}

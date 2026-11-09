@@ -107,6 +107,18 @@ pub fn calibrate_threshold(
     let mut positive = scores.positive_scores.clone();
     positive.sort_by(|a, b| b.total_cmp(a));
     let known = positive.len() + scores.positive_unindexed + scores.positive_lost;
+    // A labeled sample without a single known match certifies nothing —
+    // failed labels or not: the matches it missed are exactly what a bound
+    // is about. Prune nothing and report the target unmet, so a certifying
+    // caller keeps drawing instead of stopping on an empty proof.
+    if known == 0 && confidence.is_some() && scores.sampled > 0 {
+        return Calibration {
+            threshold: f32::NEG_INFINITY,
+            sampled_rows: scores.sampled,
+            estimated_recall: 1.0,
+            certified_recall: Some(0.0),
+        };
+    }
     if known == 0 && scores.unverified_scores.is_empty() {
         // No evidence to raise the floor with — keep the default; recall is
         // vacuously met.
@@ -139,12 +151,6 @@ pub fn calibrate_threshold(
     };
     let threshold = match confidence {
         None => estimated_floor(),
-        // No known positive, only failed labels: nothing to certify against,
-        // so take the estimate's floor, which keeps every failure and is
-        // vacuously exact. Searching the failures' scores for a certified
-        // floor would find none (each keeps zero of zero or loses one) and
-        // turn pruning off over a single failed call.
-        Some(_) if known == 0 => estimated_floor(),
         Some(confidence) => {
             // Nothing certifies: prune nothing. A floor at the lowest sampled
             // positive would still drop every unsampled match below it, on a
@@ -360,6 +366,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_sample_without_matches_certifies_nothing() {
+        let none = SampledScores {
+            sampled: 64,
+            ..Default::default()
+        };
+        let certified = calibrate_threshold(0.9, Some(0.95), 0.5, &none);
+        assert_eq!(certified.threshold, f32::NEG_INFINITY, "prunes nothing");
+        assert!(!certified.meets(0.9), "an empty proof is no proof");
+        // Estimating keeps the caller's default, as before.
+        let estimated = calibrate_threshold(0.9, None, 0.5, &none);
+        assert_eq!(estimated.threshold, 0.5);
+        // Nothing sampled at all — no rows — is vacuously met.
+        let empty = calibrate_threshold(0.9, Some(0.95), 0.5, &SampledScores::default());
+        assert!(empty.meets(0.9));
+    }
+
     /// The uncertified path, unchanged: `WITH RECALL` alone must cost and
     /// prune exactly what it always did.
     mod point_estimate {
@@ -503,27 +526,25 @@ mod tests {
             assert_eq!(with.threshold, 0.5, "{with:?}");
         }
 
-        /// A sample with no known positive and one failed label says nothing
-        /// to certify against. Both readings keep the default floor, lowered
-        /// only if the failure sits below it, rather than turning pruning off
-        /// over one failed call.
+        /// A sample with no known positive and one failed label. The estimate
+        /// keeps the default floor, lowered only if the failure sits below
+        /// it, rather than turning pruning off over one failed call. A
+        /// certificate has nothing to stand on either way, so it prunes
+        /// nothing and reports the target unmet.
         #[test]
-        fn a_lone_failed_label_does_not_turn_pruning_off() {
+        fn a_lone_failed_label_estimates_but_certifies_nothing() {
             for failed_score in [0.8_f32, 0.2] {
                 let sample = SampledScores {
                     unverified_scores: vec![failed_score],
                     sampled: 64,
                     ..Default::default()
                 };
-                let expected = failed_score.min(0.35);
-                for confidence in [None, Some(0.9)] {
-                    let calibration = calibrate_threshold(0.9, confidence, 0.35, &sample);
-                    assert_eq!(
-                        calibration.threshold, expected,
-                        "failed score {failed_score}, confidence {confidence:?}",
-                    );
-                    assert!(calibration.meets(0.9));
-                }
+                let estimated = calibrate_threshold(0.9, None, 0.35, &sample);
+                assert_eq!(estimated.threshold, failed_score.min(0.35));
+                assert!(estimated.meets(0.9));
+                let certified = calibrate_threshold(0.9, Some(0.9), 0.35, &sample);
+                assert_eq!(certified.threshold, f32::NEG_INFINITY);
+                assert!(!certified.meets(0.9));
             }
         }
 
@@ -641,14 +662,15 @@ mod tests {
         }
 
         #[test]
-        fn no_positives_certifies_vacuously() {
+        fn no_positives_certifies_nothing_even_with_failed_labels() {
             let sample = SampledScores {
-                sampled: 12,
+                sampled: 64,
+                unverified_scores: vec![0.9],
                 ..Default::default()
             };
             let calibration = calibrate_threshold(0.9, Some(0.95), 0.35, &sample);
-            assert_eq!(calibration.threshold, 0.35);
-            assert_eq!(calibration.certified_recall, Some(1.0));
+            assert_eq!(calibration.threshold, f32::NEG_INFINITY);
+            assert!(!calibration.meets(0.9));
         }
 
         /// More confidence demanded means less pruning, never more.

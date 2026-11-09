@@ -42,6 +42,12 @@ struct ServeArgs {
     /// claude-haiku-4-5 for `anthropic`, gemma4:e4b for `ollama`.
     #[arg(long)]
     model: Option<String>,
+    /// Small Ollama chat model that pre-filters a MEANS no semantic index
+    /// covers, under WITH RECALL: it scores every row by its P(yes), and the
+    /// main model verifies only rows above a floor calibrated to the recall
+    /// target. Off if unset.
+    #[arg(long)]
+    scorer_model: Option<String>,
     /// Ollama embedding model used by semantic indexes
     /// (with `--embed-provider ollama`).
     #[arg(long, default_value = semcast::model::DEFAULT_EMBED_MODEL)]
@@ -143,6 +149,11 @@ async fn main() -> std::io::Result<()> {
                 builder = builder.with_embedder(Arc::new(ollama()));
             }
         }
+    }
+    if let Some(scorer) = &args.scorer_model {
+        builder = builder.with_scorer(Arc::new(
+            OllamaProvider::new(scorer).with_base_url(&args.ollama_url),
+        ));
     }
     if let Some(dir) = &args.index_dir {
         builder = builder.with_index_root(dir);

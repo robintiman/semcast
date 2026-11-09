@@ -102,6 +102,13 @@ document's top chunks, verify reads it per row, keyed by `doc_hash` so it surviv
 repartitioning. `WITH RECALL` makes the scan calibrate its own threshold at
 execution time (`src/optimizer/calibrate.rs`) by labeling a sample.
 
+With no index but a scorer (`SemcastContextBuilder::with_scorer`, a second
+chat model) and `WITH RECALL`, the planner builds `ScoreScanExec → VerifyExec`
+instead (`src/physical/score_scan.rs`): the scorer's P("yes") per row,
+thresholded at a floor calibrated the same way. Both calibrating stages draw
+and label their sample through `src/physical/sample.rs`, so they share labels
+through the verdict cache.
+
 `src/optimizer/funnel.rs::derive_funnel` is an unimplemented stub — the funnel is
 assembled in the physical planner, not there.
 

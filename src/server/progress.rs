@@ -38,6 +38,11 @@ impl ProgressEvent {
 #[serde(default)]
 pub struct FunnelCounts {
     pub has_index_scan: bool,
+    pub has_scorer: bool,
+    pub scorer_calls: usize,
+    pub scorer_cache_hits: usize,
+    pub scorer_rows_pruned: usize,
+    pub scorer_passthrough_rows: usize,
     pub index_hits: usize,
     pub rows_pruned: usize,
     pub calibration_sampled_rows: usize,
@@ -90,6 +95,7 @@ pub struct FunnelCounts {
 impl FunnelCounts {
     pub fn is_semantic(&self) -> bool {
         self.has_index_scan
+            || self.has_scorer
             || self.has_verify
             || self.has_extract
             || self.has_rank
@@ -123,6 +129,21 @@ pub fn snapshot(plan: &Arc<dyn ExecutionPlan>) -> FunnelCounts {
                 if let Some(metrics) = metrics {
                     counts.index_hits += counter_total(&metrics, "index_hits");
                     counts.rows_pruned += counter_total(&metrics, "rows_pruned");
+                    counts.calibration_sampled_rows +=
+                        counter_total(&metrics, "calibration_sampled_rows");
+                    counts.calibration_model_calls +=
+                        sent_calls(&metrics, "calibration_model_calls");
+                    counts.calibration_label_errors +=
+                        counter_total(&metrics, "calibration_label_errors");
+                }
+            }
+            "ScoreScanExec" => {
+                counts.has_scorer = true;
+                if let Some(metrics) = metrics {
+                    counts.scorer_calls += sent_calls(&metrics, "scorer_calls");
+                    counts.scorer_cache_hits += counter_total(&metrics, "scorer_cache_hits");
+                    counts.scorer_rows_pruned += counter_total(&metrics, "rows_pruned");
+                    counts.scorer_passthrough_rows += counter_total(&metrics, "passthrough_rows");
                     counts.calibration_sampled_rows +=
                         counter_total(&metrics, "calibration_sampled_rows");
                     counts.calibration_model_calls +=
@@ -219,6 +240,21 @@ pub fn render(counts: &FunnelCounts) -> String {
             "index scan: {} hits, {} pruned",
             counts.index_hits, counts.rows_pruned,
         ));
+    }
+    if counts.has_scorer {
+        let mut scorer = format!(
+            "scorer: {} calls, {} cache hits, {} pruned",
+            counts.scorer_calls, counts.scorer_cache_hits, counts.scorer_rows_pruned,
+        );
+        if counts.scorer_passthrough_rows > 0 {
+            scorer.push_str(&format!(
+                ", {} unscored rows sent to verify",
+                counts.scorer_passthrough_rows
+            ));
+        }
+        parts.push(scorer);
+    }
+    {
         if counts.calibration_sampled_rows > 0 {
             let mut calibration = format!(
                 "calibration: {} rows labeled, {} model calls",
@@ -331,6 +367,7 @@ fn collect(plan: &Arc<dyn ExecutionPlan>, out: &mut Vec<Arc<dyn ExecutionPlan>>)
     if matches!(
         plan.name(),
         "IndexScanExec"
+            | "ScoreScanExec"
             | "VerifyExec"
             | "SemExtractExec"
             | "SemRankExec"
