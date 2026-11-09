@@ -19,6 +19,8 @@ install-path = "CARGO_HOME"
 install-updater = false
 
 # Override runners: dist 0.28.7 defaults aarch64-apple-darwin to the retired
-# macos-13 image, which leaves the job queued forever. Pin to macos-14 (Apple Silicon).
+# macos-13 image, which leaves the job queued forever. macos-14 was retired
+# too (v0.4.0's build was cancelled: "configuration not supported"), so
+# follow the moving label rather than pin an image that will age out again.
 [dist.github-custom-runners]
-aarch64-apple-darwin = "macos-14"
+aarch64-apple-darwin = "macos-latest"
