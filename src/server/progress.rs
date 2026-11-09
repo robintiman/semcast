@@ -75,6 +75,7 @@ pub struct FunnelCounts {
     pub classify_rows_gated: usize,
     pub classify_rows_failed: usize,
     pub classify_branches_failed: usize,
+    pub classify_rows_unscored: usize,
     pub has_rank: bool,
     pub rank_candidate_rows: usize,
     pub rank_rows_pruned: usize,
@@ -173,6 +174,7 @@ pub fn snapshot(plan: &Arc<dyn ExecutionPlan>) -> FunnelCounts {
                     counts.classify_rows_gated += counter_total(&metrics, "rows_gated");
                     counts.classify_rows_failed += counter_total(&metrics, "rows_failed");
                     counts.classify_branches_failed += counter_total(&metrics, "branches_failed");
+                    counts.classify_rows_unscored += counter_total(&metrics, "rows_unscored");
                 }
             }
             "SemRankExec" => {
@@ -287,6 +289,15 @@ pub fn render(counts: &FunnelCounts) -> String {
             counts.classify_rows_failed,
             counts.classify_branches_failed,
         ));
+        // A NULL CONFIDENCE() looks like any other NULL in the result, so
+        // say why there is one.
+        if counts.classify_rows_unscored > 0 {
+            parts.push(format!(
+                "classify: {} rows have no CONFIDENCE() — the model reported no \
+                 probability, or the cache holds a different verdict",
+                counts.classify_rows_unscored,
+            ));
+        }
     }
     if counts.has_rank {
         parts.push(format!(

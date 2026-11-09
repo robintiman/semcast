@@ -467,3 +467,48 @@ async fn semantic_distinct_against_live_ollama() {
     );
     assert!(ids.contains(&4) && ids.contains(&5), "{ids:?}");
 }
+
+/// `CONFIDENCE()` reads a real P("yes") off Ollama's logprobs: high for the
+/// clear match, low for the clear miss.
+#[tokio::test]
+#[ignore = "requires a running Ollama server with a pulled model"]
+async fn confidence_against_live_ollama() {
+    use datafusion::arrow::array::{Array, Float64Array};
+
+    let model = std::env::var("SEMCAST_OLLAMA_MODEL").unwrap_or_else(|_| "gemma4:e4b".to_owned());
+    let ctx = semcast_context(Arc::new(OllamaProvider::new(model)));
+    ctx.sql(
+        "CREATE TABLE tickets AS SELECT * FROM (VALUES
+             (1, 'This is the third outage this week. I am furious and want my money back.'),
+             (2, 'Thanks for the quick fix, everything works great now!')
+         ) AS t(id, body)",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    let batches = semcast::sql(
+        &ctx,
+        "SELECT id, CONFIDENCE(body MEANS 'the customer is angry') FROM tickets ORDER BY id",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+    let scores: Vec<Option<f64>> = batches
+        .iter()
+        .flat_map(|b| {
+            let column = b.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+            column.iter().collect::<Vec<_>>()
+        })
+        .collect();
+    println!("live ollama CONFIDENCE: {scores:?}");
+    let [Some(angry), Some(happy)] = scores[..] else {
+        panic!("expected a probability for both rows, got {scores:?}");
+    };
+    assert!(angry > 0.5, "{angry}");
+    assert!(happy < 0.5, "{happy}");
+}

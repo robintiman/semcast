@@ -150,6 +150,38 @@ Each column answers exactly what the same `MEANS` answers in a `WHERE`, so
 verdicts are shared: filter first and label after, and the labelling is free.
 No index is used — labelling every row prunes nothing.
 
+#### `CONFIDENCE()`
+
+```sql
+CONFIDENCE(<text_column> MEANS '<condition>')   -- a DOUBLE in [0, 1]
+```
+
+The model's probability that the `MEANS` holds, read from its yes/no answer.
+Goes in a `SELECT` list, a `WHERE`, or an `ORDER BY`. One model call per row,
+never fused, and shared with the same `MEANS` in a `WHERE`: whichever runs
+first pays.
+
+```sql
+SELECT id, CONFIDENCE(body MEANS 'customer is angry') AS anger
+FROM tickets
+WHERE CONFIDENCE(body MEANS 'customer is angry') > 0.8
+ORDER BY anger DESC;
+```
+
+NULL when the text is NULL, the call fails, or the provider reports no
+probabilities (Ollama does; Anthropic doesn't). `ORDER BY … DESC` puts NULLs
+first; add `NULLS LAST`. Not to be confused with `WITH CONFIDENCE`, which
+qualifies a recall target.
+
+`UPDATE` and `DELETE` refuse `MEANS`, `CONFIDENCE()` and subqueries in their
+`WHERE` (DataFusion would apply them to every row). Keep the other rows
+instead:
+
+```sql
+CREATE TABLE open_tickets AS SELECT * FROM tickets
+WHERE id NOT IN (SELECT id FROM tickets WHERE body MEANS 'resolved');
+```
+
 #### `WITH RECALL`
 
 ```sql
@@ -470,6 +502,8 @@ jobs stay queryable across restarts. One statement per `SUBMIT`.
       orders them
 - [x] Classify — `MEANS` in a `SELECT` list or a `CASE` branch, all branches
       fused into one model call per row
+- [x] `CONFIDENCE(… MEANS …)` — the model's P("yes") as a column, sharing the
+      `MEANS` cache
 - [x] Cluster — `GROUP BY MEANING OF … INTO k`, one model call per group,
       auto-`k` by silhouette sweep
 - [x] Semantic dedupe — `SEMANTIC DISTINCT ON … WITH SIMILARITY`, no model

@@ -198,15 +198,13 @@ impl ExtensionPlanner for SemcastExtensionPlanner {
                 .as_ref()
                 .map(|guard| planner.create_physical_expr(guard, schema, session_state))
                 .transpose()?;
-            let column_names = (0..classify.conditions.len())
-                .map(|branch| crate::logical::sem_classify::branch_column_name(classify.id, branch))
-                .collect();
             return Ok(Some(Arc::new(SemClassifyExec::new(
                 Arc::clone(&physical_inputs[0]),
                 text,
                 classify.conditions.clone(),
                 guard,
-                column_names,
+                classify.output,
+                classify.column_names(),
                 Arc::clone(&self.model),
                 Arc::clone(&self.cache),
             )?)));

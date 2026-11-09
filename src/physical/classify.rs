@@ -7,6 +7,11 @@
 //! a row that needs just one answer is sent the verify prompt byte-for-byte,
 //! so it shares that stage's cache entries outright.
 //!
+//! `CONFIDENCE(text MEANS 'condition')` runs here too, as a one-condition
+//! node whose column is the model's P("yes") rather than the verdict. It asks
+//! exactly the verify request, so it reads and writes the same cache entries
+//! a `WHERE ... MEANS` does, plus the probability stored beside them.
+//!
 //! No index stage. A classify labels every row, so there is nothing to prune;
 //! and the conditions would each want their own chunk set while the fused call
 //! sends one input. The model reads the full text.
@@ -14,7 +19,9 @@
 use std::fmt;
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Array, ArrayRef, BooleanArray, BooleanBuilder, StringArray};
+use datafusion::arrow::array::{
+    Array, ArrayRef, BooleanArray, BooleanBuilder, Float64Builder, StringArray,
+};
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -34,10 +41,12 @@ use datafusion::physical_plan::{
 use futures::TryStreamExt;
 
 use crate::cache::{CacheKey, CachedValue, SemanticCache};
+use crate::logical::sem_classify::ClassifyOutput;
 use crate::model::{CompletionRequest, ModelId, ModelProvider};
 use crate::physical::extract::parse_json_object;
 use crate::physical::verify::{
-    MEANS_PROMPT_VERSION, cache_verdict, means_cache_key, parse_verdict, synthesize_means_prompt,
+    MEANS_PROMPT_VERSION, cache_unscored, cache_verdict, cached_score, means_cache_key,
+    parse_verdict, synthesize_means_prompt,
 };
 
 /// Version of the *fused* prompt — the one that asks about several conditions
@@ -89,6 +98,10 @@ fn classify_schema(count: usize) -> serde_json::Value {
 /// or answers unparseably gets NULL — which no `CASE` branch matches, so the
 /// row falls through to the next branch or `ELSE` instead of taking the query
 /// down with it.
+///
+/// For `CONFIDENCE()` ([`ClassifyOutput::YesProbability`]) every one of those
+/// rows is NULL instead — no probability was measured — and so is a row whose
+/// provider reports no probability (counted in `rows_unscored`).
 #[derive(Debug)]
 pub struct SemClassifyExec {
     input: Arc<dyn ExecutionPlan>,
@@ -98,6 +111,7 @@ pub struct SemClassifyExec {
     /// Rows this evaluates false (or NULL) for skip the model — an earlier
     /// `CASE` branch already claimed them.
     guard: Option<Arc<dyn PhysicalExpr>>,
+    output: ClassifyOutput,
     model: Arc<dyn ModelProvider>,
     cache: Arc<dyn SemanticCache>,
     output_schema: SchemaRef,
@@ -106,18 +120,24 @@ pub struct SemClassifyExec {
 }
 
 impl SemClassifyExec {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         input: Arc<dyn ExecutionPlan>,
         text: Arc<dyn PhysicalExpr>,
         conditions: Vec<String>,
         guard: Option<Arc<dyn PhysicalExpr>>,
+        output: ClassifyOutput,
         column_names: Vec<String>,
         model: Arc<dyn ModelProvider>,
         cache: Arc<dyn SemanticCache>,
     ) -> Result<Self> {
+        let data_type = match output {
+            ClassifyOutput::Verdict => DataType::Boolean,
+            ClassifyOutput::YesProbability => DataType::Float64,
+        };
         let mut fields = input.schema().fields().to_vec();
         for name in &column_names {
-            fields.push(Arc::new(Field::new(name, DataType::Boolean, true)));
+            fields.push(Arc::new(Field::new(name, data_type.clone(), true)));
         }
         let output_schema = Arc::new(Schema::new(fields));
         let properties = Arc::new(PlanProperties::new(
@@ -132,6 +152,7 @@ impl SemClassifyExec {
             text,
             conditions,
             guard,
+            output,
             model,
             cache,
             output_schema,
@@ -151,12 +172,20 @@ impl SemClassifyExec {
 
 impl DisplayAs for SemClassifyExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(
-            f,
-            "SemClassifyExec: {} condition(s) model={}",
-            self.conditions.len(),
-            self.model.id()
-        )?;
+        match self.output {
+            ClassifyOutput::Verdict => write!(
+                f,
+                "SemClassifyExec: {} condition(s) model={}",
+                self.conditions.len(),
+                self.model.id()
+            )?,
+            ClassifyOutput::YesProbability => write!(
+                f,
+                "SemClassifyExec: CONFIDENCE('{}') model={}",
+                self.conditions[0],
+                self.model.id()
+            )?,
+        }
         if self.guard.is_some() {
             write!(f, " gated")?;
         }
@@ -196,6 +225,7 @@ impl ExecutionPlan for SemClassifyExec {
             Arc::clone(&self.text),
             self.conditions.clone(),
             self.guard.clone(),
+            self.output,
             self.column_names(),
             Arc::clone(&self.model),
             Arc::clone(&self.cache),
@@ -224,10 +254,17 @@ impl ExecutionPlan for SemClassifyExec {
             rows_failed: MetricBuilder::new(&self.metrics).counter("rows_failed", partition),
             branches_failed: MetricBuilder::new(&self.metrics)
                 .counter("branches_failed", partition),
+            rows_unscored: MetricBuilder::new(&self.metrics).counter("rows_unscored", partition),
         });
+        let output = self.output;
         let stream = input.and_then(move |batch| {
             let classifier = Arc::clone(&classifier);
-            async move { classifier.classify_batch(batch).await }
+            async move {
+                match output {
+                    ClassifyOutput::Verdict => classifier.classify_batch(batch).await,
+                    ClassifyOutput::YesProbability => classifier.score_batch(batch).await,
+                }
+            }
         });
         let output = Box::pin(RecordBatchStreamAdapter::new(
             Arc::clone(&self.output_schema),
@@ -269,9 +306,111 @@ struct Classifier {
     rows_gated: Count,
     rows_failed: Count,
     branches_failed: Count,
+    /// `CONFIDENCE()` rows whose answer came back without a probability: the
+    /// provider reports none, or the cache already holds a different verdict.
+    rows_unscored: Count,
 }
 
 impl Classifier {
+    /// `CONFIDENCE()`: one P("yes") per row, for the single condition.
+    ///
+    /// A cached probability is served only alongside the verdict it was
+    /// measured with. A cached verdict *without* one doesn't count — the
+    /// row is asked again, with logprobs, and both are stored. A row known
+    /// to have no usable probability is NULL without a call.
+    async fn score_batch(&self, batch: RecordBatch) -> Result<RecordBatch> {
+        let rows = batch.num_rows();
+        if rows == 0 {
+            return Ok(RecordBatch::new_empty(Arc::clone(&self.output_schema)));
+        }
+        let texts = self.text.evaluate(&batch)?.into_array(rows)?;
+        let texts = cast(&texts, &DataType::Utf8)?;
+        let texts = texts
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("text cast to Utf8");
+        let guard = self.evaluate_guard(&batch)?;
+        let condition = &self.conditions[0];
+
+        let mut scores: Vec<Option<f64>> = vec![None; rows];
+        let mut requests = Vec::new();
+        let mut pending: Vec<(usize, CacheKey)> = Vec::new();
+        for (row, score) in scores.iter_mut().enumerate() {
+            if !guard_allows(guard.as_ref(), row) {
+                self.rows_gated.add(1);
+                continue;
+            }
+            if !texts.is_valid(row) {
+                continue;
+            }
+            let text = texts.value(row);
+            let key = means_cache_key(condition, text, &self.model_id, MEANS_PROMPT_VERSION);
+            if let Some(cached) = cached_score(self.cache.as_ref(), &key) {
+                self.cache_hits.add(1);
+                if cached.is_none() {
+                    self.rows_unscored.add(1);
+                }
+                *score = cached.map(f64::from);
+                continue;
+            }
+            requests.push(self.request(text, &[0]));
+            pending.push((row, key));
+        }
+        self.model_calls.add(requests.len());
+        let completions = self.model.complete(requests).await;
+        self.model_calls_merged
+            .add(crate::physical::verify::merged_calls(&completions));
+        debug_assert_eq!(completions.len(), pending.len());
+        for ((row, key), completion) in pending.into_iter().zip(&completions) {
+            let Some((completion, verdict)) = completion
+                .as_ref()
+                .ok()
+                .and_then(|c| parse_verdict(&c.text).map(|v| (c, v)))
+            else {
+                self.rows_failed.add(1);
+                continue;
+            };
+            // The stored verdict wins; a probability is kept only beside the
+            // verdict it was measured with. A stored verdict that differs can
+            // never be paired, so the row is settled as unscored and later
+            // queries don't pay for the same NULL.
+            let stored = match self.cache.get(&key) {
+                Some(CachedValue::Value(stored)) => Some(stored == "yes"),
+                _ => None,
+            };
+            scores[row] = match (stored, completion.yes_probability) {
+                (Some(stored), _) if stored != verdict => {
+                    cache_unscored(self.cache.as_ref(), &key, stored);
+                    None
+                }
+                (_, Some(probability)) => {
+                    cache_verdict(self.cache.as_ref(), key, verdict, Some(probability));
+                    Some(f64::from(probability))
+                }
+                // Not settled: the next answer may well carry a probability
+                // (another provider under the same id, a one-off parse miss).
+                (_, None) => {
+                    cache_verdict(self.cache.as_ref(), key, verdict, None);
+                    None
+                }
+            };
+            if scores[row].is_none() {
+                self.rows_unscored.add(1);
+            }
+        }
+
+        let mut builder = Float64Builder::with_capacity(rows);
+        for score in scores {
+            builder.append_option(score);
+        }
+        let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
+        columns.push(Arc::new(builder.finish()));
+        Ok(RecordBatch::try_new(
+            Arc::clone(&self.output_schema),
+            columns,
+        )?)
+    }
+
     async fn classify_batch(&self, batch: RecordBatch) -> Result<RecordBatch> {
         let rows = batch.num_rows();
         if rows == 0 {

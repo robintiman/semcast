@@ -388,7 +388,7 @@ pub(crate) fn means_cache_key(
 /// entry keeps its first value independently, so a verdict stored without a
 /// probability (an older build, a provider without logprobs) can later be
 /// joined by a probability from a different answer; naming the verdict
-/// lets [`cached_yes_probability`] refuse such a pair.
+/// lets [`cached_score`] refuse such a pair.
 pub(crate) fn yes_probability_key(verdict: &CacheKey) -> CacheKey {
     CacheKey {
         field: "means.yes_probability".to_owned(),
@@ -419,25 +419,47 @@ pub(crate) fn cache_verdict(
     cache.put_many(entries);
 }
 
-/// The cached P("yes") for the verdict under `key`, if one was stored with
-/// that same verdict.
-// Read by `CONFIDENCE()`, which lands next; until then only tests call it.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn cached_yes_probability(cache: &dyn SemanticCache, key: &CacheKey) -> Option<f32> {
+/// What the cache settles about P("yes") for the verdict under `key`:
+/// `None` when nothing is known yet (ask the model), `Some(None)` when it is
+/// known there is no usable probability, `Some(Some(p))` for a probability
+/// measured with the stored verdict.
+///
+/// "No usable probability" is an `"<verdict> unscored"` entry — a store
+/// that keeps its first value holds a different verdict than the answer
+/// that came with a probability — or a probability measured with a
+/// different verdict. Each entry keeps its first value, so asking again
+/// could never fix either: settling it is what stops a query from paying
+/// for the same NULL every time. A provider that simply gave no probability
+/// is not settled; the next answer may carry one.
+pub(crate) fn cached_score(cache: &dyn SemanticCache, key: &CacheKey) -> Option<Option<f32>> {
     let Some(CachedValue::Value(verdict)) = cache.get(key) else {
         return None;
     };
     let Some(CachedValue::Value(entry)) = cache.get(&yes_probability_key(key)) else {
         return None;
     };
-    let (measured_with, probability) = entry.split_once(' ')?;
+    let Some((measured_with, probability)) = entry.split_once(' ') else {
+        return Some(None);
+    };
     if measured_with != verdict {
-        return None;
+        return Some(None);
     }
-    probability
-        .parse()
-        .ok()
-        .filter(|p: &f32| (0.0..=1.0).contains(p))
+    Some(
+        probability
+            .parse()
+            .ok()
+            .filter(|p: &f32| (0.0..=1.0).contains(p)),
+    )
+}
+
+/// Record that the verdict under `key` has no usable probability; see
+/// [`cached_score`].
+pub(crate) fn cache_unscored(cache: &dyn SemanticCache, key: &CacheKey, verdict: bool) {
+    let verdict = if verdict { "yes" } else { "no" };
+    cache.put(
+        yes_probability_key(key),
+        CachedValue::Value(format!("{verdict} unscored")),
+    );
 }
 
 /// The answers in a batch the scheduler merged onto an identical request
@@ -483,7 +505,7 @@ mod yes_probability_cache_tests {
     fn a_probability_is_read_back_with_its_verdict() {
         let cache = InMemoryCache::default();
         cache_verdict(&cache, key(), true, Some(0.8));
-        assert_eq!(cached_yes_probability(&cache, &key()), Some(0.8));
+        assert_eq!(cached_score(&cache, &key()).flatten(), Some(0.8));
         assert_eq!(
             cache.get(&key()),
             Some(CachedValue::Value("yes".to_owned()))
@@ -500,14 +522,24 @@ mod yes_probability_cache_tests {
             yes_probability_key(&key()),
             CachedValue::Value("no 0.08".to_owned()),
         );
-        assert_eq!(cached_yes_probability(&cache, &key()), None);
+        assert_eq!(cached_score(&cache, &key()).flatten(), None);
+    }
+
+    #[test]
+    fn an_unscored_verdict_is_settled() {
+        let cache = InMemoryCache::default();
+        cache_verdict(&cache, key(), true, None);
+        assert_eq!(cached_score(&cache, &key()), None, "not known yet");
+        cache_unscored(&cache, &key(), true);
+        assert_eq!(cached_score(&cache, &key()), Some(None));
+        assert_eq!(cached_score(&cache, &key()).flatten(), None);
     }
 
     #[test]
     fn no_verdict_or_no_probability_reads_as_none() {
         let cache = InMemoryCache::default();
-        assert_eq!(cached_yes_probability(&cache, &key()), None);
+        assert_eq!(cached_score(&cache, &key()).flatten(), None);
         cache_verdict(&cache, key(), false, None);
-        assert_eq!(cached_yes_probability(&cache, &key()), None);
+        assert_eq!(cached_score(&cache, &key()).flatten(), None);
     }
 }

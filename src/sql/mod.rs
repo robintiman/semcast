@@ -19,6 +19,7 @@
 
 pub mod cluster;
 pub mod cluster_udf;
+pub mod confidence_udf;
 pub mod ddl;
 pub mod dialect;
 pub mod distinct;

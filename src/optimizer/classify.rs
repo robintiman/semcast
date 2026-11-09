@@ -11,12 +11,17 @@
 //! only: every column still answers exactly the question the same `MEANS`
 //! would ask in a `WHERE`.
 //!
+//! `CONFIDENCE(text MEANS 'condition')` gets a node of its own with one
+//! condition, never fused: a probability is read off the yes/no token of the
+//! verify prompt, which a fused JSON answer doesn't have. Asking it that way
+//! also shares the verdict cache with a `WHERE ... MEANS` over the same text.
+//!
 //! [`SemClassifyNode`]: crate::logical::SemClassifyNode
 //! [`MeansRewriteRule`]: crate::optimizer::rewrite::MeansRewriteRule
 
 use std::sync::Arc;
 
-use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, Result, plan_err};
 use datafusion::logical_expr::expr::Case;
 use datafusion::logical_expr::expr_rewriter::NamePreserver;
@@ -24,8 +29,10 @@ use datafusion::logical_expr::utils::conjunction;
 use datafusion::logical_expr::{Expr, Extension, LogicalPlan, Projection};
 
 use crate::logical::SemClassifyNode;
-use crate::logical::sem_classify::branch_column_name;
-use crate::optimizer::rewrite::{contains_means, destructure_means, is_means_call};
+use crate::logical::sem_classify::{ClassifyOutput, branch_column_name, confidence_column_name};
+use crate::optimizer::rewrite::{
+    contains_means, destructure_confidence, destructure_means, is_confidence_call, is_means_call,
+};
 
 /// Rewrite a projection's `means()` markers into stacked classify nodes,
 /// leaving a projection without markers untouched.
@@ -63,7 +70,17 @@ pub fn rewrite_projection(projection: Projection) -> Result<Transformed<LogicalP
 
 /// Replace every `means()` in `expr` with the column its classify node will
 /// produce, threading the guard that says which rows reach it.
-fn rewrite_expr(expr: Expr, guard: &Option<Expr>, builder: &mut Builder) -> Result<Expr> {
+pub(crate) fn rewrite_expr(
+    expr: Expr,
+    guard: &Option<Expr>,
+    builder: &mut Builder,
+) -> Result<Expr> {
+    if is_confidence_call(&expr) {
+        let (text, condition) = destructure_confidence(expr)?;
+        return Ok(Expr::Column(
+            builder.register_confidence(text, condition, guard),
+        ));
+    }
     if is_means_call(&expr) {
         let (text, condition, recall, _confidence) = destructure_means(expr)?;
         if recall.is_some() {
@@ -82,6 +99,28 @@ fn rewrite_expr(expr: Expr, guard: &Option<Expr>, builder: &mut Builder) -> Resu
 
     Ok(expr
         .map_children(|child| Ok(Transformed::yes(rewrite_expr(child, guard, builder)?)))?
+        .data)
+}
+
+/// Replace each `confidence()` in a `WHERE` predicate with its column,
+/// leaving any bare `means()` for the filter rewrite — which decides whether
+/// its position is legal.
+pub(crate) fn lift_confidence(expr: Expr, builder: &mut Builder) -> Result<Expr> {
+    // Top-down, so an outer call is checked before anything inside it is
+    // replaced: a CONFIDENCE() reading another one must still be refused.
+    Ok(expr
+        .transform_down(|expr| {
+            if is_confidence_call(&expr) {
+                let (text, condition) = destructure_confidence(expr)?;
+                let column = builder.register_confidence(text, condition, &None);
+                return Ok(Transformed::new(
+                    Expr::Column(column),
+                    true,
+                    TreeNodeRecursion::Jump,
+                ));
+            }
+            Ok(Transformed::no(expr))
+        })?
         .data)
 }
 
@@ -160,7 +199,7 @@ fn case_guard(case: &Case, outer: &Option<Expr>) -> Result<Option<Expr>> {
 /// a marker returns its column immediately, so one traversal both rewrites the
 /// expressions and describes the nodes to build.
 #[derive(Default)]
-struct Builder {
+pub(crate) struct Builder {
     groups: Vec<Group>,
 }
 
@@ -169,23 +208,51 @@ struct Group {
     guard: Option<Expr>,
     /// Conditions in first-appearance order; the index is the branch index.
     conditions: Vec<String>,
+    output: ClassifyOutput,
 }
 
 impl Builder {
+    /// The column that will carry P("yes") for `condition`: one node per
+    /// distinct `(text, guard, condition)`, shared by every repeat of it.
+    fn register_confidence(
+        &mut self,
+        text: Expr,
+        condition: String,
+        guard: &Option<Expr>,
+    ) -> Column {
+        let id = match self.groups.iter().position(|g| {
+            g.output == ClassifyOutput::YesProbability
+                && g.text == text
+                && &g.guard == guard
+                && g.conditions[0] == condition
+        }) {
+            Some(id) => id,
+            None => {
+                self.groups.push(Group {
+                    text,
+                    guard: guard.clone(),
+                    conditions: vec![condition],
+                    output: ClassifyOutput::YesProbability,
+                });
+                self.groups.len() - 1
+            }
+        };
+        Column::new_unqualified(confidence_column_name(id))
+    }
+
     /// The column that will carry `condition`'s verdict, creating the group
     /// and the branch if this is the first time either is seen.
     fn register(&mut self, text: Expr, condition: String, guard: &Option<Expr>) -> Column {
-        let group = match self
-            .groups
-            .iter()
-            .position(|g| g.text == text && &g.guard == guard)
-        {
+        let group = match self.groups.iter().position(|g| {
+            g.output == ClassifyOutput::Verdict && g.text == text && &g.guard == guard
+        }) {
             Some(group) => group,
             None => {
                 self.groups.push(Group {
                     text,
                     guard: guard.clone(),
                     conditions: Vec::new(),
+                    output: ClassifyOutput::Verdict,
                 });
                 self.groups.len() - 1
             }
@@ -203,17 +270,23 @@ impl Builder {
 
     /// Stack one node per group above `input`. Group index is the node id, so
     /// the columns handed out during registration line up.
-    fn build(self, input: LogicalPlan) -> Result<LogicalPlan> {
+    pub(crate) fn build(self, input: LogicalPlan) -> Result<LogicalPlan> {
         let mut plan = input;
-        for (id, group) in self.groups.into_iter().enumerate() {
-            plan = LogicalPlan::Extension(Extension {
-                node: Arc::new(SemClassifyNode::try_new(
+        for (id, mut group) in self.groups.into_iter().enumerate() {
+            let node = match group.output {
+                ClassifyOutput::Verdict => {
+                    SemClassifyNode::try_new(plan, group.text, group.conditions, group.guard, id)?
+                }
+                ClassifyOutput::YesProbability => SemClassifyNode::try_new_confidence(
                     plan,
                     group.text,
-                    group.conditions,
+                    group.conditions.swap_remove(0),
                     group.guard,
                     id,
-                )?),
+                )?,
+            };
+            plan = LogicalPlan::Extension(Extension {
+                node: Arc::new(node),
             });
         }
         Ok(plan)
