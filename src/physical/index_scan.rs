@@ -46,7 +46,8 @@ use crate::optimizer::calibrate::{
 };
 use crate::optimizer::proxy::LearnedProxy;
 use crate::physical::verify::{
-    MEANS_PROMPT_VERSION, means_cache_key, parse_verdict, synthesize_means_prompt,
+    MEANS_PROMPT_VERSION, cache_verdict, means_cache_key, merged_calls, parse_verdict,
+    synthesize_means_prompt,
 };
 
 /// A sampled document and its label: `Some(matched)`, or `None` when the
@@ -307,6 +308,8 @@ impl ExecutionPlan for IndexScanExec {
                 .counter("calibration_sampled_rows", partition),
             calibration_model_calls: MetricBuilder::new(&self.metrics)
                 .counter("calibration_model_calls", partition),
+            calibration_model_calls_merged: MetricBuilder::new(&self.metrics)
+                .counter("calibration_model_calls_merged", partition),
             calibration_label_errors: MetricBuilder::new(&self.metrics)
                 .counter("calibration_label_errors", partition),
         });
@@ -366,6 +369,8 @@ struct Scanner {
     passthrough_rows: Count,
     calibration_sampled_rows: Count,
     calibration_model_calls: Count,
+    /// Of `calibration_model_calls`, those merged onto an identical call.
+    calibration_model_calls_merged: Count,
     calibration_label_errors: Count,
 }
 
@@ -704,24 +709,31 @@ impl Scanner {
                         input: text.clone(),
                         max_tokens: 8,
                         schema: None,
+                        logprobs: true,
                     });
                 }
             }
         }
         self.calibration_model_calls.add(requests.len());
-
         let completions = calibration.model.complete(requests).await;
+        self.calibration_model_calls_merged
+            .add(merged_calls(&completions));
         debug_assert_eq!(completions.len(), misses.len());
         for (text, completion) in misses.into_iter().zip(&completions) {
-            match completion.as_ref().map(|c| parse_verdict(&c.text)) {
-                Ok(Some(matched)) => {
-                    calibration.cache.put(
+            match completion
+                .as_ref()
+                .map(|c| (parse_verdict(&c.text), c.yes_probability))
+            {
+                Ok((Some(matched), yes_probability)) => {
+                    cache_verdict(
+                        calibration.cache.as_ref(),
                         means_cache_key(&self.condition, text, &model_id, MEANS_PROMPT_VERSION),
-                        CachedValue::Value(if matched { "yes" } else { "no" }.to_owned()),
+                        matched,
+                        yes_probability,
                     );
                     labels.push((text.clone(), Some(matched)));
                 }
-                Ok(None) | Err(_) => {
+                Ok((None, _)) | Err(_) => {
                     self.calibration_label_errors.add(1);
                     labels.push((text.clone(), None));
                 }

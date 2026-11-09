@@ -76,3 +76,72 @@ async fn a_cancelled_query_does_not_block_the_next_one() {
     .await
     .expect("the cancelled query gave its permits back");
 }
+
+/// Run `sql` to completion and report the verify stage's model calls.
+async fn verify_calls(ctx: SessionContext, sql: &'static str) -> usize {
+    let df = semcast::sql(&ctx, sql).await.unwrap();
+    let plan = df.create_physical_plan().await.unwrap();
+    datafusion::physical_plan::collect(Arc::clone(&plan), ctx.task_ctx())
+        .await
+        .unwrap();
+    semcast::server::progress::snapshot(&plan).model_calls
+}
+
+#[tokio::test]
+async fn a_merged_answer_is_not_counted_as_a_model_call() {
+    let model =
+        Arc::new(MockModel::answering_yes_to(["furious"]).with_latency(Duration::from_millis(200)));
+    let ctx = SemcastContextBuilder::new(Arc::clone(&model) as _).build();
+    tickets(&ctx).await;
+    let (first, second) = tokio::join!(
+        verify_calls(ctx.clone(), ANGRY),
+        verify_calls(ctx.clone(), ANGRY)
+    );
+    assert_eq!(model.completion_calls(), 3);
+    assert_eq!(
+        first + second,
+        3,
+        "the two queries' counts add up to the calls the model got"
+    );
+}
+
+#[tokio::test]
+async fn progress_counts_calls_while_a_batch_is_still_running() {
+    let model = Arc::new(MockModel::default().with_latency(Duration::from_millis(600)));
+    let ctx = SemcastContextBuilder::new(Arc::clone(&model) as _).build();
+    tickets(&ctx).await;
+    let df = semcast::sql(&ctx, ANGRY).await.unwrap();
+    let plan = df.create_physical_plan().await.unwrap();
+    let running = tokio::spawn(datafusion::physical_plan::collect(
+        Arc::clone(&plan),
+        ctx.task_ctx(),
+    ));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        semcast::server::progress::snapshot(&plan).model_calls,
+        3,
+        "calls in flight are already counted"
+    );
+    running.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_failed_merged_answer_is_not_counted_as_a_model_call() {
+    let model = Arc::new(
+        MockModel::default()
+            .failing_on(["furious"])
+            .with_latency(Duration::from_millis(200)),
+    );
+    let ctx = SemcastContextBuilder::new(Arc::clone(&model) as _).build();
+    tickets(&ctx).await;
+    let (first, second) = tokio::join!(
+        verify_calls(ctx.clone(), ANGRY),
+        verify_calls(ctx.clone(), ANGRY)
+    );
+    assert_eq!(model.completion_calls(), 3);
+    assert_eq!(
+        first + second,
+        3,
+        "the two failing rows were each sent once"
+    );
+}

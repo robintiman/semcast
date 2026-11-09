@@ -223,6 +223,8 @@ impl ExecutionPlan for SemRankExec {
             rows_pruned: MetricBuilder::new(&self.metrics).counter("rows_pruned", partition),
             unindexed_rows: MetricBuilder::new(&self.metrics).counter("unindexed_rows", partition),
             model_calls: MetricBuilder::new(&self.metrics).counter("model_calls", partition),
+            model_calls_merged: MetricBuilder::new(&self.metrics)
+                .counter("model_calls_merged", partition),
             cache_hits: MetricBuilder::new(&self.metrics).counter("cache_hits", partition),
             rows_failed: MetricBuilder::new(&self.metrics).counter("rows_failed", partition),
         };
@@ -287,6 +289,9 @@ struct Ranker {
     rows_pruned: Count,
     unindexed_rows: Count,
     model_calls: Count,
+    /// Of `model_calls`, those the scheduler answered from an identical
+    /// request already in flight: no call of their own.
+    model_calls_merged: Count,
     cache_hits: Count,
     rows_failed: Count,
 }
@@ -403,13 +408,17 @@ impl Ranker {
                     input: input.clone(),
                     max_tokens: 32,
                     schema: Some(score_schema()),
+                    logprobs: false,
                 });
                 pending.push((hash, input));
             }
         }
+        // Counted as sent, so progress shows calls while they run; merges
+        // are known only once they answer.
         self.model_calls.add(requests.len());
-
         let completions = self.model.complete(requests).await;
+        self.model_calls_merged
+            .add(crate::physical::verify::merged_calls(&completions));
         debug_assert_eq!(completions.len(), pending.len());
         for ((hash, input), completion) in pending.iter().zip(&completions) {
             match completion.as_ref().map(|c| parse_score(&c.text)) {

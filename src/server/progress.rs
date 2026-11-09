@@ -125,7 +125,7 @@ pub fn snapshot(plan: &Arc<dyn ExecutionPlan>) -> FunnelCounts {
                     counts.calibration_sampled_rows +=
                         counter_total(&metrics, "calibration_sampled_rows");
                     counts.calibration_model_calls +=
-                        counter_total(&metrics, "calibration_model_calls");
+                        sent_calls(&metrics, "calibration_model_calls");
                     counts.calibration_label_errors +=
                         counter_total(&metrics, "calibration_label_errors");
                 }
@@ -133,7 +133,7 @@ pub fn snapshot(plan: &Arc<dyn ExecutionPlan>) -> FunnelCounts {
             "VerifyExec" => {
                 counts.has_verify = true;
                 if let Some(metrics) = metrics {
-                    counts.model_calls += counter_total(&metrics, "model_calls");
+                    counts.model_calls += sent_calls(&metrics, "model_calls");
                     counts.cache_hits += counter_total(&metrics, "cache_hits");
                     counts.rows_dropped += counter_total(&metrics, "rows_dropped");
                 }
@@ -141,7 +141,7 @@ pub fn snapshot(plan: &Arc<dyn ExecutionPlan>) -> FunnelCounts {
             "SemExtractExec" => {
                 counts.has_extract = true;
                 if let Some(metrics) = metrics {
-                    counts.extract_model_calls += counter_total(&metrics, "model_calls");
+                    counts.extract_model_calls += sent_calls(&metrics, "model_calls");
                     counts.extract_cache_hits += counter_total(&metrics, "cache_hits");
                     counts.extract_rows_failed += counter_total(&metrics, "rows_failed");
                     counts.extract_fields_failed += counter_total(&metrics, "fields_failed");
@@ -159,7 +159,7 @@ pub fn snapshot(plan: &Arc<dyn ExecutionPlan>) -> FunnelCounts {
                 counts.has_cluster = true;
                 if let Some(metrics) = metrics {
                     counts.cluster_groups += counter_total(&metrics, "groups");
-                    counts.cluster_model_calls += counter_total(&metrics, "model_calls");
+                    counts.cluster_model_calls += sent_calls(&metrics, "model_calls");
                     counts.cluster_cache_hits += counter_total(&metrics, "cache_hits");
                     counts.cluster_unindexed_rows += counter_total(&metrics, "unindexed_rows");
                     counts.cluster_labels_failed += counter_total(&metrics, "labels_failed");
@@ -168,7 +168,7 @@ pub fn snapshot(plan: &Arc<dyn ExecutionPlan>) -> FunnelCounts {
             "SemClassifyExec" => {
                 counts.has_classify = true;
                 if let Some(metrics) = metrics {
-                    counts.classify_model_calls += counter_total(&metrics, "model_calls");
+                    counts.classify_model_calls += sent_calls(&metrics, "model_calls");
                     counts.classify_cache_hits += counter_total(&metrics, "cache_hits");
                     counts.classify_rows_gated += counter_total(&metrics, "rows_gated");
                     counts.classify_rows_failed += counter_total(&metrics, "rows_failed");
@@ -181,7 +181,7 @@ pub fn snapshot(plan: &Arc<dyn ExecutionPlan>) -> FunnelCounts {
                     counts.rank_candidate_rows += counter_total(&metrics, "candidate_rows");
                     counts.rank_rows_pruned += counter_total(&metrics, "rows_pruned");
                     counts.rank_unindexed_rows += counter_total(&metrics, "unindexed_rows");
-                    counts.rank_model_calls += counter_total(&metrics, "model_calls");
+                    counts.rank_model_calls += sent_calls(&metrics, "model_calls");
                     counts.rank_cache_hits += counter_total(&metrics, "cache_hits");
                     counts.rank_rows_failed += counter_total(&metrics, "rows_failed");
                 }
@@ -332,6 +332,12 @@ fn collect(plan: &Arc<dyn ExecutionPlan>, out: &mut Vec<Arc<dyn ExecutionPlan>>)
     for child in plan.children() {
         collect(child, out);
     }
+}
+
+/// The calls an operator's `name` counter records, less those the scheduler
+/// merged onto an identical call (`<name>_merged`), which cost nothing.
+fn sent_calls(metrics: &MetricsSet, name: &str) -> usize {
+    counter_total(metrics, name).saturating_sub(counter_total(metrics, &format!("{name}_merged")))
 }
 
 fn counter_total(metrics: &MetricsSet, name: &str) -> usize {

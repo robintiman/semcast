@@ -71,6 +71,10 @@ impl OllamaProvider {
             options: ChatOptions {
                 num_predict: request.max_tokens,
             },
+            logprobs: request.logprobs.then_some(true),
+            // Enough alternatives to see both answers in their usual
+            // spellings ("yes", "Yes", " yes", "no", ...).
+            top_logprobs: request.logprobs.then_some(TOP_LOGPROBS),
         };
         tracing::debug!(
             target: "semcast::model",
@@ -97,10 +101,24 @@ impl OllamaProvider {
             response = %chat.message.content,
             "llm response"
         );
+        let yes_probability = chat
+            .logprobs
+            .as_deref()
+            .and_then(first_answer_token)
+            .and_then(|token| {
+                let alternatives: Vec<(&str, f32)> = token
+                    .top_logprobs
+                    .iter()
+                    .map(|alt| (alt.token.as_str(), alt.logprob))
+                    .collect();
+                super::yes_probability(&alternatives)
+            });
         Ok(Completion {
             text: chat.message.content,
             input_tokens: chat.prompt_eval_count,
             output_tokens: chat.eval_count,
+            yes_probability,
+            merged: false,
         })
     }
 }
@@ -140,6 +158,15 @@ impl ModelProvider for OllamaProvider {
     }
 }
 
+/// Alternatives asked for at each token when `logprobs` is set.
+const TOP_LOGPROBS: usize = 10;
+
+/// The first token that carries text: some models open with a control
+/// token, which says nothing about the answer.
+fn first_answer_token(tokens: &[TokenLogprobs]) -> Option<&TokenLogprobs> {
+    tokens.iter().find(|token| !token.token.trim().is_empty())
+}
+
 #[derive(Serialize)]
 struct ChatRequest<'a> {
     model: &'a str,
@@ -149,6 +176,10 @@ struct ChatRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     format: Option<&'a serde_json::Value>,
     options: ChatOptions,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logprobs: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_logprobs: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -169,6 +200,34 @@ struct ChatResponse {
     prompt_eval_count: usize,
     #[serde(default)]
     eval_count: usize,
+    /// One entry per generated token, when the request asked for them. A
+    /// shape we don't know (a look-alike server's) reads as none: a missing
+    /// probability must not cost the answer.
+    #[serde(default, deserialize_with = "lenient_logprobs")]
+    logprobs: Option<Vec<TokenLogprobs>>,
+}
+
+fn lenient_logprobs<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Vec<TokenLogprobs>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).ok())
+}
+
+#[derive(Deserialize)]
+struct TokenLogprobs {
+    token: String,
+    #[serde(default)]
+    top_logprobs: Vec<Alternative>,
+}
+
+#[derive(Deserialize)]
+struct Alternative {
+    token: String,
+    logprob: f32,
 }
 
 #[derive(Deserialize)]
@@ -223,7 +282,58 @@ mod tests {
             think: false,
             format,
             options: ChatOptions { num_predict: 8 },
+            logprobs: None,
+            top_logprobs: None,
         }
+    }
+
+    #[test]
+    fn chat_request_omits_logprobs_unless_asked() {
+        let body = serde_json::to_value(chat_request(None)).unwrap();
+        assert!(body.get("logprobs").is_none());
+        assert!(body.get("top_logprobs").is_none());
+    }
+
+    #[test]
+    fn reads_yes_probability_from_the_first_answer_token() {
+        // Shape of a live /api/chat reply with logprobs (gemma4, think off);
+        // the empty first token stands in for a model's control token.
+        let json = r#"{
+            "message": {"role": "assistant", "content": "yes"},
+            "logprobs": [
+                {"token": "", "logprob": -0.01, "top_logprobs": [{"token": "", "logprob": -0.01}]},
+                {"token": "yes", "logprob": -0.0048, "top_logprobs": [
+                    {"token": "yes", "logprob": -0.0048},
+                    {"token": "no", "logprob": -7.26}
+                ]}
+            ]
+        }"#;
+        let chat: ChatResponse = serde_json::from_str(json).unwrap();
+        let token = first_answer_token(chat.logprobs.as_deref().unwrap()).unwrap();
+        assert_eq!(token.token, "yes");
+        let alternatives: Vec<(&str, f32)> = token
+            .top_logprobs
+            .iter()
+            .map(|alt| (alt.token.as_str(), alt.logprob))
+            .collect();
+        let p = crate::model::yes_probability(&alternatives).unwrap();
+        assert!(p > 0.99, "{p}");
+    }
+
+    #[test]
+    fn logprobs_in_an_unknown_shape_cost_the_probability_not_the_answer() {
+        let json = r#"{"message": {"role": "assistant", "content": "yes"},
+                       "logprobs": {"content": [{"token": "yes", "logprob": -0.1}]}}"#;
+        let chat: ChatResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(chat.message.content, "yes");
+        assert!(chat.logprobs.is_none());
+    }
+
+    #[test]
+    fn a_reply_without_logprobs_still_parses() {
+        let json = r#"{"message": {"role": "assistant", "content": "no"}}"#;
+        let chat: ChatResponse = serde_json::from_str(json).unwrap();
+        assert!(chat.logprobs.is_none());
     }
 
     #[test]

@@ -53,6 +53,10 @@ pub struct CompletionRequest {
     /// constrained-decoding contract for typed extraction. `None` is today's
     /// free-form behavior (a `MEANS` yes/no verdict).
     pub schema: Option<serde_json::Value>,
+    /// Ask for the probability that the answer is "yes", read from the
+    /// first token's log-probabilities — for yes/no prompts (`MEANS`). A
+    /// provider that can't report them answers without one.
+    pub logprobs: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +65,13 @@ pub struct Completion {
     /// Token counts feed `EXPLAIN` cost estimates and the `BUDGET` cap.
     pub input_tokens: usize,
     pub output_tokens: usize,
+    /// P("yes") among the yes/no answers the model weighed for its first
+    /// token, when the request asked for `logprobs` and the provider can
+    /// tell. `None` otherwise.
+    pub yes_probability: Option<f32>,
+    /// This answer came from an identical request already in flight, so it
+    /// cost no call of its own. Set by the [`Scheduler`].
+    pub merged: bool,
 }
 
 pub type Embedding = Vec<f32>;
@@ -86,6 +97,25 @@ pub trait ModelProvider: std::fmt::Debug + Send + Sync {
     fn embed_batch_size(&self) -> usize {
         64
     }
+}
+
+/// P("yes") from a token's alternatives and their log-probabilities: the
+/// mass on "yes", over the mass on "yes" and "no", whatever the case or
+/// leading space. `None` when neither answer is among them — the model was
+/// about to say something else, and there is no probability to report.
+pub(crate) fn yes_probability(alternatives: &[(&str, f32)]) -> Option<f32> {
+    let (mut yes, mut no) = (0.0_f64, 0.0_f64);
+    for (token, logprob) in alternatives {
+        let word = token.trim().to_ascii_lowercase();
+        let mass = f64::from(*logprob).exp();
+        match word.as_str() {
+            "yes" => yes += mass,
+            "no" => no += mass,
+            _ => {}
+        }
+    }
+    let total = yes + no;
+    (total > 0.0).then(|| (yes / total) as f32)
 }
 
 /// How many requests an HTTP provider keeps in flight at once.
@@ -271,5 +301,36 @@ mod tests {
         assert!(backoff(0) >= BASE_BACKOFF / 2);
         // By attempt 10 the exponential has saturated at the cap.
         assert!(backoff(10) >= MAX_BACKOFF / 2);
+    }
+}
+
+#[cfg(test)]
+mod yes_probability_tests {
+    use super::yes_probability;
+
+    #[test]
+    fn folds_spellings_and_renormalizes_over_yes_and_no() {
+        // Live gemma4 alternatives for "Is the sky blue?".
+        let p = yes_probability(&[
+            ("yes", -0.0048),
+            ("Yes", -5.53),
+            ("no", -7.26),
+            (" yes", -9.27),
+            ("No", -10.33),
+        ])
+        .unwrap();
+        assert!(p > 0.99 && p < 1.0, "{p}");
+    }
+
+    #[test]
+    fn an_even_split_is_one_half() {
+        let p = yes_probability(&[("yes", -0.7), ("no", -0.7), ("maybe", -0.1)]).unwrap();
+        assert!((p - 0.5).abs() < 1e-6, "{p}");
+    }
+
+    #[test]
+    fn no_yes_or_no_among_the_alternatives_is_no_probability() {
+        assert_eq!(yes_probability(&[("The", -0.1), ("I", -2.0)]), None);
+        assert_eq!(yes_probability(&[]), None);
     }
 }

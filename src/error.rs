@@ -11,6 +11,11 @@ pub enum SemcastError {
     #[error("model error: {0}")]
     Model(String),
 
+    /// A model error handed to a caller whose request was merged onto an
+    /// identical one in flight: the same failure, but no call of its own.
+    #[error("model error: {0}")]
+    MergedModel(String),
+
     #[error("calibration error: {0}")]
     Calibration(String),
 

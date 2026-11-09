@@ -160,6 +160,8 @@ impl ExecutionPlan for SemExtractExec {
             cache: Arc::clone(&self.cache),
             output_schema: Arc::clone(&self.output_schema),
             model_calls: MetricBuilder::new(&self.metrics).counter("model_calls", partition),
+            model_calls_merged: MetricBuilder::new(&self.metrics)
+                .counter("model_calls_merged", partition),
             cache_hits: MetricBuilder::new(&self.metrics).counter("cache_hits", partition),
             rows_failed: MetricBuilder::new(&self.metrics).counter("rows_failed", partition),
             fields_failed: MetricBuilder::new(&self.metrics).counter("fields_failed", partition),
@@ -194,6 +196,9 @@ struct Extractor {
     cache: Arc<dyn SemanticCache>,
     output_schema: SchemaRef,
     model_calls: Count,
+    /// Of `model_calls`, those the scheduler answered from an identical
+    /// request already in flight: no call of their own.
+    model_calls_merged: Count,
     cache_hits: Count,
     rows_failed: Count,
     fields_failed: Count,
@@ -270,6 +275,7 @@ impl Extractor {
                         .json_schema(&pending_fields)
                         .map_err(DataFusionError::from)?,
                 ),
+                logprobs: false,
             });
             pending.push(PendingRow {
                 row,
@@ -277,9 +283,12 @@ impl Extractor {
                 pending_units,
             });
         }
+        // Counted as sent, so progress shows calls while they run; merges
+        // are known only once they answer.
         self.model_calls.add(requests.len());
-
         let completions = self.model.complete(requests).await;
+        self.model_calls_merged
+            .add(crate::physical::verify::merged_calls(&completions));
         debug_assert_eq!(completions.len(), pending.len());
         for (pending_row, completion) in pending.iter().zip(&completions) {
             let object = completion

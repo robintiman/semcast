@@ -111,6 +111,8 @@ impl AnthropicProvider {
             text,
             input_tokens: message.usage.input_tokens,
             output_tokens: message.usage.output_tokens,
+            yes_probability: None,
+            merged: false,
         })
     }
 }
@@ -241,6 +243,7 @@ mod tests {
             input: "in".to_owned(),
             max_tokens: 8,
             schema: None,
+            logprobs: false,
         };
         let body = request_body("claude-haiku-4-5", &request);
         assert_eq!(body["model"], "claude-haiku-4-5");
@@ -256,6 +259,7 @@ mod tests {
             input: "in".to_owned(),
             max_tokens: 2048,
             schema: Some(schema.clone()),
+            logprobs: false,
         };
         let body = request_body("claude-haiku-4-5", &request);
         assert_eq!(body["output_config"]["format"]["type"], "json_schema");

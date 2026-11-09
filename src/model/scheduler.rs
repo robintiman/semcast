@@ -114,23 +114,35 @@ impl Scheduler {
 
     async fn complete_one(&self, request: CompletionRequest) -> Result<Completion> {
         let key = request_key(&request);
-        let answer = {
+        let (answer, merged) = {
             let mut in_flight = self.in_flight.lock().expect("scheduler lock poisoned");
             match in_flight.get(&key).and_then(|(_, call)| call.upgrade()) {
                 Some(answer) => {
                     self.merged.fetch_add(1, Ordering::Relaxed);
-                    answer
+                    (answer, true)
                 }
                 None => {
                     let call = self.next_call.fetch_add(1, Ordering::Relaxed);
                     let answer = self.send(key, call, request);
                     let weak = answer.downgrade().expect("a fresh call has not finished");
                     in_flight.insert(key, (call, weak));
-                    answer
+                    (answer, false)
                 }
             }
         };
-        answer.await.map_err(SemcastError::Model)
+        answer
+            .await
+            .map(|completion| Completion {
+                merged,
+                ..completion
+            })
+            .map_err(|error| {
+                if merged {
+                    SemcastError::MergedModel(error)
+                } else {
+                    SemcastError::Model(error)
+                }
+            })
     }
 
     /// The call itself, as a future any number of callers can await. It
@@ -218,7 +230,7 @@ fn panic_text(panic: &(dyn std::any::Any + Send)) -> &str {
 /// add back when it wraps it.
 fn error_text(error: SemcastError) -> String {
     match error {
-        SemcastError::Model(message) => message,
+        SemcastError::Model(message) | SemcastError::MergedModel(message) => message,
         other => other.to_string(),
     }
 }
@@ -235,6 +247,7 @@ fn request_key(request: &CompletionRequest) -> u128 {
         request.input.as_bytes(),
         &request.max_tokens.to_le_bytes(),
         schema.as_bytes(),
+        &[u8::from(request.logprobs)],
     ])
 }
 
@@ -285,6 +298,7 @@ mod tests {
             input: input.to_owned(),
             max_tokens: 4,
             schema: None,
+            logprobs: false,
         }
     }
 
@@ -315,6 +329,8 @@ mod tests {
                         text: request.input,
                         input_tokens: 0,
                         output_tokens: 0,
+                        yes_probability: None,
+                        merged: false,
                     })
                 })
                 .collect()
@@ -442,6 +458,8 @@ mod tests {
                         text: "yes".to_owned(),
                         input_tokens: 0,
                         output_tokens: 0,
+                        yes_probability: None,
+                        merged: false,
                     })
                 })
                 .collect()

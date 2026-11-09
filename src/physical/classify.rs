@@ -37,7 +37,7 @@ use crate::cache::{CacheKey, CachedValue, SemanticCache};
 use crate::model::{CompletionRequest, ModelId, ModelProvider};
 use crate::physical::extract::parse_json_object;
 use crate::physical::verify::{
-    MEANS_PROMPT_VERSION, means_cache_key, parse_verdict, synthesize_means_prompt,
+    MEANS_PROMPT_VERSION, cache_verdict, means_cache_key, parse_verdict, synthesize_means_prompt,
 };
 
 /// Version of the *fused* prompt — the one that asks about several conditions
@@ -217,6 +217,8 @@ impl ExecutionPlan for SemClassifyExec {
             cache: Arc::clone(&self.cache),
             output_schema: Arc::clone(&self.output_schema),
             model_calls: MetricBuilder::new(&self.metrics).counter("model_calls", partition),
+            model_calls_merged: MetricBuilder::new(&self.metrics)
+                .counter("model_calls_merged", partition),
             cache_hits: MetricBuilder::new(&self.metrics).counter("cache_hits", partition),
             rows_gated: MetricBuilder::new(&self.metrics).counter("rows_gated", partition),
             rows_failed: MetricBuilder::new(&self.metrics).counter("rows_failed", partition),
@@ -260,6 +262,9 @@ struct Classifier {
     cache: Arc<dyn SemanticCache>,
     output_schema: SchemaRef,
     model_calls: Count,
+    /// Of `model_calls`, those the scheduler answered from an identical
+    /// request already in flight: no call of their own.
+    model_calls_merged: Count,
     cache_hits: Count,
     rows_gated: Count,
     rows_failed: Count,
@@ -324,16 +329,19 @@ impl Classifier {
                 pending,
             });
         }
+        // Counted as sent, so progress shows calls while they run; merges
+        // are known only once they answer.
         self.model_calls.add(requests.len());
-
         let completions = self.model.complete(requests).await;
+        self.model_calls_merged
+            .add(crate::physical::verify::merged_calls(&completions));
         debug_assert_eq!(completions.len(), pending_rows.len());
         for (pending_row, completion) in pending_rows.iter().zip(&completions) {
             let Ok(completion) = completion.as_ref() else {
                 self.rows_failed.add(1);
                 continue;
             };
-            self.apply(pending_row, &completion.text, &mut verdicts);
+            self.apply(pending_row, completion, &mut verdicts);
         }
 
         let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
@@ -363,6 +371,7 @@ impl Classifier {
                 input: text.to_owned(),
                 max_tokens: 8,
                 schema: None,
+                logprobs: true,
             };
         }
         let conditions: Vec<&str> = pending
@@ -374,13 +383,20 @@ impl Classifier {
             input: text.to_owned(),
             max_tokens: CLASSIFY_MAX_TOKENS,
             schema: Some(classify_schema(conditions.len())),
+            logprobs: false,
         }
     }
 
     /// Decode one row's answer and cache each verdict it yielded. Conditions
     /// are cached individually, so editing one branch of a `CASE` leaves the
     /// others warm.
-    fn apply(&self, pending_row: &PendingRow, answer: &str, verdicts: &mut [Vec<Option<bool>>]) {
+    fn apply(
+        &self,
+        pending_row: &PendingRow,
+        completion: &crate::model::Completion,
+        verdicts: &mut [Vec<Option<bool>>],
+    ) {
+        let answer = completion.text.as_str();
         let decoded: Vec<Option<bool>> = if pending_row.pending.len() == 1 {
             vec![parse_verdict(answer)]
         } else {
@@ -402,14 +418,22 @@ impl Classifier {
             };
             verdicts[branch][pending_row.row] = Some(verdict);
             // Only successful verdicts are cached: a transient model failure
-            // must not permanently mislabel a row.
-            self.cache.put(
+            // must not permanently mislabel a row. A fused answer has no
+            // single yes/no token, so only a lone condition has a probability.
+            let yes_probability = if pending_row.pending.len() == 1 {
+                completion.yes_probability
+            } else {
+                None
+            };
+            cache_verdict(
+                self.cache.as_ref(),
                 self.cache_key(
                     &self.conditions[branch],
                     &pending_row.text,
                     pending_row.pending.len(),
                 ),
-                CachedValue::Value(if verdict { "yes" } else { "no" }.to_owned()),
+                verdict,
+                yes_probability,
             );
         }
     }

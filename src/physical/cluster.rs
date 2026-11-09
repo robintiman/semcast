@@ -201,6 +201,8 @@ impl ExecutionPlan for SemClusterExec {
             output_schema: Arc::clone(&self.output_schema),
             groups: MetricBuilder::new(&self.metrics).counter("groups", partition),
             model_calls: MetricBuilder::new(&self.metrics).counter("model_calls", partition),
+            model_calls_merged: MetricBuilder::new(&self.metrics)
+                .counter("model_calls_merged", partition),
             cache_hits: MetricBuilder::new(&self.metrics).counter("cache_hits", partition),
             unindexed_rows: MetricBuilder::new(&self.metrics).counter("unindexed_rows", partition),
             labels_failed: MetricBuilder::new(&self.metrics).counter("labels_failed", partition),
@@ -245,6 +247,9 @@ struct Grouper {
     output_schema: SchemaRef,
     groups: Count,
     model_calls: Count,
+    /// Of `model_calls`, those the scheduler answered from an identical
+    /// request already in flight: no call of their own.
+    model_calls_merged: Count,
     cache_hits: Count,
     unindexed_rows: Count,
     labels_failed: Count,
@@ -357,12 +362,16 @@ impl Grouper {
                 input,
                 max_tokens: LABEL_MAX_TOKENS,
                 schema: Some(label_schema()),
+                logprobs: false,
             });
             pending.push((cluster, key));
         }
+        // Counted as sent, so progress shows calls while they run; merges
+        // are known only once they answer.
         self.model_calls.add(requests.len());
-
         let completions = self.model.complete(requests).await;
+        self.model_calls_merged
+            .add(crate::physical::verify::merged_calls(&completions));
         debug_assert_eq!(completions.len(), pending.len());
         for ((cluster, key), completion) in pending.into_iter().zip(&completions) {
             match completion.as_ref().ok().and_then(|c| parse_label(&c.text)) {
