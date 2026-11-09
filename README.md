@@ -169,8 +169,12 @@ ORDER BY anger DESC;
 ```
 
 NULL when the text is NULL, the call fails, or the provider reports no
-probabilities (Ollama does; Anthropic doesn't). Not to be confused with
-`WITH CONFIDENCE`, which qualifies a recall target.
+probabilities (Ollama does; Anthropic doesn't). `ORDER BY … DESC` puts NULLs
+first; add `NULLS LAST`. Not to be confused with `WITH CONFIDENCE`, which
+qualifies a recall target.
+
+`UPDATE` and `DELETE` refuse `MEANS` and `CONFIDENCE()`: select the matching
+keys into a table first, then update or delete by key.
 
 #### `WITH RECALL`
 

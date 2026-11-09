@@ -158,6 +158,18 @@ async fn a_provider_without_probabilities_gives_null() {
 }
 
 #[tokio::test]
+async fn an_unscored_row_is_not_asked_again() {
+    let model = Arc::new(Counting::new(Unscored(furious_model())));
+    let ctx = tickets(Arc::clone(&model) as _, Arc::new(InMemoryCache::default())).await;
+    let sql = "SELECT id, CONFIDENCE(body MEANS 'is angry') FROM tickets ORDER BY id";
+    run(&ctx, sql).await;
+    assert_eq!(model.calls(), 2);
+    let batches = run(&ctx, sql).await;
+    assert_eq!(floats(&batches, 1), [None, None, None]);
+    assert_eq!(model.calls(), 2, "settled as unscored");
+}
+
+#[tokio::test]
 async fn a_probability_is_not_paired_with_a_different_stored_verdict() {
     // A store that keeps its first value, as the SQLite store does, already
     // holds "no" for row 1. The fresh answer says yes, so its probability
@@ -176,13 +188,20 @@ async fn a_probability_is_not_paired_with_a_different_stored_verdict() {
     )
     .await;
 
-    let ctx = tickets(Arc::new(model), Arc::clone(&cache) as _).await;
-    let batches = run(
-        &ctx,
-        "SELECT id, CONFIDENCE(body MEANS 'is angry') FROM tickets ORDER BY id",
-    )
-    .await;
+    let model = Arc::new(model);
+    let ctx = tickets(Arc::clone(&model) as _, Arc::clone(&cache) as _).await;
+    let sql = "SELECT id, CONFIDENCE(body MEANS 'is angry') FROM tickets ORDER BY id";
+    let batches = run(&ctx, sql).await;
     assert_eq!(floats(&batches, 1), [None, None, None]);
+    assert_eq!(model.completion_calls(), 2);
+    run(&ctx, sql).await;
+    assert_eq!(
+        model.completion_calls(),
+        2,
+        "the mismatch is settled, not re-asked"
+    );
+    let batches = run(&ctx, "SELECT id FROM tickets WHERE body MEANS 'is angry'").await;
+    assert_eq!(ids(&batches), [2], "the stored verdict still wins");
 }
 
 #[tokio::test]
@@ -210,6 +229,55 @@ async fn confidence_filters_in_a_where() {
     .await;
     assert!(ids(&batches).is_empty());
     assert_eq!(model.completion_calls(), 2);
+}
+
+#[tokio::test]
+async fn cheaper_conjuncts_run_before_confidence() {
+    let model = Arc::new(furious_model());
+    let ctx = tickets(Arc::clone(&model) as _, Arc::new(InMemoryCache::default())).await;
+    let batches = run(
+        &ctx,
+        "SELECT id FROM tickets WHERE id = 1 AND CONFIDENCE(body MEANS 'is angry') > 0.5",
+    )
+    .await;
+    assert_eq!(ids(&batches), [1]);
+    assert_eq!(model.completion_calls(), 1, "row 2 was filtered out first");
+
+    // A MEANS conjunct prunes before CONFIDENCE() pays, too. The mock says
+    // yes to anything about the furious row, so only row 1 survives it.
+    let batches = run(
+        &ctx,
+        "SELECT id FROM tickets \
+         WHERE body MEANS 'is upset' AND CONFIDENCE(body MEANS 'is happy') > 0.5",
+    )
+    .await;
+    assert_eq!(ids(&batches), [1]);
+    assert_eq!(
+        model.completion_calls(),
+        4,
+        "1 earlier + 2 MEANS calls + 1 CONFIDENCE call, for the survivor only"
+    );
+}
+
+#[tokio::test]
+async fn delete_and_update_refuse_semantic_predicates() {
+    let model = Arc::new(furious_model());
+    let ctx = tickets(Arc::clone(&model) as _, Arc::new(InMemoryCache::default())).await;
+    for sql in [
+        "DELETE FROM tickets WHERE body MEANS 'is angry'",
+        "DELETE FROM tickets WHERE CONFIDENCE(body MEANS 'is angry') > 0.5",
+        "DELETE FROM tickets WHERE id IN (SELECT id FROM tickets WHERE body MEANS 'x')",
+        "UPDATE tickets SET body = 'x' WHERE body MEANS 'is angry'",
+    ] {
+        let error = match semcast::sql(&ctx, sql).await {
+            Err(e) => e.to_string(),
+            Ok(df) => df.collect().await.expect_err(sql).to_string(),
+        };
+        assert!(error.contains("cannot filter on MEANS"), "{sql}: {error}");
+    }
+    let batches = run(&ctx, "SELECT id FROM tickets ORDER BY id").await;
+    assert_eq!(ids(&batches), [1, 2, 3], "nothing was deleted");
+    assert_eq!(model.completion_calls(), 0);
 }
 
 #[tokio::test]
@@ -276,6 +344,34 @@ async fn confidence_misuse_is_a_plan_error() {
              WHERE body MEANS 'y' WITH RECALL 0.9",
             "WITH RECALL",
         ),
+        (
+            "SELECT id FROM tickets \
+             WHERE CONFIDENCE(CONFIDENCE(body MEANS 'a') MEANS 'b') > 0",
+            "cannot read the output",
+        ),
+        (
+            "SELECT id FROM tickets \
+             ORDER BY CONFIDENCE(CONFIDENCE(body MEANS 'a') MEANS 'b')",
+            "cannot read the output",
+        ),
+        (
+            "SELECT id FROM tickets WHERE CONFIDENCE(body MEANS 'a') MEANS 'b'",
+            "cannot read the output",
+        ),
+        (
+            "SELECT id FROM tickets \
+             WHERE CAST(CONFIDENCE(body MEANS 'a') AS VARCHAR) MEANS 'b'",
+            "cannot read the output",
+        ),
+        (
+            "SELECT id FROM tickets \
+             WHERE CONFIDENCE(body MEANS 'a') > 0.5 OR body MEANS 'b'",
+            "top-level AND conjunct",
+        ),
+        (
+            "SELECT avg(CONFIDENCE(body MEANS 'x')) FROM tickets",
+            "aggregate or window",
+        ),
     ] {
         let error = match semcast::sql(&ctx, sql).await {
             Err(e) => e.to_string(),
@@ -308,6 +404,43 @@ async fn explain_names_the_confidence_stage() {
         text.contains("SemClassifyExec: CONFIDENCE('is angry')"),
         "{text}"
     );
+}
+
+/// Counts completion requests sent through it.
+#[derive(Debug)]
+struct Counting<M> {
+    inner: M,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl<M> Counting<M> {
+    fn new(inner: M) -> Self {
+        Self {
+            inner,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl<M: ModelProvider> ModelProvider for Counting<M> {
+    fn id(&self) -> ModelId {
+        self.inner.id()
+    }
+
+    async fn complete(&self, requests: Vec<CompletionRequest>) -> Vec<Result<Completion>> {
+        self.calls
+            .fetch_add(requests.len(), std::sync::atomic::Ordering::SeqCst);
+        self.inner.complete(requests).await
+    }
+
+    async fn embed(&self, texts: Vec<String>) -> Result<Vec<Embedding>> {
+        self.inner.embed(texts).await
+    }
 }
 
 /// A provider that reports no probabilities, like one without logprobs.

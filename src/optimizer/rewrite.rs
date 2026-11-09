@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, Result, ScalarValue, plan_err};
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::utils::{conjunction, split_conjunction_owned};
@@ -71,7 +71,9 @@ const LEGAL_POSITIONS: &str = "means() is supported as a top-level AND conjunct 
      clause (to filter) or in a SELECT list (to label); it cannot appear under \
      OR or NOT in a WHERE, nor in a GROUP BY, HAVING, or JOIN condition — wrap \
      it in a subquery to group or filter on a label. CONFIDENCE(text MEANS \
-     'condition') goes in a SELECT list, a WHERE clause, or an ORDER BY";
+     'condition') goes in a SELECT list, a WHERE clause, or an ORDER BY, but \
+     not inside an aggregate or window function — compute it in a subquery \
+     and aggregate over that";
 
 impl OptimizerRule for MeansRewriteRule {
     fn name(&self) -> &str {
@@ -91,6 +93,9 @@ impl OptimizerRule for MeansRewriteRule {
         plan: LogicalPlan,
         _config: &dyn OptimizerConfig,
     ) -> Result<Transformed<LogicalPlan>> {
+        for expr in plan.expressions() {
+            reject_nested_markers(&expr)?;
+        }
         // A MEANS in a SELECT list labels rows rather than dropping them.
         if let LogicalPlan::Projection(projection) = plan {
             return crate::optimizer::classify::rewrite_projection(projection);
@@ -162,18 +167,41 @@ fn passthrough_columns(plan: &LogicalPlan) -> Vec<Expr> {
 }
 
 impl MeansRewriteRule {
-    /// A `WHERE` that reads `CONFIDENCE()`: compute each probability in a
-    /// classify node below the filter, then filter on the columns as on any
-    /// other. The `MEANS` conjuncts left over go through [`Self::rewrite_filter`]
-    /// as usual, and a projection restores the input schema on top.
+    /// A `WHERE` that reads `CONFIDENCE()`. The conjuncts that don't read it
+    /// run first — ordinary predicates and `MEANS` alike, through
+    /// [`Self::rewrite_filter`] — so the probability is paid for only on rows
+    /// that survive them. Then each probability is computed in a classify
+    /// node, the rest of the predicate filters on its column, and a
+    /// projection restores the input schema on top.
     fn rewrite_confidence_filter(&self, filter: Filter) -> Result<Transformed<LogicalPlan>> {
         let passthrough = passthrough_columns(&filter.input);
+        let mut scored = Vec::new();
+        let mut first = Vec::new();
+        for conjunct in split_conjunction_owned(filter.predicate) {
+            if contains_confidence(&conjunct)? {
+                scored.push(conjunct);
+            } else {
+                first.push(conjunct);
+            }
+        }
+        let mut input = Arc::unwrap_or_clone(filter.input);
+        if let Some(predicate) = conjunction(first) {
+            input = self
+                .rewrite_filter(Filter::try_new(predicate, Arc::new(input))?)?
+                .data;
+        }
         let mut builder = crate::optimizer::classify::Builder::default();
-        let predicate =
-            crate::optimizer::classify::lift_confidence(filter.predicate, &mut builder)?;
-        let input = builder.build(Arc::unwrap_or_clone(filter.input))?;
-        let lifted = Filter::try_new(predicate, Arc::new(input))?;
-        let filtered = self.rewrite_filter(lifted)?.data;
+        let predicate = crate::optimizer::classify::lift_confidence(
+            conjunction(scored).expect("the predicate reads CONFIDENCE()"),
+            &mut builder,
+        )?;
+        // What's left of a scored conjunct is plain SQL over the new columns;
+        // a MEANS still in it sits under OR, NOT or a comparison.
+        if contains_means(&predicate)? {
+            return plan_err!("{LEGAL_POSITIONS}");
+        }
+        let input = builder.build(input)?;
+        let filtered = LogicalPlan::Filter(Filter::try_new(predicate, Arc::new(input))?);
         Ok(Transformed::yes(LogicalPlan::Projection(
             Projection::try_new(passthrough, Arc::new(filtered))?,
         )))
@@ -404,6 +432,29 @@ pub(crate) fn contains_means(expr: &Expr) -> Result<bool> {
     expr.exists(|e| Ok(is_means_call(e) || is_confidence_call(e)))
 }
 
+/// A `MEANS` or `CONFIDENCE()` must read text from the table, never another
+/// marker's output: the model would be asked about a probability or a verdict.
+fn reject_nested_markers(expr: &Expr) -> Result<()> {
+    // A CONFIDENCE() wraps a means(), so checking every means()'s text covers
+    // both markers.
+    expr.apply(|e| {
+        if let Expr::ScalarFunction(call) = e {
+            if is_means_call(e) {
+                if let Some(text) = call.args.first() {
+                    if contains_means(text)? {
+                        return plan_err!(
+                            "a MEANS or CONFIDENCE() cannot read the output of \
+                             another MEANS or CONFIDENCE(); give it a text column"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+    Ok(())
+}
+
 fn contains_confidence(expr: &Expr) -> Result<bool> {
     expr.exists(|e| Ok(is_confidence_call(e)))
 }
@@ -423,9 +474,6 @@ pub(crate) fn destructure_confidence(expr: Expr) -> Result<(Expr, String)> {
              clause; CONFIDENCE() asks every row it sees, so there is nothing \
              to calibrate"
         );
-    }
-    if contains_means(&text)? {
-        return plan_err!("CONFIDENCE() cannot read the output of another MEANS");
     }
     Ok((text, condition))
 }

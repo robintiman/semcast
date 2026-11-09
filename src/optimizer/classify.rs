@@ -21,7 +21,7 @@
 
 use std::sync::Arc;
 
-use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, Result, plan_err};
 use datafusion::logical_expr::expr::Case;
 use datafusion::logical_expr::expr_rewriter::NamePreserver;
@@ -106,12 +106,18 @@ pub(crate) fn rewrite_expr(
 /// leaving any bare `means()` for the filter rewrite — which decides whether
 /// its position is legal.
 pub(crate) fn lift_confidence(expr: Expr, builder: &mut Builder) -> Result<Expr> {
+    // Top-down, so an outer call is checked before anything inside it is
+    // replaced: a CONFIDENCE() reading another one must still be refused.
     Ok(expr
-        .transform_up(|expr| {
+        .transform_down(|expr| {
             if is_confidence_call(&expr) {
                 let (text, condition) = destructure_confidence(expr)?;
                 let column = builder.register_confidence(text, condition, &None);
-                return Ok(Transformed::yes(Expr::Column(column)));
+                return Ok(Transformed::new(
+                    Expr::Column(column),
+                    true,
+                    TreeNodeRecursion::Jump,
+                ));
             }
             Ok(Transformed::no(expr))
         })?

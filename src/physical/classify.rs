@@ -45,8 +45,8 @@ use crate::logical::sem_classify::ClassifyOutput;
 use crate::model::{CompletionRequest, ModelId, ModelProvider};
 use crate::physical::extract::parse_json_object;
 use crate::physical::verify::{
-    MEANS_PROMPT_VERSION, cache_verdict, cached_yes_probability, means_cache_key, parse_verdict,
-    synthesize_means_prompt,
+    MEANS_PROMPT_VERSION, cache_unscored, cache_verdict, cached_score, means_cache_key,
+    parse_verdict, synthesize_means_prompt,
 };
 
 /// Version of the *fused* prompt — the one that asks about several conditions
@@ -316,7 +316,8 @@ impl Classifier {
     ///
     /// A cached probability is served only alongside the verdict it was
     /// measured with. A cached verdict *without* one doesn't count — the
-    /// row is asked again, with logprobs, and both are stored.
+    /// row is asked again, with logprobs, and both are stored. A row known
+    /// to have no usable probability is NULL without a call.
     async fn score_batch(&self, batch: RecordBatch) -> Result<RecordBatch> {
         let rows = batch.num_rows();
         if rows == 0 {
@@ -344,9 +345,9 @@ impl Classifier {
             }
             let text = texts.value(row);
             let key = means_cache_key(condition, text, &self.model_id, MEANS_PROMPT_VERSION);
-            if let Some(probability) = cached_yes_probability(self.cache.as_ref(), &key) {
+            if let Some(cached) = cached_score(self.cache.as_ref(), &key) {
                 self.cache_hits.add(1);
-                *score = Some(f64::from(probability));
+                *score = cached.map(f64::from);
                 continue;
             }
             requests.push(self.request(text, &[0]));
@@ -366,21 +367,26 @@ impl Classifier {
                 self.rows_failed.add(1);
                 continue;
             };
-            cache_verdict(
-                self.cache.as_ref(),
-                key.clone(),
-                verdict,
-                completion.yes_probability,
-            );
-            // Read back what the cache now pairs, so this query reports what
-            // every later one will. A store that keeps its first verdict may
-            // hold a different one than this answer gave, and then this
-            // probability isn't the probability of that verdict.
-            scores[row] = match (completion.yes_probability, self.cache.get(&key)) {
-                (None, _) => None,
-                (Some(probability), None) => Some(f64::from(probability)),
-                (Some(_), Some(_)) => {
-                    cached_yes_probability(self.cache.as_ref(), &key).map(f64::from)
+            // The stored verdict wins; a probability is kept only beside the
+            // verdict it was measured with, and otherwise the row is settled
+            // as unscored, so later queries don't pay for the same NULL.
+            let stored = match self.cache.get(&key) {
+                Some(CachedValue::Value(stored)) => Some(stored == "yes"),
+                _ => None,
+            };
+            scores[row] = match (stored, completion.yes_probability) {
+                (Some(stored), _) if stored != verdict => {
+                    cache_unscored(self.cache.as_ref(), &key, stored);
+                    None
+                }
+                (_, Some(probability)) => {
+                    cache_verdict(self.cache.as_ref(), key, verdict, Some(probability));
+                    Some(f64::from(probability))
+                }
+                (_, None) => {
+                    cache_verdict(self.cache.as_ref(), key.clone(), verdict, None);
+                    cache_unscored(self.cache.as_ref(), &key, verdict);
+                    None
                 }
             };
             if scores[row].is_none() {

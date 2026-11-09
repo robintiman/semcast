@@ -209,7 +209,43 @@ pub(crate) async fn run_sql(ctx: &SessionContext, text: &str, record: bool) -> R
     if matches!(plan, datafusion::logical_expr::LogicalPlan::Ddl(_)) {
         return catalog::execute_ddl(ctx, plan, text, record).await;
     }
+    reject_semantic_dml(&plan)?;
     Ok(ctx.execute_logical_plan(plan).await?)
+}
+
+/// `UPDATE`/`DELETE` hand the table only the predicates DataFusion can push
+/// down, and a semantic one becomes an extension node it can't: the statement
+/// would then touch every row without asking the model. Refuse it instead.
+fn reject_semantic_dml(plan: &datafusion::logical_expr::LogicalPlan) -> Result<()> {
+    use datafusion::common::tree_node::TreeNodeRecursion;
+    use datafusion::logical_expr::{LogicalPlan, WriteOp};
+
+    let LogicalPlan::Dml(dml) = plan else {
+        return Ok(());
+    };
+    if !matches!(dml.op, WriteOp::Delete | WriteOp::Update) {
+        return Ok(());
+    }
+    let mut semantic = false;
+    dml.input.apply_with_subqueries(|node| {
+        for expr in node.expressions() {
+            if optimizer::rewrite::contains_means(&expr)? {
+                semantic = true;
+                return Ok(TreeNodeRecursion::Stop);
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+    if semantic {
+        return Err(datafusion::error::DataFusionError::Plan(format!(
+            "{} cannot filter on MEANS or CONFIDENCE(): select the matching keys \
+             first (CREATE TABLE ... AS SELECT id ... WHERE ... MEANS ...), then \
+             {} by those keys",
+            dml.op, dml.op
+        ))
+        .into());
+    }
+    Ok(())
 }
 
 /// [`semcast_context`] with a caller-provided verdict cache.

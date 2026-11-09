@@ -118,8 +118,9 @@ assembled in the physical planner, not there.
   model's P("yes") for it, when the provider reports logprobs, goes in a
   separate entry (`verify::cache_verdict`, field `means.yes_probability`,
   value `"yes 0.97"`), so older builds never misread a verdict; read it back
-  with `verify::cached_yes_probability`, which refuses a probability measured
-  with a different verdict. Operators count `model_calls` as requests are
+  with `verify::cached_score`, which refuses a probability measured with a
+  different verdict; an `"<verdict> unscored"` entry settles a row that has
+  no usable probability, so `CONFIDENCE()` doesn't re-ask it. Operators count `model_calls` as requests are
   sent and `model_calls_merged` once answers show which the scheduler merged;
   `progress.rs` reports the difference.
 - Rows fail, queries don't: a row the model errors on is excluded from a
