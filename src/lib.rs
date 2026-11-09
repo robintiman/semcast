@@ -250,8 +250,8 @@ fn reject_semantic_dml(plan: &datafusion::logical_expr::LogicalPlan) -> Result<(
                 })?;
                 if subquery {
                     refusal = Some(format!(
-                        "{op} with a subquery in its WHERE would affect every row: \
-                         DataFusion drops subquery predicates from {op}. Keep the \
+                        "{op} cannot use a subquery: DataFusion drops subquery \
+                         predicates from {op}, so it would affect every row. Keep the \
                          other rows instead: CREATE TABLE <new> AS SELECT * FROM \
                          <table> WHERE <key> NOT IN (SELECT ...)"
                     ));
