@@ -379,6 +379,7 @@ impl SemcastContextBuilder {
             .build();
         let ctx = SessionContext::new_with_state(state);
         ctx.register_udf(sql::means_udf::means_udf());
+        ctx.register_udf(sql::confidence_udf::confidence_udf());
         ctx.register_udf(sql::rank_udf::relevance_udf());
         ctx.register_udf(sql::cluster_udf::meaning_of_udf());
         ctx.register_udf(sql::distinct_udf::semantic_key_udf());

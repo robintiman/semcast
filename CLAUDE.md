@@ -54,6 +54,7 @@ SQL text
 |---|---|---|---|---|
 | `MEANS` (filter) | `dialect.rs`, `means_udf.rs` | `rewrite.rs` | `sem_filter.rs` | `verify.rs` + `index_scan.rs` |
 | `MEANS` (label / `CASE`) | same | `rewrite.rs` → `classify.rs` | `sem_classify.rs` | `classify.rs` |
+| `CONFIDENCE(… MEANS …)` | `confidence_udf.rs` | same (Filter/Sort lift in `rewrite.rs`) | `sem_classify.rs` (`YesProbability`) | `classify.rs` (`score_batch`) |
 | `RELEVANCE TO` | `dialect.rs`, `rank.rs`, `rank_udf.rs` | `rank.rs` | `sem_rank.rs` | `rank.rs` |
 | `GROUP BY MEANING OF` | `cluster.rs`, `cluster_udf.rs` | `cluster.rs` | `sem_cluster.rs` | `cluster.rs` |
 | `SEMANTIC DISTINCT ON` | `distinct.rs`, `distinct_udf.rs` | `distinct.rs` | `sem_distinct.rs` | `distinct.rs` |

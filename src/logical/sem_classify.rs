@@ -11,6 +11,10 @@
 //! conditions into one model call is an optimization, never a change of
 //! question.
 //!
+//! The same node also carries `CONFIDENCE(text MEANS 'condition')`: then it
+//! asks one condition and materializes the model's P("yes") as a `DOUBLE`
+//! instead of the verdict — see [`ClassifyOutput`].
+//!
 //! [`MeansRewriteRule`]: crate::optimizer::rewrite::MeansRewriteRule
 
 use std::cmp::Ordering;
@@ -22,6 +26,16 @@ use std::sync::Arc;
 use datafusion::arrow::datatypes::{DataType, Field};
 use datafusion::common::{Column, DFSchema, DFSchemaRef, Result, TableReference, internal_err};
 use datafusion::logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNodeCore};
+
+/// What a classify node's columns hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Hash)]
+pub enum ClassifyOutput {
+    /// One nullable `Boolean` per condition: the verdict.
+    Verdict,
+    /// One nullable `Float64` for a single condition: the model's P("yes"),
+    /// asked unfused so it is the probability of exactly the verify question.
+    YesProbability,
+}
 
 /// Logical node that extends the input with one model-assigned boolean per
 /// natural-language condition.
@@ -39,6 +53,8 @@ pub struct SemClassifyNode {
     pub guard: Option<Expr>,
     /// Disambiguates this node's columns from a sibling classify node's.
     pub id: usize,
+    /// Verdicts or a probability.
+    pub output: ClassifyOutput,
     /// Input schema plus one column per condition.
     pub output_schema: DFSchemaRef,
 }
@@ -52,23 +68,53 @@ impl SemClassifyNode {
         guard: Option<Expr>,
         id: usize,
     ) -> Result<Self> {
+        Self::try_new_with_output(input, text, conditions, guard, id, ClassifyOutput::Verdict)
+    }
+
+    /// Output = input columns + one nullable `Float64`: P("yes") for the one
+    /// condition `CONFIDENCE()` asks.
+    pub fn try_new_confidence(
+        input: LogicalPlan,
+        text: Expr,
+        condition: String,
+        guard: Option<Expr>,
+        id: usize,
+    ) -> Result<Self> {
+        Self::try_new_with_output(
+            input,
+            text,
+            vec![condition],
+            guard,
+            id,
+            ClassifyOutput::YesProbability,
+        )
+    }
+
+    fn try_new_with_output(
+        input: LogicalPlan,
+        text: Expr,
+        conditions: Vec<String>,
+        guard: Option<Expr>,
+        id: usize,
+        output: ClassifyOutput,
+    ) -> Result<Self> {
         if conditions.is_empty() {
             return internal_err!("SemClassify needs at least one condition");
+        }
+        if output == ClassifyOutput::YesProbability && conditions.len() != 1 {
+            return internal_err!("a CONFIDENCE classify asks exactly one condition");
         }
         let mut qualified: Vec<(Option<TableReference>, Arc<Field>)> = input
             .schema()
             .iter()
             .map(|(q, f)| (q.cloned(), Arc::clone(f)))
             .collect();
-        for branch in 0..conditions.len() {
-            qualified.push((
-                None,
-                Arc::new(Field::new(
-                    branch_column_name(id, branch),
-                    DataType::Boolean,
-                    true,
-                )),
-            ));
+        for name in column_names(id, conditions.len(), output) {
+            let data_type = match output {
+                ClassifyOutput::Verdict => DataType::Boolean,
+                ClassifyOutput::YesProbability => DataType::Float64,
+            };
+            qualified.push((None, Arc::new(Field::new(name, data_type, true))));
         }
         let output_schema = Arc::new(DFSchema::new_with_metadata(qualified, HashMap::new())?);
         Ok(Self {
@@ -77,6 +123,7 @@ impl SemClassifyNode {
             conditions,
             guard,
             id,
+            output,
             output_schema,
         })
     }
@@ -85,7 +132,23 @@ impl SemClassifyNode {
     /// reference the rewrite substitutes for the marker call.
     pub fn branch_column(&self, condition: &str) -> Option<Column> {
         let branch = self.conditions.iter().position(|c| c == condition)?;
-        Some(Column::new_unqualified(branch_column_name(self.id, branch)))
+        Some(Column::new_unqualified(
+            column_names(self.id, self.conditions.len(), self.output).swap_remove(branch),
+        ))
+    }
+
+    /// The names of the columns this node appends, in order.
+    pub fn column_names(&self) -> Vec<String> {
+        column_names(self.id, self.conditions.len(), self.output)
+    }
+}
+
+fn column_names(id: usize, conditions: usize, output: ClassifyOutput) -> Vec<String> {
+    match output {
+        ClassifyOutput::Verdict => (0..conditions)
+            .map(|branch| branch_column_name(id, branch))
+            .collect(),
+        ClassifyOutput::YesProbability => vec![confidence_column_name(id)],
     }
 }
 
@@ -93,6 +156,13 @@ impl SemClassifyNode {
 /// from colliding.
 pub fn branch_column_name(id: usize, branch: usize) -> String {
     format!("__sem_class_{id}_{branch}")
+}
+
+/// The `CONFIDENCE()` column's name. Its own prefix, so it never collides
+/// with a verdict column — not even one a fused `WHERE` builds with the same
+/// id below a `CONFIDENCE()` in that `WHERE`.
+pub fn confidence_column_name(id: usize) -> String {
+    format!("__sem_conf_{id}")
 }
 
 // `output_schema` is derived from the other fields, so comparisons key on
@@ -105,6 +175,7 @@ impl PartialEq for SemClassifyNode {
             && self.conditions == other.conditions
             && self.guard == other.guard
             && self.id == other.id
+            && self.output == other.output
     }
 }
 
@@ -118,6 +189,7 @@ impl PartialOrd for SemClassifyNode {
             &self.conditions,
             &self.guard,
             self.id,
+            self.output,
         )
             .partial_cmp(&(
                 &other.input,
@@ -125,6 +197,7 @@ impl PartialOrd for SemClassifyNode {
                 &other.conditions,
                 &other.guard,
                 other.id,
+                other.output,
             ))
     }
 }
@@ -136,6 +209,7 @@ impl Hash for SemClassifyNode {
         self.conditions.hash(state);
         self.guard.hash(state);
         self.id.hash(state);
+        self.output.hash(state);
     }
 }
 
@@ -161,7 +235,11 @@ impl UserDefinedLogicalNodeCore for SemClassifyNode {
     }
 
     fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "SemClassify: MEANS(")?;
+        let operator = match self.output {
+            ClassifyOutput::Verdict => "MEANS",
+            ClassifyOutput::YesProbability => "CONFIDENCE",
+        };
+        write!(f, "SemClassify: {operator}(")?;
         for (i, condition) in self.conditions.iter().enumerate() {
             if i > 0 {
                 write!(f, ", ")?;
@@ -191,12 +269,13 @@ impl UserDefinedLogicalNodeCore for SemClassifyNode {
         }
         let guard = (exprs.len() > 1).then(|| exprs.swap_remove(1));
         // Recompute the schema — the input's columns may have changed.
-        Self::try_new(
+        Self::try_new_with_output(
             inputs.swap_remove(0),
             exprs.swap_remove(0),
             self.conditions.clone(),
             guard,
             self.id,
+            self.output,
         )
     }
 }

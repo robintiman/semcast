@@ -421,8 +421,6 @@ pub(crate) fn cache_verdict(
 
 /// The cached P("yes") for the verdict under `key`, if one was stored with
 /// that same verdict.
-// Read by `CONFIDENCE()`, which lands next; until then only tests call it.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn cached_yes_probability(cache: &dyn SemanticCache, key: &CacheKey) -> Option<f32> {
     let Some(CachedValue::Value(verdict)) = cache.get(key) else {
         return None;

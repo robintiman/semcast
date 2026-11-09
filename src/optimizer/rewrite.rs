@@ -16,13 +16,14 @@ use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{Column, Result, ScalarValue, plan_err};
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::utils::{conjunction, split_conjunction_owned};
-use datafusion::logical_expr::{Expr, Extension, Filter, LogicalPlan, Projection};
+use datafusion::logical_expr::{Expr, Extension, Filter, LogicalPlan, Projection, Sort, SortExpr};
 use datafusion::optimizer::optimizer::ApplyOrder;
 use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
 
 use crate::index::registry::SemcastRuntime;
 use crate::logical::sem_classify::branch_column_name;
 use crate::logical::{SemClassifyNode, SemFilterNode};
+use crate::sql::confidence_udf::CONFIDENCE_UDF_NAME;
 use crate::sql::means_udf::MEANS_UDF_NAME;
 
 /// Finds `means(..)` calls inside `Filter` predicates, splits them out of the
@@ -43,6 +44,12 @@ use crate::sql::means_udf::MEANS_UDF_NAME;
 /// `WHERE` clause, or anywhere in a `SELECT` list. Elsewhere — under
 /// `OR`/`NOT` in a `WHERE`, in a `GROUP BY`, with a non-literal condition —
 /// is a plan-time error rather than a silent model call per row.
+///
+/// `CONFIDENCE(text MEANS 'condition')` is a number, not a predicate, so it
+/// goes in a `SELECT` list, anywhere in a `WHERE` (`CONFIDENCE(..) > 0.8`),
+/// or in an `ORDER BY`. In a `WHERE` or `ORDER BY` it is computed by a
+/// classify node below the filter or sort, and a projection drops the column
+/// again.
 #[derive(Debug)]
 pub struct MeansRewriteRule {
     /// Holds the session runtime directly because `OptimizerConfig` exposes no
@@ -63,7 +70,8 @@ impl MeansRewriteRule {
 const LEGAL_POSITIONS: &str = "means() is supported as a top-level AND conjunct of a WHERE \
      clause (to filter) or in a SELECT list (to label); it cannot appear under \
      OR or NOT in a WHERE, nor in a GROUP BY, HAVING, or JOIN condition — wrap \
-     it in a subquery to group or filter on a label";
+     it in a subquery to group or filter on a label. CONFIDENCE(text MEANS \
+     'condition') goes in a SELECT list, a WHERE clause, or an ORDER BY";
 
 impl OptimizerRule for MeansRewriteRule {
     fn name(&self) -> &str {
@@ -88,6 +96,19 @@ impl OptimizerRule for MeansRewriteRule {
             return crate::optimizer::classify::rewrite_projection(projection);
         }
 
+        if let LogicalPlan::Sort(sort) = &plan {
+            let mut holds_confidence = false;
+            for sort_expr in &sort.expr {
+                holds_confidence |= contains_confidence(&sort_expr.expr)?;
+            }
+            if holds_confidence {
+                let LogicalPlan::Sort(sort) = plan else {
+                    unreachable!("matched above")
+                };
+                return rewrite_confidence_sort(sort);
+            }
+        }
+
         let LogicalPlan::Filter(filter) = plan else {
             for expr in plan.expressions() {
                 if contains_means(&expr)? {
@@ -96,7 +117,69 @@ impl OptimizerRule for MeansRewriteRule {
             }
             return Ok(Transformed::no(plan));
         };
+        if contains_confidence(&filter.predicate)? {
+            return self.rewrite_confidence_filter(filter);
+        }
+        self.rewrite_filter(filter)
+    }
+}
 
+/// An `ORDER BY` that reads `CONFIDENCE()`: compute it below the sort, sort
+/// on the column, and drop the column again above.
+fn rewrite_confidence_sort(sort: Sort) -> Result<Transformed<LogicalPlan>> {
+    let passthrough = passthrough_columns(&sort.input);
+    let mut builder = crate::optimizer::classify::Builder::default();
+    let expr = sort
+        .expr
+        .into_iter()
+        .map(|sort_expr| {
+            let expr = crate::optimizer::classify::lift_confidence(sort_expr.expr, &mut builder)?;
+            Ok(SortExpr { expr, ..sort_expr })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for sort_expr in &expr {
+        if contains_means(&sort_expr.expr)? {
+            return plan_err!("{LEGAL_POSITIONS} (found it in an ORDER BY)");
+        }
+    }
+    let input = builder.build(Arc::unwrap_or_clone(sort.input))?;
+    let sorted = LogicalPlan::Sort(Sort {
+        expr,
+        input: Arc::new(input),
+        fetch: sort.fetch,
+    });
+    Ok(Transformed::yes(LogicalPlan::Projection(
+        Projection::try_new(passthrough, Arc::new(sorted))?,
+    )))
+}
+
+fn passthrough_columns(plan: &LogicalPlan) -> Vec<Expr> {
+    plan.schema()
+        .columns()
+        .into_iter()
+        .map(Expr::Column)
+        .collect()
+}
+
+impl MeansRewriteRule {
+    /// A `WHERE` that reads `CONFIDENCE()`: compute each probability in a
+    /// classify node below the filter, then filter on the columns as on any
+    /// other. The `MEANS` conjuncts left over go through [`Self::rewrite_filter`]
+    /// as usual, and a projection restores the input schema on top.
+    fn rewrite_confidence_filter(&self, filter: Filter) -> Result<Transformed<LogicalPlan>> {
+        let passthrough = passthrough_columns(&filter.input);
+        let mut builder = crate::optimizer::classify::Builder::default();
+        let predicate =
+            crate::optimizer::classify::lift_confidence(filter.predicate, &mut builder)?;
+        let input = builder.build(Arc::unwrap_or_clone(filter.input))?;
+        let lifted = Filter::try_new(predicate, Arc::new(input))?;
+        let filtered = self.rewrite_filter(lifted)?.data;
+        Ok(Transformed::yes(LogicalPlan::Projection(
+            Projection::try_new(passthrough, Arc::new(filtered))?,
+        )))
+    }
+
+    fn rewrite_filter(&self, filter: Filter) -> Result<Transformed<LogicalPlan>> {
         let (semantic, free): (Vec<Expr>, Vec<Expr>) =
             split_conjunction_owned(filter.predicate.clone())
                 .into_iter()
@@ -311,8 +394,40 @@ pub(crate) fn is_means_call(expr: &Expr) -> bool {
     matches!(expr, Expr::ScalarFunction(f) if f.func.name() == MEANS_UDF_NAME)
 }
 
+pub(crate) fn is_confidence_call(expr: &Expr) -> bool {
+    matches!(expr, Expr::ScalarFunction(f) if f.func.name() == CONFIDENCE_UDF_NAME)
+}
+
+/// Any semcast marker that must be rewritten before execution: a `means()`,
+/// or a `confidence()` (which wraps one).
 pub(crate) fn contains_means(expr: &Expr) -> Result<bool> {
-    expr.exists(|e| Ok(is_means_call(e)))
+    expr.exists(|e| Ok(is_means_call(e) || is_confidence_call(e)))
+}
+
+fn contains_confidence(expr: &Expr) -> Result<bool> {
+    expr.exists(|e| Ok(is_confidence_call(e)))
+}
+
+/// Pull `(text_expr, condition)` out of a `confidence(means(..))` call.
+pub(crate) fn destructure_confidence(expr: Expr) -> Result<(Expr, String)> {
+    let Expr::ScalarFunction(ScalarFunction { mut args, .. }) = expr else {
+        unreachable!("caller checked is_confidence_call");
+    };
+    if args.len() != 1 || !is_means_call(&args[0]) {
+        return plan_err!("CONFIDENCE() takes one MEANS: CONFIDENCE(text MEANS 'condition')");
+    }
+    let (text, condition, recall, _confidence) = destructure_means(args.swap_remove(0))?;
+    if recall.is_some() {
+        return plan_err!(
+            "WITH RECALL calibrates the index pre-filter for a MEANS in a WHERE \
+             clause; CONFIDENCE() asks every row it sees, so there is nothing \
+             to calibrate"
+        );
+    }
+    if contains_means(&text)? {
+        return plan_err!("CONFIDENCE() cannot read the output of another MEANS");
+    }
+    Ok((text, condition))
 }
 
 /// Pull `(text_expr, condition, recall, confidence)` out of a validated
