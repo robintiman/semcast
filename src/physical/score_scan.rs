@@ -17,7 +17,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use datafusion::arrow::array::{Array, BooleanArray, StringArray};
 use datafusion::arrow::compute::{cast, filter_record_batch};
@@ -55,16 +55,36 @@ use crate::physical::verify::{
 /// so with nothing to check it against, it prunes nothing.
 pub const DEFAULT_SCORER_FLOOR: f32 = f32::NEG_INFINITY;
 
-/// How many answers in one batch, none with a probability, it takes to
-/// conclude the scorer reports none — enough that a one-off parse miss
-/// doesn't switch it off.
+/// How many answers without a probability, and none ever with one, it
+/// takes to conclude the scorer reports none.
 const MIN_ANSWERS_TO_SWITCH_OFF: usize = 8;
 
 /// What a session has learned about its scorer, shared by every scan that
 /// uses it. In memory only, on purpose: see [`Scanner::score`].
 #[derive(Debug, Default)]
 pub struct ScorerHealth {
+    /// Set once the scorer has given a probability, fresh or cached: from
+    /// then on a missing one is a per-row miss, never a reason to stop.
+    scored: AtomicBool,
+    /// Answers without a probability while `scored` is unset.
+    unscored_answers: AtomicUsize,
     no_logprobs: AtomicBool,
+}
+
+impl ScorerHealth {
+    fn record(&self, with_probability: usize, without: usize) {
+        if with_probability > 0 {
+            self.scored.store(true, Ordering::Relaxed);
+            return;
+        }
+        if self.scored.load(Ordering::Relaxed) {
+            return;
+        }
+        let total = self.unscored_answers.fetch_add(without, Ordering::Relaxed) + without;
+        if total >= MIN_ANSWERS_TO_SWITCH_OFF {
+            self.no_logprobs.store(true, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Prunes rows whose scorer P("yes") falls below a floor calibrated to the
@@ -361,6 +381,9 @@ impl Scanner {
                 }
             }
         }
+        if !scores.is_empty() {
+            self.health.record(scores.len(), 0);
+        }
         if self.health.no_logprobs.load(Ordering::Relaxed) {
             // Every row passes through; asking would buy nothing.
             return scores;
@@ -368,7 +391,7 @@ impl Scanner {
         self.scorer_calls.add(requests.len());
         let completions = self.scorer.complete(requests).await;
         let answered = completions.iter().filter(|c| c.is_ok()).count();
-        let mut answered_with_probability = false;
+        let mut with_probability = 0;
         self.scorer_calls_merged.add(merged_calls(&completions));
         let cache = self.calibration.cache.as_ref();
         for ((hash, key), completion) in pending.into_iter().zip(&completions) {
@@ -376,11 +399,11 @@ impl Scanner {
             let verdict = parse_verdict(&completion.text);
             let Some(probability) = completion.yes_probability else {
                 // Not cached: the next answer may carry one (see
-                // `cached_score`). A scorer that never does is switched off
-                // for the process below.
+                // `cached_score`). A scorer that never gives one is switched
+                // off for the process below.
                 continue;
             };
-            answered_with_probability = true;
+            with_probability += 1;
             if let Some(verdict) = verdict {
                 cache_verdict(cache, key.clone(), verdict, Some(probability));
             }
@@ -395,19 +418,20 @@ impl Scanner {
                 scores.insert(hash, score);
             }
         }
-        if answered >= MIN_ANSWERS_TO_SWITCH_OFF && !answered_with_probability {
-            // A whole batch of answers and not one probability: this scorer
-            // reports none. Remembered for the process only, so a scorer that
-            // starts reporting them (another build, another server) is used
-            // again after a restart, and nothing durable claims otherwise.
-            if !self.health.no_logprobs.swap(true, Ordering::Relaxed) {
-                tracing::warn!(
-                    target: "semcast::scorer",
-                    scorer = %self.scorer.id(),
-                    "the scorer reports no probabilities (no logprobs); it is \
-                     switched off until restart and every row is verified",
-                );
-            }
+        // A scorer that has never given a probability in this process, after
+        // enough answers, reports none. Remembered in memory only, so one
+        // that starts reporting them (another build, another server) is used
+        // again after a restart, and nothing durable claims otherwise.
+        let was_off = self.health.no_logprobs.load(Ordering::Relaxed);
+        self.health
+            .record(with_probability, answered - with_probability);
+        if !was_off && self.health.no_logprobs.load(Ordering::Relaxed) {
+            tracing::warn!(
+                target: "semcast::scorer",
+                scorer = %self.scorer.id(),
+                "the scorer reports no probabilities (no logprobs); it is \
+                 switched off until restart and every row is verified",
+            );
         }
         scores
     }

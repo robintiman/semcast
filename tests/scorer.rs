@@ -27,6 +27,8 @@ struct Named {
     calls: AtomicUsize,
     /// Drop every probability, like a provider without logprobs.
     unscored: bool,
+    /// Drop the probability for inputs containing this.
+    unscored_on: Option<&'static str>,
 }
 
 impl Named {
@@ -36,6 +38,7 @@ impl Named {
             inner,
             calls: AtomicUsize::new(0),
             unscored: false,
+            unscored_on: None,
         })
     }
 
@@ -52,14 +55,18 @@ impl ModelProvider for Named {
 
     async fn complete(&self, requests: Vec<CompletionRequest>) -> Vec<Result<Completion>> {
         self.calls.fetch_add(requests.len(), Ordering::SeqCst);
-        let unscored = self.unscored;
+        let drop: Vec<bool> = requests
+            .iter()
+            .map(|r| self.unscored || self.unscored_on.is_some_and(|n| r.input.contains(n)))
+            .collect();
         self.inner
             .complete(requests)
             .await
             .into_iter()
-            .map(|c| {
+            .zip(drop)
+            .map(|(c, drop)| {
                 c.map(|c| Completion {
-                    yes_probability: if unscored { None } else { c.yes_probability },
+                    yes_probability: if drop { None } else { c.yes_probability },
                     ..c
                 })
             })
@@ -192,6 +199,7 @@ async fn a_scorer_without_probabilities_prunes_nothing() {
         inner: MockModel::answering_yes_to(["furious"]),
         calls: AtomicUsize::new(0),
         unscored: true,
+        unscored_on: None,
     });
     let ctx = tickets(
         Arc::clone(&model),
@@ -316,6 +324,7 @@ async fn a_scorer_without_probabilities_is_asked_once() {
         inner: MockModel::answering_yes_to(["furious"]),
         calls: AtomicUsize::new(0),
         unscored: true,
+        unscored_on: None,
     });
     let ctx = tickets(
         session_model(),
@@ -339,6 +348,7 @@ async fn an_unscored_scorer_leaves_nothing_durable_behind() {
         inner: MockModel::answering_yes_to(["furious"]),
         calls: AtomicUsize::new(0),
         unscored: true,
+        unscored_on: None,
     });
     let ctx = tickets(session_model(), Some(scorer), Arc::clone(&cache)).await;
     run(&ctx, RECALL_QUERY).await;
@@ -372,4 +382,43 @@ async fn a_scorer_that_is_the_session_model_is_ignored() {
     let batches = run(&ctx, RECALL_QUERY).await;
     assert_eq!(ids(&batches), MATCHES);
     assert_eq!(scorer.calls(), 0);
+}
+
+#[tokio::test]
+async fn a_few_unscored_rows_never_switch_a_working_scorer_off() {
+    let scorer = Arc::new(Named {
+        id: "scorer",
+        inner: MockModel::answering_yes_to(["furious"])
+            .with_yes_probability(|input| if input.contains("furious") { 0.9 } else { 0.05 }),
+        calls: AtomicUsize::new(0),
+        unscored: false,
+        unscored_on: Some("odd"),
+    });
+    let ctx = tickets(
+        session_model(),
+        Some(Arc::clone(&scorer)),
+        Arc::new(InMemoryCache::default()),
+    )
+    .await;
+    run(&ctx, RECALL_QUERY).await;
+    run(
+        &ctx,
+        "INSERT INTO tickets SELECT value + 1000, 'ticket ' || value || ': odd' \
+         FROM generate_series(1, 10)",
+    )
+    .await;
+    // Ten new rows the scorer can't score: one batch without a probability.
+    run(&ctx, RECALL_QUERY).await;
+    assert_eq!(scorer.calls(), 210);
+    let before = scorer.calls();
+    run(
+        &ctx,
+        "SELECT id FROM tickets WHERE body MEANS 'is furious' WITH RECALL 0.9",
+    )
+    .await;
+    assert_eq!(
+        scorer.calls() - before,
+        210,
+        "still scoring a new condition"
+    );
 }
