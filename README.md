@@ -206,6 +206,12 @@ WHERE transcript MEANS 'discussed offline sync'
 WITH RECALL 0.9;
 ```
 
+No index on the column? Start the server with `--scorer-model <small Ollama
+model>` and `WITH RECALL` uses it instead: the scorer reads every row and
+gives its P("yes"), the main model labels a sample, and only rows above the
+calibrated floor reach the main model. A row the scorer can't score is
+verified anyway. Without `WITH RECALL` the scorer is never asked.
+
 #### `WITH CONFIDENCE`
 
 ```sql

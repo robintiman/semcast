@@ -289,6 +289,7 @@ pub struct SemcastContextBuilder {
     model: Arc<dyn ModelProvider>,
     fallbacks: Vec<Arc<dyn ModelProvider>>,
     embedder: Option<Arc<dyn ModelProvider>>,
+    scorer: Option<Arc<dyn ModelProvider>>,
     cache: Arc<dyn SemanticCache>,
     index_root: Option<std::path::PathBuf>,
     information_schema: bool,
@@ -303,6 +304,7 @@ impl SemcastContextBuilder {
             model,
             fallbacks: Vec::new(),
             embedder: None,
+            scorer: None,
             cache: Arc::new(InMemoryCache::default()),
             index_root: None,
             information_schema: false,
@@ -332,6 +334,17 @@ impl SemcastContextBuilder {
     /// when the session model can't embed (Anthropic).
     pub fn with_embedder(mut self, embedder: Arc<dyn ModelProvider>) -> Self {
         self.embedder = Some(embedder);
+        self
+    }
+
+    /// A cheap chat model that pre-filters a `MEANS` no index covers, when
+    /// the statement asks `WITH RECALL`: it scores every row by its P("yes")
+    /// (it must report logprobs, as Ollama does), and the session model
+    /// verifies only rows above a floor calibrated to the target on a
+    /// labeled sample. Without `WITH RECALL` it is never asked. It gets its
+    /// own cap on requests in flight.
+    pub fn with_scorer(mut self, scorer: Arc<dyn ModelProvider>) -> Self {
+        self.scorer = Some(scorer);
         self
     }
 
@@ -403,6 +416,9 @@ impl SemcastContextBuilder {
                 self.max_in_flight,
             )));
         }
+        let scorer: Option<Arc<dyn ModelProvider>> = self
+            .scorer
+            .map(|scorer| Arc::new(crate::model::Scheduler::new(scorer, self.max_in_flight)) as _);
         if let Some(root) = self.index_root {
             runtime = runtime.with_index_root(root);
         }
@@ -435,7 +451,9 @@ impl SemcastContextBuilder {
             .with_optimizer_rule(Arc::new(RelevanceRewriteRule))
             .with_optimizer_rule(Arc::new(ClusterRewriteRule))
             .with_optimizer_rule(Arc::new(DistinctRewriteRule))
-            .with_query_planner(Arc::new(SemcastQueryPlanner::new(model, self.cache)))
+            .with_query_planner(Arc::new(
+                SemcastQueryPlanner::new(model, self.cache).with_scorer(scorer),
+            ))
             .build();
         let ctx = SessionContext::new_with_state(state);
         ctx.register_udf(sql::means_udf::means_udf());

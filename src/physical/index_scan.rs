@@ -38,21 +38,14 @@ use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 use tokio::sync::OnceCell;
 
-use crate::cache::{CachedValue, SemanticCache};
+use crate::cache::SemanticCache;
 use crate::index::{FilterScan, SearchParams, SemanticIndex, doc_hash};
-use crate::model::{CompletionRequest, ModelProvider};
+use crate::model::ModelProvider;
 use crate::optimizer::calibrate::{
     CALIBRATION_LABEL_BUDGET, Calibration, SampledScores, calibrate_threshold,
 };
 use crate::optimizer::proxy::LearnedProxy;
-use crate::physical::verify::{
-    MEANS_PROMPT_VERSION, cache_verdict, means_cache_key, merged_calls, parse_verdict,
-    synthesize_means_prompt,
-};
-
-/// A sampled document and its label: `Some(matched)`, or `None` when the
-/// labeling call failed and its truth is unknown.
-type Label = (String, Option<bool>);
+use crate::physical::sample::{Label, Labeler, draw_sample};
 
 /// Where each labeled document sits against the index: scored, never indexed
 /// (passes through at any floor, so it helps recall for free), or indexed but
@@ -93,22 +86,6 @@ fn score_labels(
         }
     }
     scores
-}
-
-/// Seeds the calibration sample's document order. Fixed, so repeat queries
-/// draw the same sample and their labels come from the verdict cache.
-const SAMPLE_SEED: u64 = 0x5eed_ca1b_0000_0001;
-
-/// A document's place in the calibration sample's draw order: SplitMix64 of
-/// its [`doc_hash`] mixed with the seed. Taking the documents with the
-/// smallest priorities is a uniform sample without replacement, and it
-/// depends on nothing but the set of documents — not on input order, not on
-/// partitioning.
-fn sample_priority(doc_hash: u64) -> u64 {
-    let mut z = (doc_hash ^ SAMPLE_SEED).wrapping_add(0x9e37_79b9_7f4a_7c15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    z ^ (z >> 31)
 }
 
 /// What one index search learned, shared from the scan to the verify stage.
@@ -639,13 +616,7 @@ impl Scanner {
     }
 
     /// A uniform random sample of the distinct documents in the buffered
-    /// batches, at most `sample_size`, in draw order: the documents with the
-    /// smallest [`sample_priority`]. Any prefix is itself a uniform sample,
-    /// which is what lets certification label it a tranche at a time.
-    ///
-    /// Only hashes and row positions are kept while drawing; text is copied
-    /// for the drawn documents alone, so the sample costs memory in its own
-    /// size, not the input's.
+    /// batches; see [`draw_sample`].
     fn sample_documents(
         &self,
         buffered: &[RecordBatch],
@@ -655,91 +626,22 @@ impl Scanner {
             .iter()
             .map(|batch| self.evaluate_texts(batch))
             .collect::<Result<_>>()?;
-        let mut first_seen: HashMap<u64, (usize, usize)> = HashMap::new();
-        for (batch, array) in texts.iter().enumerate() {
-            let array = as_strings(array);
-            for row in 0..array.len() {
-                if array.is_valid(row) {
-                    first_seen
-                        .entry(doc_hash(array.value(row)))
-                        .or_insert((batch, row));
-                }
-            }
-        }
-        let mut drawn: Vec<(u64, (usize, usize))> = first_seen
-            .into_iter()
-            .map(|(hash, position)| (sample_priority(hash), position))
-            .collect();
-        drawn.sort_unstable_by_key(|(priority, _)| *priority);
-        drawn.truncate(sample_size);
-        Ok(drawn
-            .into_iter()
-            .map(|(_, (batch, row))| as_strings(&texts[batch]).value(row).to_owned())
-            .collect())
+        let texts: Vec<&StringArray> = texts.iter().map(as_strings).collect();
+        Ok(draw_sample(&texts, sample_size))
     }
 
-    /// Ground-truth labels for the sample: the model reads each document's
-    /// full text — the definition of `MEANS`. Byte-identical requests and
-    /// cache keys to the no-index verify path, so labels land in the verdict
-    /// cache and repeat calibrations draw from it. A document whose call
-    /// fails or answers unparseably stays in the sample, labelled `None`:
-    /// rows fail, queries don't, but the certificate counts the failure as a
-    /// possible miss rather than pretending the document was never drawn.
-    /// Failures are not cached, so the next calibration retries them.
+    /// Ground-truth labels for the sample; see [`Labeler`].
     async fn label_sample(&self, calibration: &CalibrationConfig, sample: &[String]) -> Vec<Label> {
-        let prompt = synthesize_means_prompt(&self.condition);
-        let model_id = calibration.model.id();
-        let mut labels = Vec::new();
-        let mut misses = Vec::new();
-        let mut requests = Vec::new();
-        for text in sample {
-            match calibration.cache.get(&means_cache_key(
-                &self.condition,
-                text,
-                &model_id,
-                MEANS_PROMPT_VERSION,
-            )) {
-                Some(CachedValue::Value(verdict)) => {
-                    labels.push((text.clone(), Some(verdict == "yes")));
-                }
-                _ => {
-                    misses.push(text);
-                    requests.push(CompletionRequest {
-                        system: prompt.clone(),
-                        input: text.clone(),
-                        max_tokens: 8,
-                        schema: None,
-                        logprobs: true,
-                    });
-                }
-            }
+        Labeler {
+            condition: &self.condition,
+            model: calibration.model.as_ref(),
+            cache: calibration.cache.as_ref(),
+            calls: &self.calibration_model_calls,
+            calls_merged: &self.calibration_model_calls_merged,
+            errors: &self.calibration_label_errors,
         }
-        self.calibration_model_calls.add(requests.len());
-        let completions = calibration.model.complete(requests).await;
-        self.calibration_model_calls_merged
-            .add(merged_calls(&completions));
-        debug_assert_eq!(completions.len(), misses.len());
-        for (text, completion) in misses.into_iter().zip(&completions) {
-            match completion
-                .as_ref()
-                .map(|c| (parse_verdict(&c.text), c.yes_probability))
-            {
-                Ok((Some(matched), yes_probability)) => {
-                    cache_verdict(
-                        calibration.cache.as_ref(),
-                        means_cache_key(&self.condition, text, &model_id, MEANS_PROMPT_VERSION),
-                        matched,
-                        yes_probability,
-                    );
-                    labels.push((text.clone(), Some(matched)));
-                }
-                Ok((None, _)) | Err(_) => {
-                    self.calibration_label_errors.add(1);
-                    labels.push((text.clone(), None));
-                }
-            }
-        }
-        labels
+        .label(sample)
+        .await
     }
 }
 
