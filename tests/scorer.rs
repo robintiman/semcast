@@ -272,3 +272,74 @@ async fn explain_shows_the_scorer_stage() {
         "{text}"
     );
 }
+
+#[tokio::test]
+async fn a_sample_without_matches_prunes_nothing() {
+    // 2000 rows, 8 matches: a 64-row sample likely holds none, and the
+    // scorer underrates every match. Its own yes/no must not decide alone.
+    for sql in [
+        "SELECT id FROM rare WHERE body MEANS 'is angry' WITH RECALL 0.9",
+        "SELECT id FROM rare WHERE body MEANS 'is angry' WITH RECALL 0.9 WITH CONFIDENCE 0.95",
+    ] {
+        let scorer = Named::new(
+            "scorer",
+            MockModel::answering_yes_to(["furious"])
+                .with_yes_probability(|input| if input.contains("furious") { 0.3 } else { 0.05 }),
+        );
+        let ctx = SemcastContextBuilder::new(session_model())
+            .with_scorer(scorer)
+            .build();
+        ctx.sql(
+            "CREATE TABLE rare AS SELECT value AS id, \
+                 CASE WHEN value % 250 = 0 THEN 'ticket ' || value || ': I am furious' \
+                      ELSE 'ticket ' || value || ': all good' END AS body \
+             FROM generate_series(1, 2000)",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+        let batches = run(&ctx, sql).await;
+        assert_eq!(
+            ids(&batches),
+            [250, 500, 750, 1000, 1250, 1500, 1750, 2000],
+            "{sql}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_scorer_without_probabilities_is_asked_once() {
+    let scorer = Arc::new(Named {
+        id: "scorer",
+        inner: MockModel::answering_yes_to(["furious"]),
+        calls: AtomicUsize::new(0),
+        unscored: true,
+    });
+    let ctx = tickets(
+        session_model(),
+        Some(Arc::clone(&scorer)),
+        Arc::new(InMemoryCache::default()),
+    )
+    .await;
+    run(&ctx, RECALL_QUERY).await;
+    assert_eq!(scorer.calls(), 200);
+    run(&ctx, RECALL_QUERY).await;
+    assert_eq!(scorer.calls(), 200, "settled, not re-asked");
+}
+
+#[tokio::test]
+async fn a_scorer_that_is_the_session_model_is_ignored() {
+    let model = session_model();
+    let scorer = Named::new("session", MockModel::answering_yes_to(["nothing"]));
+    let ctx = tickets(
+        Arc::clone(&model),
+        Some(Arc::clone(&scorer)),
+        Arc::new(InMemoryCache::default()),
+    )
+    .await;
+    let batches = run(&ctx, RECALL_QUERY).await;
+    assert_eq!(ids(&batches), MATCHES);
+    assert_eq!(scorer.calls(), 0);
+}

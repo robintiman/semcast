@@ -146,7 +146,13 @@ impl ExtensionPlanner for SemcastExtensionPlanner {
             // a target there is nothing to calibrate against, and the scorer
             // stays out of the way.
             let mut input = Arc::clone(&physical_inputs[0]);
-            if let (Some(scorer), Some(target_recall)) = (&self.scorer, filter.recall) {
+            // A scorer that is the session model would save nothing, and
+            // under one id its answers are the session model's verdicts.
+            let scorer = self
+                .scorer
+                .as_ref()
+                .filter(|scorer| scorer.id() != self.model.id());
+            if let (Some(scorer), Some(target_recall)) = (scorer, filter.recall) {
                 input = Arc::new(ScoreScanExec::new(
                     input,
                     Arc::clone(&text),

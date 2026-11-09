@@ -108,6 +108,18 @@ pub fn calibrate_threshold(
     positive.sort_by(|a, b| b.total_cmp(a));
     let known = positive.len() + scores.positive_unindexed + scores.positive_lost;
     if known == 0 && scores.unverified_scores.is_empty() {
+        // A labeled sample without a single match certifies nothing: the
+        // matches it missed are exactly what a bound is about. Prune
+        // nothing and report the target unmet, so a certifying caller keeps
+        // drawing instead of stopping on an empty proof.
+        if confidence.is_some() && scores.sampled > 0 {
+            return Calibration {
+                threshold: f32::NEG_INFINITY,
+                sampled_rows: scores.sampled,
+                estimated_recall: 1.0,
+                certified_recall: Some(0.0),
+            };
+        }
         // No evidence to raise the floor with — keep the default; recall is
         // vacuously met.
         return Calibration {
@@ -358,6 +370,23 @@ mod tests {
             sampled: positive_scores.len(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_sample_without_matches_certifies_nothing() {
+        let none = SampledScores {
+            sampled: 64,
+            ..Default::default()
+        };
+        let certified = calibrate_threshold(0.9, Some(0.95), 0.5, &none);
+        assert_eq!(certified.threshold, f32::NEG_INFINITY, "prunes nothing");
+        assert!(!certified.meets(0.9), "an empty proof is no proof");
+        // Estimating keeps the caller's default, as before.
+        let estimated = calibrate_threshold(0.9, None, 0.5, &none);
+        assert_eq!(estimated.threshold, 0.5);
+        // Nothing sampled at all — no rows — is vacuously met.
+        let empty = calibrate_threshold(0.9, Some(0.95), 0.5, &SampledScores::default());
+        assert!(empty.meets(0.9));
     }
 
     /// The uncertified path, unchanged: `WITH RECALL` alone must cost and

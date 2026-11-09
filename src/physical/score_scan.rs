@@ -26,14 +26,15 @@ use datafusion::common::Statistics;
 use datafusion::error::Result;
 use datafusion::execution::TaskContext;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
-use datafusion::physical_expr::{Distribution, EquivalenceProperties, PhysicalExpr};
+use datafusion::physical_expr::{Distribution, PhysicalExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::{
     Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
 };
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
+    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
+    SendableRecordBatchStream,
 };
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
@@ -44,13 +45,14 @@ use crate::optimizer::calibrate::{Calibration, SampledScores, calibrate_threshol
 use crate::physical::index_scan::CalibrationConfig;
 use crate::physical::sample::{Label, Labeler, draw_sample};
 use crate::physical::verify::{
-    MEANS_PROMPT_VERSION, cache_verdict, cached_score, means_cache_key, merged_calls,
-    parse_verdict, synthesize_means_prompt,
+    MEANS_PROMPT_VERSION, cache_unscored, cache_verdict, cached_score, means_cache_key,
+    merged_calls, parse_verdict, synthesize_means_prompt,
 };
 
-/// The floor when the sample holds no known match to set one by: the
-/// scorer's own yes/no boundary.
-pub const DEFAULT_SCORER_FLOOR: f32 = 0.5;
+/// The floor when the sample holds no known match to set one by: none. The
+/// scorer's own yes/no is exactly the judgement the sample exists to check,
+/// so with nothing to check it against, it prunes nothing.
+pub const DEFAULT_SCORER_FLOOR: f32 = f32::NEG_INFINITY;
 
 /// Prunes rows whose scorer P("yes") falls below a floor calibrated to the
 /// recall target, ahead of the session model's verify.
@@ -74,7 +76,8 @@ impl ScoreScanExec {
         calibration: CalibrationConfig,
     ) -> Self {
         let properties = Arc::new(PlanProperties::new(
-            EquivalenceProperties::new(input.schema()),
+            // A filter: the input's orderings and equivalences still hold.
+            input.equivalence_properties().clone(),
             // One partition in (see `required_input_distribution`), one out.
             datafusion::physical_plan::Partitioning::UnknownPartitioning(1),
             EmissionType::Final,
@@ -138,6 +141,10 @@ impl ExecutionPlan for ScoreScanExec {
     /// stage must see all of them in one stream.
     fn required_input_distribution(&self) -> Vec<Distribution> {
         vec![Distribution::SinglePartition]
+    }
+
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![true]
     }
 
     fn with_new_children(
@@ -237,13 +244,24 @@ impl Scanner {
             .iter()
             .map(|batch| self.evaluate_texts(batch))
             .collect::<Result<_>>()?;
+        for array in &texts {
+            reservation.try_grow(array.get_array_memory_size())?;
+        }
         let strings: Vec<&StringArray> = texts.iter().map(as_strings).collect();
 
         let scores = self.score(&strings).await;
-        let threshold = self.calibrate(&strings, &scores).await.threshold;
+        let (calibrated, labels) = self.calibrate(&strings, &scores).await;
+        // A sampled match is already paid for, and a failed label may be
+        // one: never prune either, whatever the scorer said. Verify reads
+        // their labels from the cache.
+        let labelled: HashSet<u64> = labels
+            .iter()
+            .filter(|(_, label)| *label != Some(false))
+            .map(|(text, _)| doc_hash(text))
+            .collect();
 
         let mut output = Vec::with_capacity(buffered.len());
-        for (batch, texts) in buffered.into_iter().zip(&strings) {
+        for (batch, texts) in buffered.iter().zip(&strings) {
             let mut keep = vec![false; batch.num_rows()];
             for (row, keep_row) in keep.iter_mut().enumerate() {
                 // NULL text never matches — free to drop here.
@@ -251,8 +269,10 @@ impl Scanner {
                     self.rows_pruned.add(1);
                     continue;
                 }
-                match scores.get(&doc_hash(texts.value(row))) {
-                    Some(score) if *score >= threshold => *keep_row = true,
+                let hash = doc_hash(texts.value(row));
+                match scores.get(&hash) {
+                    _ if labelled.contains(&hash) => *keep_row = true,
+                    Some(score) if *score >= calibrated.threshold => *keep_row = true,
                     Some(_) => self.rows_pruned.add(1),
                     None => {
                         self.passthrough_rows.add(1);
@@ -260,13 +280,20 @@ impl Scanner {
                     }
                 }
             }
-            output.push(filter_record_batch(&batch, &BooleanArray::from(keep)));
+            let filtered = filter_record_batch(batch, &BooleanArray::from(keep))?;
+            reservation.try_grow(filtered.get_array_memory_size())?;
+            output.push(filtered);
         }
-        drop(reservation);
-        Ok(
-            futures::stream::iter(output.into_iter().map(|batch| batch.map_err(Into::into)))
-                .boxed(),
-        )
+        drop(texts);
+        drop(buffered);
+        // Hold the charge for the filtered copies as long as the stream
+        // holds them.
+        reservation.resize(output.iter().map(RecordBatch::get_array_memory_size).sum());
+        Ok(futures::stream::iter(output.into_iter().map(move |batch| {
+            let _reservation = &reservation;
+            Ok(batch)
+        }))
+        .boxed())
     }
 
     /// The scorer's P("yes") for every distinct document, from the cache
@@ -315,10 +342,17 @@ impl Scanner {
         let cache = self.calibration.cache.as_ref();
         for ((hash, key), completion) in pending.into_iter().zip(&completions) {
             let Ok(completion) = completion else { continue };
+            let verdict = parse_verdict(&completion.text);
             let Some(probability) = completion.yes_probability else {
+                // Settled, so a scorer without logprobs costs one call per
+                // document, not one per document per query.
+                if let Some(verdict) = verdict {
+                    cache_verdict(cache, key.clone(), verdict, None);
+                    cache_unscored(cache, &key, verdict);
+                }
                 continue;
             };
-            if let Some(verdict) = parse_verdict(&completion.text) {
+            if let Some(verdict) = verdict {
                 cache_verdict(cache, key.clone(), verdict, Some(probability));
             }
             // What the cache now pairs, so this query scores as later ones
@@ -337,7 +371,12 @@ impl Scanner {
 
     /// The floor: label a random sample with the session model and set it
     /// at the recall target, one tranche at a time when certifying.
-    async fn calibrate(&self, texts: &[&StringArray], scores: &HashMap<u64, f32>) -> Calibration {
+    /// Returns the calibration and the labels it was drawn from.
+    async fn calibrate(
+        &self,
+        texts: &[&StringArray],
+        scores: &HashMap<u64, f32>,
+    ) -> (Calibration, Vec<Label>) {
         let calibration = &self.calibration;
         let labeler = Labeler {
             condition: &self.condition,
@@ -395,7 +434,7 @@ impl Scanner {
                  prunes nothing and every row is verified",
             );
         }
-        calibrated
+        (calibrated, labels)
     }
 
     fn evaluate_texts(&self, batch: &RecordBatch) -> Result<Arc<dyn Array>> {
