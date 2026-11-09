@@ -74,7 +74,9 @@ pub struct ScorerHealth {
 impl ScorerHealth {
     fn record(&self, with_probability: usize, without: usize) {
         if with_probability > 0 {
+            // Also undoes a switch-off another query made meanwhile.
             self.scored.store(true, Ordering::Relaxed);
+            self.no_logprobs.store(false, Ordering::Relaxed);
             return;
         }
         if self.scored.load(Ordering::Relaxed) {
