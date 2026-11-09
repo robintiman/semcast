@@ -347,6 +347,9 @@ impl Classifier {
             let key = means_cache_key(condition, text, &self.model_id, MEANS_PROMPT_VERSION);
             if let Some(cached) = cached_score(self.cache.as_ref(), &key) {
                 self.cache_hits.add(1);
+                if cached.is_none() {
+                    self.rows_unscored.add(1);
+                }
                 *score = cached.map(f64::from);
                 continue;
             }
@@ -368,8 +371,9 @@ impl Classifier {
                 continue;
             };
             // The stored verdict wins; a probability is kept only beside the
-            // verdict it was measured with, and otherwise the row is settled
-            // as unscored, so later queries don't pay for the same NULL.
+            // verdict it was measured with. A stored verdict that differs can
+            // never be paired, so the row is settled as unscored and later
+            // queries don't pay for the same NULL.
             let stored = match self.cache.get(&key) {
                 Some(CachedValue::Value(stored)) => Some(stored == "yes"),
                 _ => None,
@@ -383,9 +387,10 @@ impl Classifier {
                     cache_verdict(self.cache.as_ref(), key, verdict, Some(probability));
                     Some(f64::from(probability))
                 }
+                // Not settled: the next answer may well carry a probability
+                // (another provider under the same id, a one-off parse miss).
                 (_, None) => {
-                    cache_verdict(self.cache.as_ref(), key.clone(), verdict, None);
-                    cache_unscored(self.cache.as_ref(), &key, verdict);
+                    cache_verdict(self.cache.as_ref(), key, verdict, None);
                     None
                 }
             };

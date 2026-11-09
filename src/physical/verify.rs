@@ -424,12 +424,13 @@ pub(crate) fn cache_verdict(
 /// known there is no usable probability, `Some(Some(p))` for a probability
 /// measured with the stored verdict.
 ///
-/// "No usable probability" is an `"<verdict> unscored"` entry — the model
-/// gave none, or a store that keeps its first value holds a different
-/// verdict than the answer that came with one — or a probability measured
-/// with a different verdict. Each entry keeps its first value, so asking
-/// again could never fix either: settling it is what stops a query from
-/// paying for the same NULL every time.
+/// "No usable probability" is an `"<verdict> unscored"` entry — a store
+/// that keeps its first value holds a different verdict than the answer
+/// that came with a probability — or a probability measured with a
+/// different verdict. Each entry keeps its first value, so asking again
+/// could never fix either: settling it is what stops a query from paying
+/// for the same NULL every time. A provider that simply gave no probability
+/// is not settled; the next answer may carry one.
 pub(crate) fn cached_score(cache: &dyn SemanticCache, key: &CacheKey) -> Option<Option<f32>> {
     let Some(CachedValue::Value(verdict)) = cache.get(key) else {
         return None;

@@ -214,38 +214,62 @@ pub(crate) async fn run_sql(ctx: &SessionContext, text: &str, record: bool) -> R
 }
 
 /// `UPDATE`/`DELETE` hand the table only the predicates DataFusion can push
-/// down, and a semantic one becomes an extension node it can't: the statement
-/// would then touch every row without asking the model. Refuse it instead.
+/// down. A semantic one becomes an extension node it can't push, and a
+/// subquery predicate is dropped outright: either way the statement would
+/// touch every row. Refuse both, wherever the statement sits in the plan
+/// (`EXPLAIN ANALYZE` runs it too).
 fn reject_semantic_dml(plan: &datafusion::logical_expr::LogicalPlan) -> Result<()> {
-    use datafusion::common::tree_node::TreeNodeRecursion;
-    use datafusion::logical_expr::{LogicalPlan, WriteOp};
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    use datafusion::logical_expr::{Expr, LogicalPlan, WriteOp};
 
-    let LogicalPlan::Dml(dml) = plan else {
-        return Ok(());
-    };
-    if !matches!(dml.op, WriteOp::Delete | WriteOp::Update) {
-        return Ok(());
-    }
-    let mut semantic = false;
-    dml.input.apply_with_subqueries(|node| {
-        for expr in node.expressions() {
-            if optimizer::rewrite::contains_means(&expr)? {
-                semantic = true;
-                return Ok(TreeNodeRecursion::Stop);
-            }
+    let mut refusal: Option<String> = None;
+    plan.apply_with_subqueries(|node| {
+        let LogicalPlan::Dml(dml) = node else {
+            return Ok(TreeNodeRecursion::Continue);
+        };
+        if !matches!(dml.op, WriteOp::Delete | WriteOp::Update) {
+            return Ok(TreeNodeRecursion::Continue);
         }
-        Ok(TreeNodeRecursion::Continue)
+        let op = dml.op.to_string();
+        dml.input.apply_with_subqueries(|node| {
+            for expr in node.expressions() {
+                if optimizer::rewrite::contains_means(&expr)? {
+                    refusal = Some(format!(
+                        "{op} cannot filter on MEANS or CONFIDENCE(): it would \
+                         affect every row without asking the model. Keep the other \
+                         rows instead: CREATE TABLE <new> AS SELECT * FROM <table> \
+                         WHERE <key> NOT IN (SELECT <key> FROM <table> WHERE ... MEANS ...)"
+                    ));
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+                let subquery = expr.exists(|e| {
+                    Ok(matches!(
+                        e,
+                        Expr::InSubquery(_) | Expr::Exists(_) | Expr::ScalarSubquery(_)
+                    ))
+                })?;
+                if subquery {
+                    refusal = Some(format!(
+                        "{op} with a subquery in its WHERE would affect every row: \
+                         DataFusion drops subquery predicates from {op}. Keep the \
+                         other rows instead: CREATE TABLE <new> AS SELECT * FROM \
+                         <table> WHERE <key> NOT IN (SELECT ...)"
+                    ));
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        Ok(if refusal.is_some() {
+            TreeNodeRecursion::Stop
+        } else {
+            TreeNodeRecursion::Continue
+        })
     })?;
-    if semantic {
-        return Err(datafusion::error::DataFusionError::Plan(format!(
-            "{} cannot filter on MEANS or CONFIDENCE(): select the matching keys \
-             first (CREATE TABLE ... AS SELECT id ... WHERE ... MEANS ...), then \
-             {} by those keys",
-            dml.op, dml.op
-        ))
-        .into());
+    match refusal {
+        Some(message) => Err(datafusion::error::DataFusionError::Plan(message).into()),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// [`semcast_context`] with a caller-provided verdict cache.

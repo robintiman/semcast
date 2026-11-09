@@ -119,8 +119,9 @@ assembled in the physical planner, not there.
   separate entry (`verify::cache_verdict`, field `means.yes_probability`,
   value `"yes 0.97"`), so older builds never misread a verdict; read it back
   with `verify::cached_score`, which refuses a probability measured with a
-  different verdict; an `"<verdict> unscored"` entry settles a row that has
-  no usable probability, so `CONFIDENCE()` doesn't re-ask it. Operators count `model_calls` as requests are
+  different verdict; an `"<verdict> unscored"` entry settles a row whose
+  stored verdict differs from the answer that came with a probability, so
+  `CONFIDENCE()` doesn't re-ask it. Operators count `model_calls` as requests are
   sent and `model_calls_merged` once answers show which the scheduler merged;
   `progress.rs` reports the difference.
 - Rows fail, queries don't: a row the model errors on is excluded from a
@@ -130,6 +131,9 @@ assembled in the physical planner, not there.
 - An index gap degrades, never drops: unindexed documents pass the pre-filter
   through to full-text verify; `SEMANTIC DISTINCT` falls back to exact-match
   dedupe. Never silently discard rows the index hasn't seen.
+- `UPDATE`/`DELETE` with a `MEANS`, `CONFIDENCE()` or subquery predicate is
+  refused (`lib.rs::reject_semantic_dml`): DataFusion would hand the table
+  no predicate and the statement would touch every row.
 - A new statement that defines or drops something durable must also save
   or forget it in the catalog (`catalog::execute_ddl` for planned DDL, a
   `Change` in the semantic-DDL branch of `run_sql`), or it silently vanishes

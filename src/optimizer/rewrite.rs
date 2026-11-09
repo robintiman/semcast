@@ -395,7 +395,12 @@ pub fn apply_recall(
     let mut rewrites = 0usize;
     let transformed = plan.transform_up(|plan| {
         plan.map_expressions(|expr| {
-            expr.transform_up(|expr| match expr {
+            // Top-down so a CONFIDENCE() can be skipped whole: its MEANS is
+            // a question to score, not a filter to calibrate.
+            expr.transform_down(|expr| match expr {
+                confidence if is_confidence_call(&confidence) => {
+                    Ok(Transformed::new(confidence, false, TreeNodeRecursion::Jump))
+                }
                 Expr::ScalarFunction(mut call)
                     if call.func.name() == MEANS_UDF_NAME && call.args.len() == 2 =>
                 {

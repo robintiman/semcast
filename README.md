@@ -173,8 +173,14 @@ probabilities (Ollama does; Anthropic doesn't). `ORDER BY … DESC` puts NULLs
 first; add `NULLS LAST`. Not to be confused with `WITH CONFIDENCE`, which
 qualifies a recall target.
 
-`UPDATE` and `DELETE` refuse `MEANS` and `CONFIDENCE()`: select the matching
-keys into a table first, then update or delete by key.
+`UPDATE` and `DELETE` refuse `MEANS`, `CONFIDENCE()` and subqueries in their
+`WHERE` (DataFusion would apply them to every row). Keep the other rows
+instead:
+
+```sql
+CREATE TABLE open_tickets AS SELECT * FROM tickets
+WHERE id NOT IN (SELECT id FROM tickets WHERE body MEANS 'resolved');
+```
 
 #### `WITH RECALL`
 

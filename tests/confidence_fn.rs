@@ -158,15 +158,21 @@ async fn a_provider_without_probabilities_gives_null() {
 }
 
 #[tokio::test]
-async fn an_unscored_row_is_not_asked_again() {
-    let model = Arc::new(Counting::new(Unscored(furious_model())));
-    let ctx = tickets(Arc::clone(&model) as _, Arc::new(InMemoryCache::default())).await;
+async fn a_missing_probability_is_asked_again() {
+    // Not settled: another provider under the same model id may report one.
+    let cache: Arc<dyn SemanticCache> = Arc::new(InMemoryCache::default());
+    let unscored = Arc::new(Counting::new(Unscored(furious_model())));
+    let ctx = tickets(Arc::clone(&unscored) as _, Arc::clone(&cache)).await;
     let sql = "SELECT id, CONFIDENCE(body MEANS 'is angry') FROM tickets ORDER BY id";
-    run(&ctx, sql).await;
-    assert_eq!(model.calls(), 2);
     let batches = run(&ctx, sql).await;
     assert_eq!(floats(&batches, 1), [None, None, None]);
-    assert_eq!(model.calls(), 2, "settled as unscored");
+    assert_eq!(unscored.calls(), 2);
+
+    let model = Arc::new(furious_model());
+    let ctx = tickets(Arc::clone(&model) as _, cache).await;
+    let batches = run(&ctx, sql).await;
+    assert_eq!(floats(&batches, 1), [Some(0.8), Some(0.3), None]);
+    assert_eq!(model.completion_calls(), 2);
 }
 
 #[tokio::test]
@@ -268,16 +274,53 @@ async fn delete_and_update_refuse_semantic_predicates() {
         "DELETE FROM tickets WHERE CONFIDENCE(body MEANS 'is angry') > 0.5",
         "DELETE FROM tickets WHERE id IN (SELECT id FROM tickets WHERE body MEANS 'x')",
         "UPDATE tickets SET body = 'x' WHERE body MEANS 'is angry'",
+        "EXPLAIN ANALYZE DELETE FROM tickets WHERE body MEANS 'is angry'",
+        // DataFusion drops a subquery predicate from DELETE, semantic or not.
+        "DELETE FROM tickets WHERE id IN (SELECT id FROM tickets WHERE id = 1)",
     ] {
         let error = match semcast::sql(&ctx, sql).await {
             Err(e) => e.to_string(),
             Ok(df) => df.collect().await.expect_err(sql).to_string(),
         };
-        assert!(error.contains("cannot filter on MEANS"), "{sql}: {error}");
+        assert!(error.contains("affect every row"), "{sql}: {error}");
     }
     let batches = run(&ctx, "SELECT id FROM tickets ORDER BY id").await;
     assert_eq!(ids(&batches), [1, 2, 3], "nothing was deleted");
     assert_eq!(model.completion_calls(), 0);
+}
+
+#[tokio::test]
+async fn the_documented_delete_workaround_keeps_the_other_rows() {
+    let ctx = tickets(
+        Arc::new(furious_model()),
+        Arc::new(InMemoryCache::default()),
+    )
+    .await;
+    run(
+        &ctx,
+        "CREATE TABLE calm AS SELECT * FROM tickets \
+         WHERE id NOT IN (SELECT id FROM tickets WHERE body MEANS 'is angry')",
+    )
+    .await;
+    let batches = run(&ctx, "SELECT id FROM calm ORDER BY id").await;
+    assert_eq!(ids(&batches), [2, 3]);
+}
+
+#[tokio::test]
+async fn with_recall_leaves_confidence_alone() {
+    let ctx = tickets(
+        Arc::new(furious_model()),
+        Arc::new(InMemoryCache::default()),
+    )
+    .await;
+    let batches = run(
+        &ctx,
+        "SELECT id, CONFIDENCE(body MEANS 'is angry') FROM tickets \
+         WHERE body MEANS 'is upset' WITH RECALL 0.9",
+    )
+    .await;
+    assert_eq!(ids(&batches), [1]);
+    assert_eq!(floats(&batches, 1), [Some(0.8)]);
 }
 
 #[tokio::test]
@@ -338,11 +381,6 @@ async fn confidence_misuse_is_a_plan_error() {
         (
             "SELECT count(*) FROM tickets GROUP BY CONFIDENCE(body MEANS 'x')",
             "CONFIDENCE(text MEANS",
-        ),
-        (
-            "SELECT CONFIDENCE(body MEANS 'x') FROM tickets \
-             WHERE body MEANS 'y' WITH RECALL 0.9",
-            "WITH RECALL",
         ),
         (
             "SELECT id FROM tickets \
