@@ -25,6 +25,7 @@ use crate::logical::{
 use crate::model::ModelProvider;
 use crate::optimizer::calibrate::DEFAULT_CALIBRATION_SAMPLE;
 use crate::physical::index_scan::{CalibrationConfig, ChunkEvidence, IndexScanExec};
+use crate::physical::score_scan::ScorerHealth;
 use crate::physical::{
     ScoreScanExec, SemClassifyExec, SemClusterExec, SemDistinctExec, SemExtractExec, SemRankExec,
     VerifyExec,
@@ -35,7 +36,7 @@ use crate::physical::{
 pub struct SemcastQueryPlanner {
     model: Arc<dyn ModelProvider>,
     cache: Arc<dyn SemanticCache>,
-    scorer: Option<Arc<dyn ModelProvider>>,
+    scorer: Option<(Arc<dyn ModelProvider>, Arc<ScorerHealth>)>,
 }
 
 impl SemcastQueryPlanner {
@@ -50,7 +51,7 @@ impl SemcastQueryPlanner {
     /// A cheap model whose P("yes") pre-filters an unindexed `MEANS` under
     /// `WITH RECALL`; see [`ScoreScanExec`].
     pub fn with_scorer(mut self, scorer: Option<Arc<dyn ModelProvider>>) -> Self {
-        self.scorer = scorer;
+        self.scorer = scorer.map(|scorer| (scorer, Arc::new(ScorerHealth::default())));
         self
     }
 }
@@ -87,7 +88,7 @@ impl QueryPlanner for SemcastQueryPlanner {
 struct SemcastExtensionPlanner {
     model: Arc<dyn ModelProvider>,
     cache: Arc<dyn SemanticCache>,
-    scorer: Option<Arc<dyn ModelProvider>>,
+    scorer: Option<(Arc<dyn ModelProvider>, Arc<ScorerHealth>)>,
 }
 
 #[async_trait]
@@ -151,13 +152,14 @@ impl ExtensionPlanner for SemcastExtensionPlanner {
             let scorer = self
                 .scorer
                 .as_ref()
-                .filter(|scorer| scorer.id() != self.model.id());
-            if let (Some(scorer), Some(target_recall)) = (scorer, filter.recall) {
+                .filter(|(scorer, _)| scorer.id() != self.model.id());
+            if let (Some((scorer, health)), Some(target_recall)) = (scorer, filter.recall) {
                 input = Arc::new(ScoreScanExec::new(
                     input,
                     Arc::clone(&text),
                     filter.condition.clone(),
                     Arc::clone(scorer),
+                    Arc::clone(health),
                     CalibrationConfig {
                         target_recall,
                         confidence: filter.confidence,

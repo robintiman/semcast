@@ -17,6 +17,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use datafusion::arrow::array::{Array, BooleanArray, StringArray};
 use datafusion::arrow::compute::{cast, filter_record_batch};
@@ -45,14 +46,26 @@ use crate::optimizer::calibrate::{Calibration, SampledScores, calibrate_threshol
 use crate::physical::index_scan::CalibrationConfig;
 use crate::physical::sample::{Label, Labeler, draw_sample};
 use crate::physical::verify::{
-    MEANS_PROMPT_VERSION, cache_unscored, cache_verdict, cached_score, means_cache_key,
-    merged_calls, parse_verdict, synthesize_means_prompt,
+    MEANS_PROMPT_VERSION, cache_verdict, cached_score, means_cache_key, merged_calls,
+    parse_verdict, synthesize_means_prompt,
 };
 
 /// The floor when the sample holds no known match to set one by: none. The
 /// scorer's own yes/no is exactly the judgement the sample exists to check,
 /// so with nothing to check it against, it prunes nothing.
 pub const DEFAULT_SCORER_FLOOR: f32 = f32::NEG_INFINITY;
+
+/// How many answers in one batch, none with a probability, it takes to
+/// conclude the scorer reports none — enough that a one-off parse miss
+/// doesn't switch it off.
+const MIN_ANSWERS_TO_SWITCH_OFF: usize = 8;
+
+/// What a session has learned about its scorer, shared by every scan that
+/// uses it. In memory only, on purpose: see [`Scanner::score`].
+#[derive(Debug, Default)]
+pub struct ScorerHealth {
+    no_logprobs: AtomicBool,
+}
 
 /// Prunes rows whose scorer P("yes") falls below a floor calibrated to the
 /// recall target, ahead of the session model's verify.
@@ -62,6 +75,7 @@ pub struct ScoreScanExec {
     text: Arc<dyn PhysicalExpr>,
     condition: String,
     scorer: Arc<dyn ModelProvider>,
+    health: Arc<ScorerHealth>,
     calibration: CalibrationConfig,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
@@ -73,6 +87,7 @@ impl ScoreScanExec {
         text: Arc<dyn PhysicalExpr>,
         condition: impl Into<String>,
         scorer: Arc<dyn ModelProvider>,
+        health: Arc<ScorerHealth>,
         calibration: CalibrationConfig,
     ) -> Self {
         let properties = Arc::new(PlanProperties::new(
@@ -88,6 +103,7 @@ impl ScoreScanExec {
             text,
             condition: condition.into(),
             scorer,
+            health,
             calibration,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -156,6 +172,7 @@ impl ExecutionPlan for ScoreScanExec {
             Arc::clone(&self.text),
             self.condition.clone(),
             Arc::clone(&self.scorer),
+            Arc::clone(&self.health),
             self.calibration.clone(),
         )))
     }
@@ -172,6 +189,7 @@ impl ExecutionPlan for ScoreScanExec {
             text: Arc::clone(&self.text),
             condition: self.condition.clone(),
             scorer: Arc::clone(&self.scorer),
+            health: Arc::clone(&self.health),
             calibration: self.calibration.clone(),
             scorer_calls: metric("scorer_calls"),
             scorer_calls_merged: metric("scorer_calls_merged"),
@@ -215,6 +233,7 @@ struct Scanner {
     text: Arc<dyn PhysicalExpr>,
     condition: String,
     scorer: Arc<dyn ModelProvider>,
+    health: Arc<ScorerHealth>,
     calibration: CalibrationConfig,
     scorer_calls: Count,
     /// Of `scorer_calls`, those merged onto an identical call in flight.
@@ -244,8 +263,16 @@ impl Scanner {
             .iter()
             .map(|batch| self.evaluate_texts(batch))
             .collect::<Result<_>>()?;
-        for array in &texts {
-            reservation.try_grow(array.get_array_memory_size())?;
+        // A plain Utf8 column evaluates to the batch's own array, already
+        // charged; only a computed or cast text is new memory.
+        for (array, batch) in texts.iter().zip(&buffered) {
+            let shared = batch.columns().iter().any(|column| {
+                column.to_data().buffers().first().map(|b| b.as_ptr())
+                    == array.to_data().buffers().first().map(|b| b.as_ptr())
+            });
+            if !shared {
+                reservation.try_grow(array.get_array_memory_size())?;
+            }
         }
         let strings: Vec<&StringArray> = texts.iter().map(as_strings).collect();
 
@@ -280,9 +307,7 @@ impl Scanner {
                     }
                 }
             }
-            let filtered = filter_record_batch(batch, &BooleanArray::from(keep))?;
-            reservation.try_grow(filtered.get_array_memory_size())?;
-            output.push(filtered);
+            output.push(filter_record_batch(batch, &BooleanArray::from(keep))?);
         }
         drop(texts);
         drop(buffered);
@@ -336,22 +361,26 @@ impl Scanner {
                 }
             }
         }
+        if self.health.no_logprobs.load(Ordering::Relaxed) {
+            // Every row passes through; asking would buy nothing.
+            return scores;
+        }
         self.scorer_calls.add(requests.len());
         let completions = self.scorer.complete(requests).await;
+        let answered = completions.iter().filter(|c| c.is_ok()).count();
+        let mut answered_with_probability = false;
         self.scorer_calls_merged.add(merged_calls(&completions));
         let cache = self.calibration.cache.as_ref();
         for ((hash, key), completion) in pending.into_iter().zip(&completions) {
             let Ok(completion) = completion else { continue };
             let verdict = parse_verdict(&completion.text);
             let Some(probability) = completion.yes_probability else {
-                // Settled, so a scorer without logprobs costs one call per
-                // document, not one per document per query.
-                if let Some(verdict) = verdict {
-                    cache_verdict(cache, key.clone(), verdict, None);
-                    cache_unscored(cache, &key, verdict);
-                }
+                // Not cached: the next answer may carry one (see
+                // `cached_score`). A scorer that never does is switched off
+                // for the process below.
                 continue;
             };
+            answered_with_probability = true;
             if let Some(verdict) = verdict {
                 cache_verdict(cache, key.clone(), verdict, Some(probability));
             }
@@ -364,6 +393,20 @@ impl Scanner {
             };
             if let Some(score) = score {
                 scores.insert(hash, score);
+            }
+        }
+        if answered >= MIN_ANSWERS_TO_SWITCH_OFF && !answered_with_probability {
+            // A whole batch of answers and not one probability: this scorer
+            // reports none. Remembered for the process only, so a scorer that
+            // starts reporting them (another build, another server) is used
+            // again after a restart, and nothing durable claims otherwise.
+            if !self.health.no_logprobs.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    target: "semcast::scorer",
+                    scorer = %self.scorer.id(),
+                    "the scorer reports no probabilities (no logprobs); it is \
+                     switched off until restart and every row is verified",
+                );
             }
         }
         scores

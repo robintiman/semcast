@@ -238,6 +238,9 @@ WHERE transcript MEANS 'discussed offline sync'
 WITH RECALL 0.9 WITH CONFIDENCE 0.95;
 ```
 
+A sample without a single match certifies nothing: the stage keeps labeling,
+up to 256 rows, then prunes nothing.
+
 #### `RELEVANCE TO`
 
 ```sql

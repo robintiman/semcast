@@ -326,7 +326,37 @@ async fn a_scorer_without_probabilities_is_asked_once() {
     run(&ctx, RECALL_QUERY).await;
     assert_eq!(scorer.calls(), 200);
     run(&ctx, RECALL_QUERY).await;
-    assert_eq!(scorer.calls(), 200, "settled, not re-asked");
+    assert_eq!(scorer.calls(), 200, "switched off, not re-asked");
+}
+
+#[tokio::test]
+async fn an_unscored_scorer_leaves_nothing_durable_behind() {
+    // The scorer gave no probabilities here; the same model, later serving
+    // CONFIDENCE() with logprobs over the same cache, must still be asked.
+    let cache: Arc<dyn SemanticCache> = Arc::new(InMemoryCache::default());
+    let scorer = Arc::new(Named {
+        id: "small",
+        inner: MockModel::answering_yes_to(["furious"]),
+        calls: AtomicUsize::new(0),
+        unscored: true,
+    });
+    let ctx = tickets(session_model(), Some(scorer), Arc::clone(&cache)).await;
+    run(&ctx, RECALL_QUERY).await;
+
+    let small = Named::new("small", MockModel::answering_yes_to(["furious"]));
+    let ctx = tickets(Arc::clone(&small), None, cache).await;
+    let batches = run(
+        &ctx,
+        "SELECT id, CONFIDENCE(body MEANS 'is angry') AS c FROM tickets WHERE id = 10",
+    )
+    .await;
+    let scores = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Float64Array>()
+        .unwrap();
+    assert_eq!(scores.value(0), 0.9_f32 as f64);
+    assert_eq!(small.calls(), 1);
 }
 
 #[tokio::test]
