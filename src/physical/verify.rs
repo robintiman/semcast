@@ -143,7 +143,9 @@ impl VerifyExec {
         Self {
             input,
             text,
-            condition: condition.into(),
+            // Public constructor: normalize here too, so a caller outside
+            // the rewrite still asks (and keys) the one question.
+            condition: crate::semir::normalize_instruction(&condition.into()),
             model,
             cache,
             evidence,
