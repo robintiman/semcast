@@ -324,6 +324,23 @@ async fn with_recall_leaves_confidence_alone() {
 }
 
 #[tokio::test]
+async fn confidence_aggregates_inline() {
+    let model = Arc::new(furious_model());
+    let ctx = tickets(Arc::clone(&model) as _, Arc::new(InMemoryCache::default())).await;
+    let batches = run(
+        &ctx,
+        "SELECT avg(CONFIDENCE(body MEANS 'is angry')) AS anger FROM tickets",
+    )
+    .await;
+    assert_eq!(
+        floats(&batches, 0),
+        [Some(0.55)],
+        "mean of 0.8 and 0.3; NULL is skipped"
+    );
+    assert_eq!(model.completion_calls(), 2);
+}
+
+#[tokio::test]
 async fn confidence_orders_rows() {
     let ctx = tickets(
         Arc::new(furious_model()),
@@ -379,10 +396,6 @@ async fn confidence_misuse_is_a_plan_error() {
     for (sql, expected) in [
         ("SELECT CONFIDENCE(id = 1) FROM tickets", "takes one MEANS"),
         (
-            "SELECT count(*) FROM tickets GROUP BY CONFIDENCE(body MEANS 'x')",
-            "CONFIDENCE(text MEANS",
-        ),
-        (
             "SELECT id FROM tickets \
              WHERE CONFIDENCE(CONFIDENCE(body MEANS 'a') MEANS 'b') > 0",
             "cannot read the output",
@@ -400,15 +413,6 @@ async fn confidence_misuse_is_a_plan_error() {
             "SELECT id FROM tickets \
              WHERE CAST(CONFIDENCE(body MEANS 'a') AS VARCHAR) MEANS 'b'",
             "cannot read the output",
-        ),
-        (
-            "SELECT id FROM tickets \
-             WHERE CONFIDENCE(body MEANS 'a') > 0.5 OR body MEANS 'b'",
-            "top-level AND conjunct",
-        ),
-        (
-            "SELECT avg(CONFIDENCE(body MEANS 'x')) FROM tickets",
-            "aggregate or window",
         ),
     ] {
         let error = match semcast::sql(&ctx, sql).await {

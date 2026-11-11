@@ -159,8 +159,15 @@ assembled in the physical planner, not there.
   `Change` in the semantic-DDL branch of `run_sql`), or it silently vanishes
   on restart. Save what the statement did, not what it said: compare the name
   before and after it runs.
-- Illegal marker positions (a `means()` under `OR`/`NOT`, in `GROUP BY`, …) are
-  plan-time errors, not silent per-row model calls.
+- A marker works wherever an expression does in a single-input step: a plain
+  `AND` condition of a `WHERE` filters (index, scorer, `WITH RECALL`); anywhere
+  else (`NOT`, `OR`, `GROUP BY`, aggregate and window arguments, `ORDER BY`)
+  it is lifted into a `SemClassify` column below the step
+  (`rewrite.rs::lift_below`, `rewrite_lifted_filter`), one call per row
+  reaching it, shown by `EXPLAIN`. A JOIN condition, `UPDATE`/`DELETE`, and a
+  marker reading another marker's output are plan-time errors. A label over
+  NULL text is NULL, not `false`. `tests/binder_coverage.rs` measures the
+  share of `tests/corpus/means.sql` that binds (the phase 2 gate, ≥90%).
 
 ### Server
 

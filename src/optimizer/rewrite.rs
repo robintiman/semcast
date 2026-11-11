@@ -15,8 +15,9 @@ use std::sync::Arc;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, Result, ScalarValue, plan_err};
 use datafusion::logical_expr::expr::ScalarFunction;
-use datafusion::logical_expr::utils::{conjunction, split_conjunction_owned};
-use datafusion::logical_expr::{Expr, Extension, Filter, LogicalPlan, Projection, Sort, SortExpr};
+use datafusion::logical_expr::expr_rewriter::NamePreserver;
+use datafusion::logical_expr::utils::{conjunction, split_conjunction, split_conjunction_owned};
+use datafusion::logical_expr::{Expr, Extension, Filter, LogicalPlan, Projection};
 use datafusion::optimizer::optimizer::ApplyOrder;
 use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
 
@@ -65,15 +66,12 @@ impl MeansRewriteRule {
     }
 }
 
-/// Both legal positions, named in every rejection so the error says where the
-/// marker *can* go rather than only where it cannot.
-const LEGAL_POSITIONS: &str = "means() is supported as a top-level AND conjunct of a WHERE \
-     clause (to filter) or in a SELECT list (to label); it cannot appear under \
-     OR or NOT in a WHERE, nor in a GROUP BY, HAVING, or JOIN condition — wrap \
-     it in a subquery to group or filter on a label. CONFIDENCE(text MEANS \
-     'condition') goes in a SELECT list, a WHERE clause, or an ORDER BY, but \
-     not inside an aggregate or window function — compute it in a subquery \
-     and aggregate over that";
+/// Where a marker still cannot go, named in every rejection.
+const LEGAL_POSITIONS: &str = "MEANS and CONFIDENCE() work anywhere an expression does in a \
+     single-input step (WHERE, SELECT, GROUP BY, HAVING, ORDER BY, window and \
+     aggregate arguments), but not in a JOIN condition that stays in the join \
+     (one on an outer join's preserved side): compute it in a subquery as a \
+     column first, and join on that";
 
 impl OptimizerRule for MeansRewriteRule {
     fn name(&self) -> &str {
@@ -101,61 +99,92 @@ impl OptimizerRule for MeansRewriteRule {
             return crate::optimizer::classify::rewrite_projection(projection);
         }
 
-        if let LogicalPlan::Sort(sort) = &plan {
-            let mut holds_confidence = false;
-            for sort_expr in &sort.expr {
-                holds_confidence |= contains_confidence(&sort_expr.expr)?;
-            }
-            if holds_confidence {
-                let LogicalPlan::Sort(sort) = plan else {
-                    unreachable!("matched above")
-                };
-                return rewrite_confidence_sort(sort);
-            }
-        }
-
         let LogicalPlan::Filter(filter) = plan else {
+            let mut holds_marker = false;
             for expr in plan.expressions() {
-                if contains_means(&expr)? {
-                    return plan_err!("{LEGAL_POSITIONS} (found it in a {} node)", plan.display());
-                }
+                holds_marker |= contains_means(&expr)?;
             }
-            return Ok(Transformed::no(plan));
+            if !holds_marker {
+                return Ok(Transformed::no(plan));
+            }
+            return lift_below(plan);
         };
-        if contains_confidence(&filter.predicate)? {
-            return self.rewrite_confidence_filter(filter);
+        let mut lifts = false;
+        for conjunct in split_conjunction(&filter.predicate) {
+            lifts |= !is_means_call(conjunct) && contains_means(conjunct)?;
+        }
+        if lifts {
+            return self.rewrite_lifted_filter(filter);
         }
         self.rewrite_filter(filter)
     }
 }
 
-/// An `ORDER BY` that reads `CONFIDENCE()`: compute it below the sort, sort
-/// on the column, and drop the column again above.
-fn rewrite_confidence_sort(sort: Sort) -> Result<Transformed<LogicalPlan>> {
-    let passthrough = passthrough_columns(&sort.input);
+/// A step that uses a `MEANS` or `CONFIDENCE()` as a value — a `GROUP BY`
+/// key, an aggregate or window argument, an `ORDER BY` — rather than as a
+/// filter: compute each one as a column in a classify node below the step,
+/// use the column, and drop it again above if the step passes its input's
+/// columns through.
+///
+/// One model call per row reaching the step, shown by `EXPLAIN`'s
+/// `SemClassify`. Names are preserved, so the steps above still find the
+/// columns they reference.
+fn lift_below(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
+    let inputs = plan.inputs();
+    let [input] = inputs.as_slice() else {
+        return plan_err!("{LEGAL_POSITIONS} (found it in a {} node)", plan.display());
+    };
+    let input = (*input).clone();
+    let original = Arc::clone(plan.schema());
+    let preserver = NamePreserver::new(&plan);
     let mut builder = crate::optimizer::classify::Builder::default();
-    let expr = sort
-        .expr
+    let exprs = plan
+        .expressions()
         .into_iter()
-        .map(|sort_expr| {
-            let expr = crate::optimizer::classify::lift_confidence(sort_expr.expr, &mut builder)?;
-            Ok(SortExpr { expr, ..sort_expr })
+        .map(|expr| {
+            let saved = preserver.save(&expr);
+            let lifted = crate::optimizer::classify::rewrite_expr(expr, &None, &mut builder)?;
+            Ok(saved.restore(lifted))
         })
         .collect::<Result<Vec<_>>>()?;
-    for sort_expr in &expr {
-        if contains_means(&sort_expr.expr)? {
-            return plan_err!("{LEGAL_POSITIONS} (found it in an ORDER BY)");
+    let lifted = plan.with_new_exprs(exprs, vec![builder.build(input)?])?;
+    if lifted.schema().fields().len() == original.fields().len() {
+        return Ok(Transformed::yes(lifted));
+    }
+    // The step passed the new columns through (a sort, a window): restore
+    // the schema it had.
+    let passthrough = original.columns().into_iter().map(Expr::Column).collect();
+    Ok(Transformed::yes(LogicalPlan::Projection(
+        Projection::try_new(passthrough, Arc::new(lifted))?,
+    )))
+}
+
+/// For a conjunct `d1 OR d2 OR …`, the rows still worth asking about: those
+/// no marker-free disjunct already matches. `None` when there is nothing to
+/// skip on.
+fn or_guard(conjunct: &Expr) -> Result<Option<Expr>> {
+    let mut disjuncts = Vec::new();
+    collect_disjuncts(conjunct, &mut disjuncts);
+    if disjuncts.len() < 2 {
+        return Ok(None);
+    }
+    let mut unmatched = Vec::new();
+    for disjunct in disjuncts {
+        if !contains_means(disjunct)? {
+            unmatched.push(disjunct.clone().is_not_true());
         }
     }
-    let input = builder.build(Arc::unwrap_or_clone(sort.input))?;
-    let sorted = LogicalPlan::Sort(Sort {
-        expr,
-        input: Arc::new(input),
-        fetch: sort.fetch,
-    });
-    Ok(Transformed::yes(LogicalPlan::Projection(
-        Projection::try_new(passthrough, Arc::new(sorted))?,
-    )))
+    Ok(conjunction(unmatched))
+}
+
+fn collect_disjuncts<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
+    match expr {
+        Expr::BinaryExpr(binary) if binary.op == datafusion::logical_expr::Operator::Or => {
+            collect_disjuncts(&binary.left, out);
+            collect_disjuncts(&binary.right, out);
+        }
+        other => out.push(other),
+    }
 }
 
 fn passthrough_columns(plan: &LogicalPlan) -> Vec<Expr> {
@@ -167,19 +196,28 @@ fn passthrough_columns(plan: &LogicalPlan) -> Vec<Expr> {
 }
 
 impl MeansRewriteRule {
-    /// A `WHERE` that reads `CONFIDENCE()`. The conjuncts that don't read it
-    /// run first — ordinary predicates and `MEANS` alike, through
-    /// [`Self::rewrite_filter`] — so the probability is paid for only on rows
-    /// that survive them. Then each probability is computed in a classify
-    /// node, the rest of the predicate filters on its column, and a
-    /// projection restores the input schema on top.
-    fn rewrite_confidence_filter(&self, filter: Filter) -> Result<Transformed<LogicalPlan>> {
+    /// A `WHERE` with a `MEANS` used as a value rather than as a top-level
+    /// `AND` condition: under `NOT` or `OR`, compared, inside a `CASE`, or
+    /// read through `CONFIDENCE()`.
+    ///
+    /// The conjuncts that don't need lifting run first — ordinary predicates
+    /// and plain `MEANS` conditions alike, through [`Self::rewrite_filter`],
+    /// index and all — so the lifted ones are paid for only on rows that
+    /// survive them. Each lifted `MEANS` becomes a column of a classify node,
+    /// the rest of the predicate filters on those columns, and a projection
+    /// restores the input schema on top.
+    ///
+    /// In `a OR x MEANS p`, a row an ordinary disjunct already matches skips
+    /// the model. A row whose call fails reads NULL, so SQL's three-valued
+    /// logic applies: it is dropped under `NOT`, and kept under `OR` only if
+    /// another disjunct is true.
+    fn rewrite_lifted_filter(&self, filter: Filter) -> Result<Transformed<LogicalPlan>> {
         let passthrough = passthrough_columns(&filter.input);
-        let mut scored = Vec::new();
+        let mut lifted = Vec::new();
         let mut first = Vec::new();
         for conjunct in split_conjunction_owned(filter.predicate) {
-            if contains_confidence(&conjunct)? {
-                scored.push(conjunct);
+            if !is_means_call(&conjunct) && contains_means(&conjunct)? {
+                lifted.push(conjunct);
             } else {
                 first.push(conjunct);
             }
@@ -191,15 +229,14 @@ impl MeansRewriteRule {
                 .data;
         }
         let mut builder = crate::optimizer::classify::Builder::default();
-        let predicate = crate::optimizer::classify::lift_confidence(
-            conjunction(scored).expect("the predicate reads CONFIDENCE()"),
-            &mut builder,
-        )?;
-        // What's left of a scored conjunct is plain SQL over the new columns;
-        // a MEANS still in it sits under OR, NOT or a comparison.
-        if contains_means(&predicate)? {
-            return plan_err!("{LEGAL_POSITIONS}");
-        }
+        let lifted = lifted
+            .into_iter()
+            .map(|conjunct| {
+                let guard = or_guard(&conjunct)?;
+                crate::optimizer::classify::rewrite_expr(conjunct, &guard, &mut builder)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let predicate = conjunction(lifted).expect("at least one conjunct lifts");
         let input = builder.build(input)?;
         let filtered = LogicalPlan::Filter(Filter::try_new(predicate, Arc::new(input))?);
         Ok(Transformed::yes(LogicalPlan::Projection(
@@ -392,15 +429,19 @@ pub fn apply_recall(
             );
         }
     }
+    // Only a MEANS that filters — a top-level AND condition of a WHERE or
+    // HAVING — has a lossy pre-filter to calibrate. One used as a value
+    // (a label, under NOT or OR, inside CONFIDENCE()) asks every row it sees
+    // and is exact already.
     let mut rewrites = 0usize;
     let transformed = plan.transform_up(|plan| {
-        plan.map_expressions(|expr| {
-            // Top-down so a CONFIDENCE() can be skipped whole: its MEANS is
-            // a question to score, not a filter to calibrate.
-            expr.transform_down(|expr| match expr {
-                confidence if is_confidence_call(&confidence) => {
-                    Ok(Transformed::new(confidence, false, TreeNodeRecursion::Jump))
-                }
+        let LogicalPlan::Filter(filter) = plan else {
+            return Ok(Transformed::no(plan));
+        };
+        let mut changed = false;
+        let conjuncts = split_conjunction_owned(filter.predicate)
+            .into_iter()
+            .map(|conjunct| match conjunct {
                 Expr::ScalarFunction(mut call)
                     if call.func.name() == MEANS_UDF_NAME && call.args.len() == 2 =>
                 {
@@ -411,14 +452,26 @@ pub fn apply_recall(
                     call.args
                         .push(Expr::Literal(ScalarValue::Float64(confidence), None));
                     rewrites += 1;
-                    Ok(Transformed::yes(Expr::ScalarFunction(call)))
+                    changed = true;
+                    Expr::ScalarFunction(call)
                 }
-                other => Ok(Transformed::no(other)),
+                other => other,
             })
+            .collect::<Vec<_>>();
+        let predicate = conjunction(conjuncts).expect("a filter has a predicate");
+        let filter = LogicalPlan::Filter(Filter::try_new(predicate, filter.input)?);
+        Ok(if changed {
+            Transformed::yes(filter)
+        } else {
+            Transformed::no(filter)
         })
     })?;
     if rewrites == 0 {
-        return plan_err!("WITH RECALL requires a MEANS predicate in the statement");
+        return plan_err!(
+            "WITH RECALL requires a MEANS that filters: a top-level AND condition \
+             of a WHERE (a label, or a MEANS under NOT or OR, asks every row and \
+             has nothing to calibrate)"
+        );
     }
     Ok(transformed.data)
 }
@@ -458,10 +511,6 @@ fn reject_nested_markers(expr: &Expr) -> Result<()> {
         Ok(TreeNodeRecursion::Continue)
     })?;
     Ok(())
-}
-
-fn contains_confidence(expr: &Expr) -> Result<bool> {
-    expr.exists(|e| Ok(is_confidence_call(e)))
 }
 
 /// Pull `(text_expr, condition)` out of a `confidence(means(..))` call.
