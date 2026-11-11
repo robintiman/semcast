@@ -70,9 +70,10 @@ impl MeansRewriteRule {
 const LEGAL_POSITIONS: &str = "MEANS and CONFIDENCE() work anywhere an expression does in a \
      single-input step (WHERE, SELECT, GROUP BY, HAVING, ORDER BY, window and \
      aggregate arguments), but not where they would have to stay inside a join: \
-     a condition on an outer join's preserved side, or one that shares an OR \
-     with a correlated subquery's correlation. Compute it as a column in a \
-     subquery first, then join or filter on that column";
+     a condition on an outer join's preserved side, or one inside a correlated \
+     subquery (EXISTS, IN) that reads the outer query's columns or shares an OR \
+     with the correlation. Compute it as a column in a subquery first, then \
+     join or filter on that column";
 
 impl OptimizerRule for MeansRewriteRule {
     fn name(&self) -> &str {
