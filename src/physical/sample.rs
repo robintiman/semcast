@@ -69,6 +69,9 @@ pub(crate) fn draw_sample(texts: &[&StringArray], sample_size: usize) -> Vec<Str
 /// Ground-truth labels: the session model reads each document's full text —
 /// the definition of `MEANS`.
 pub(crate) struct Labeler<'a> {
+    /// The funnel's store evidence, told every label as it lands, so later
+    /// stages decide a labelled row by its full-text verdict too.
+    pub evidence: Option<&'a crate::physical::store_lookup::StoreEvidence>,
     pub condition: &'a str,
     pub model: &'a dyn ModelProvider,
     pub cache: &'a dyn SemanticCache,
@@ -139,6 +142,13 @@ impl Labeler<'_> {
                     labels.push((text.clone(), None));
                 }
             }
+        }
+        if let Some(evidence) = self.evidence {
+            evidence.record(
+                labels
+                    .iter()
+                    .filter_map(|(text, label)| Some((text.as_str(), (*label)?))),
+            );
         }
         labels
     }

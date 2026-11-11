@@ -37,7 +37,13 @@ impl ProgressEvent {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FunnelCounts {
+    pub has_store_lookup: bool,
+    pub store_rows: usize,
+    pub store_matches: usize,
+    pub store_non_matches: usize,
     pub has_index_scan: bool,
+    pub index_store_decided: usize,
+    pub index_store_pruned: usize,
     pub has_scorer: bool,
     pub scorer_calls: usize,
     pub scorer_cache_hits: usize,
@@ -94,7 +100,8 @@ pub struct FunnelCounts {
 
 impl FunnelCounts {
     pub fn is_semantic(&self) -> bool {
-        self.has_index_scan
+        self.has_store_lookup
+            || self.has_index_scan
             || self.has_scorer
             || self.has_verify
             || self.has_extract
@@ -124,10 +131,20 @@ pub fn snapshot(plan: &Arc<dyn ExecutionPlan>) -> FunnelCounts {
     for node in semcast_nodes(plan) {
         let metrics = node.metrics();
         match node.name() {
+            "StoreLookupExec" => {
+                counts.has_store_lookup = true;
+                if let Some(metrics) = metrics {
+                    counts.store_rows += counter_total(&metrics, "rows_looked_up");
+                    counts.store_matches += counter_total(&metrics, "store_matches");
+                    counts.store_non_matches += counter_total(&metrics, "store_non_matches");
+                }
+            }
             "IndexScanExec" => {
                 counts.has_index_scan = true;
                 if let Some(metrics) = metrics {
                     counts.index_hits += counter_total(&metrics, "index_hits");
+                    counts.index_store_decided += counter_total(&metrics, "store_known");
+                    counts.index_store_pruned += counter_total(&metrics, "store_pruned");
                     counts.rows_pruned += counter_total(&metrics, "rows_pruned");
                     counts.calibration_sampled_rows +=
                         counter_total(&metrics, "calibration_sampled_rows");
@@ -235,11 +252,28 @@ pub fn final_totals(plan: &Arc<dyn ExecutionPlan>) -> Option<ProgressEvent> {
 
 pub fn render(counts: &FunnelCounts) -> String {
     let mut parts = Vec::new();
-    if counts.has_index_scan {
+    if counts.has_store_lookup {
         parts.push(format!(
-            "index scan: {} hits, {} pruned",
-            counts.index_hits, counts.rows_pruned,
+            "store: {} of {} rows already answered ({} match, {} don't)",
+            counts.store_matches + counts.store_non_matches,
+            counts.store_rows,
+            counts.store_matches,
+            counts.store_non_matches,
         ));
+    }
+    if counts.has_index_scan {
+        let mut scan = format!(
+            "index scan: {} hits, {} pruned",
+            counts.index_hits,
+            counts.rows_pruned + counts.index_store_pruned,
+        );
+        if counts.index_store_decided > 0 {
+            scan.push_str(&format!(
+                ", {} decided by the store ({} of them pruned)",
+                counts.index_store_decided, counts.index_store_pruned,
+            ));
+        }
+        parts.push(scan);
     }
     if counts.has_scorer {
         let mut scorer = format!(
@@ -367,6 +401,7 @@ fn collect(plan: &Arc<dyn ExecutionPlan>, out: &mut Vec<Arc<dyn ExecutionPlan>>)
     if matches!(
         plan.name(),
         "IndexScanExec"
+            | "StoreLookupExec"
             | "ScoreScanExec"
             | "VerifyExec"
             | "SemExtractExec"

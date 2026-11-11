@@ -26,6 +26,7 @@ use crate::model::ModelProvider;
 use crate::optimizer::calibrate::DEFAULT_CALIBRATION_SAMPLE;
 use crate::physical::index_scan::{CalibrationConfig, ChunkEvidence, IndexScanExec};
 use crate::physical::score_scan::ScorerHealth;
+use crate::physical::store_lookup::{StoreEvidence, StoreLookupExec};
 use crate::physical::{
     ScoreScanExec, SemClassifyExec, SemClusterExec, SemDistinctExec, SemExtractExec, SemRankExec,
     VerifyExec,
@@ -107,6 +108,18 @@ impl ExtensionPlanner for SemcastExtensionPlanner {
                 logical_inputs[0].schema(),
                 session_state,
             )?;
+            // The store answers first: every row whose question it has
+            // already answered is settled before any pre-filter or call, and
+            // the later stages honour its "yes" (see `StoreLookupExec`).
+            let store = Arc::new(StoreEvidence::default());
+            let looked_up: Arc<dyn ExecutionPlan> = Arc::new(StoreLookupExec::new(
+                Arc::clone(&physical_inputs[0]),
+                Arc::clone(&text),
+                filter.condition.clone(),
+                self.model.id(),
+                Arc::clone(&self.cache),
+                Arc::clone(&store),
+            ));
             // Funnel when an index covers the filtered column: index scan
             // prunes, verify reads the surviving rows' top chunks. No index
             // (or an unresolvable text expr) → verify-only, correct but full
@@ -123,30 +136,36 @@ impl ExtensionPlanner for SemcastExtensionPlanner {
                     cache: Arc::clone(&self.cache),
                 });
                 let evidence = Arc::new(ChunkEvidence::default());
-                let scan = Arc::new(IndexScanExec::new(
-                    Arc::clone(&physical_inputs[0]),
-                    Arc::clone(&text),
-                    filter.condition.clone(),
-                    index,
-                    params,
-                    calibration,
-                    Arc::clone(&evidence),
-                ));
-                return Ok(Some(Arc::new(VerifyExec::new_with_evidence(
-                    scan,
-                    text,
-                    filter.condition.clone(),
-                    Arc::clone(&self.model),
-                    Arc::clone(&self.cache),
-                    evidence,
-                    params.chunks_per_doc,
-                ))));
+                let scan = Arc::new(
+                    IndexScanExec::new(
+                        looked_up,
+                        Arc::clone(&text),
+                        filter.condition.clone(),
+                        index,
+                        params,
+                        calibration,
+                        Arc::clone(&evidence),
+                    )
+                    .with_store_evidence(Arc::clone(&store)),
+                );
+                return Ok(Some(Arc::new(
+                    VerifyExec::new_with_evidence(
+                        scan,
+                        text,
+                        filter.condition.clone(),
+                        Arc::clone(&self.model),
+                        Arc::clone(&self.cache),
+                        evidence,
+                        params.chunks_per_doc,
+                    )
+                    .with_store_evidence(store),
+                )));
             }
             // No index, but a scorer and a recall target: the scorer reads
             // every row, verify reads those above a calibrated floor. Without
             // a target there is nothing to calibrate against, and the scorer
             // stays out of the way.
-            let mut input = Arc::clone(&physical_inputs[0]);
+            let mut input = looked_up;
             // A scorer that is the session model would save nothing, and
             // under one id its answers are the session model's verdicts.
             let scorer = self
@@ -154,28 +173,34 @@ impl ExtensionPlanner for SemcastExtensionPlanner {
                 .as_ref()
                 .filter(|(scorer, _)| scorer.id() != self.model.id());
             if let (Some((scorer, health)), Some(target_recall)) = (scorer, filter.recall) {
-                input = Arc::new(ScoreScanExec::new(
-                    input,
-                    Arc::clone(&text),
-                    filter.condition.clone(),
-                    Arc::clone(scorer),
-                    Arc::clone(health),
-                    CalibrationConfig {
-                        target_recall,
-                        confidence: filter.confidence,
-                        sample_size: DEFAULT_CALIBRATION_SAMPLE,
-                        model: Arc::clone(&self.model),
-                        cache: Arc::clone(&self.cache),
-                    },
-                ));
+                input = Arc::new(
+                    ScoreScanExec::new(
+                        input,
+                        Arc::clone(&text),
+                        filter.condition.clone(),
+                        Arc::clone(scorer),
+                        Arc::clone(health),
+                        CalibrationConfig {
+                            target_recall,
+                            confidence: filter.confidence,
+                            sample_size: DEFAULT_CALIBRATION_SAMPLE,
+                            model: Arc::clone(&self.model),
+                            cache: Arc::clone(&self.cache),
+                        },
+                    )
+                    .with_store_evidence(Arc::clone(&store)),
+                );
             }
-            return Ok(Some(Arc::new(VerifyExec::new(
-                input,
-                text,
-                filter.condition.clone(),
-                Arc::clone(&self.model),
-                Arc::clone(&self.cache),
-            ))));
+            return Ok(Some(Arc::new(
+                VerifyExec::new(
+                    input,
+                    text,
+                    filter.condition.clone(),
+                    Arc::clone(&self.model),
+                    Arc::clone(&self.cache),
+                )
+                .with_store_evidence(store),
+            )));
         }
         if let Some(distinct) = node.as_any().downcast_ref::<SemDistinctNode>() {
             let schema = logical_inputs[0].schema();

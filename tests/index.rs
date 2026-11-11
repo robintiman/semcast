@@ -492,11 +492,11 @@ async fn calibration_raises_the_floor_and_prunes_the_near_miss() {
 
     let embeds_before = model.embed_calls();
     assert_eq!(matching_ids(&ctx, CALIBRATED_QUERY).await, vec![1]);
-    // 2 label calls (docs 1 and 2, full text) + doc 1's chunked verify. Doc 2
-    // scores ~0.87 — above the default floor, below the calibrated one (1.0,
-    // doc 1's score) — so it never reaches verify; surviving would cost a
-    // countable fourth call.
-    assert_eq!(model.completion_calls(), 3);
+    // 2 label calls (docs 1 and 2, full text), and nothing else: doc 1's
+    // label already answers verify, which no longer asks the chunked
+    // question too. Doc 2 scores ~0.87 — above the default floor, below the
+    // calibrated one — and its label says no, so it never reaches verify.
+    assert_eq!(model.completion_calls(), 2);
     assert_eq!(
         model.embed_calls() - embeds_before,
         1,
@@ -533,10 +533,9 @@ async fn unindexed_rows_still_pass_through_under_recall() {
         .unwrap();
 
     assert_eq!(matching_ids(&ctx, CALIBRATED_QUERY).await, vec![1, 4]);
-    // 3 labels (docs 1, 2, 4) + doc 1's chunked verify. Doc 4's passthrough
-    // verify is full text through the full-text prompt, the same request its
-    // label made, so it is free. Doc 2 is pruned.
-    assert_eq!(model.completion_calls(), 4);
+    // 3 labels (docs 1, 2, 4), and nothing else: each label decides its
+    // document for verify too. Doc 2 is pruned.
+    assert_eq!(model.completion_calls(), 3);
 }
 
 #[tokio::test]
@@ -549,9 +548,9 @@ async fn all_negative_sample_falls_back_to_the_default_floor() {
         Vec::<i64>::new()
     );
     // With no positives the floor stays at the default 0.35, which both
-    // docs clear: 2 labels + both chunked verifies. A wrongly raised floor
-    // would prune doc 2 → 3 calls.
-    assert_eq!(model.completion_calls(), 4);
+    // docs clear; their labels (2 calls) decide them, so no chunked verify
+    // follows.
+    assert_eq!(model.completion_calls(), 2);
 }
 
 #[tokio::test]
@@ -702,10 +701,9 @@ async fn uncertifiable_recall_target_prunes_nothing() {
         .filter(|input| !input.contains("sync"))
         .count();
     assert_eq!(
-        verified_negatives,
-        2 * MANY_NEGATIVES as usize,
-        "no floor: each negative is labeled on full text, then verified on \
-         its chunk rather than pruned",
+        verified_negatives, MANY_NEGATIVES as usize,
+        "no floor: each negative is judged on full text once — its label — \
+         and that verdict decides it, rather than the score",
     );
 }
 
@@ -905,7 +903,11 @@ async fn failed_labels_the_floor_keeps_do_not_stop_pruning() {
             .as_usize(),
         11,
     );
-    assert_eq!(metrics.sum_by_name("rows_pruned").unwrap().as_usize(), 10);
+    // Every negative is dropped: by the floor, or by the full-text label
+    // calibration just paid for, which decides the row first.
+    let pruned = metrics.sum_by_name("rows_pruned").unwrap().as_usize()
+        + metrics.sum_by_name("store_pruned").unwrap().as_usize();
+    assert_eq!(pruned, 10);
 }
 
 /// A failed label below the floor is a possible lost match. Six documents
@@ -1216,4 +1218,66 @@ async fn certifying_keeps_at_least_what_estimating_keeps() {
     }
     assert_eq!(kept[0], vec![1]);
     assert_eq!(kept[1], vec![1], "the certified funnel is at least as wide");
+}
+
+/// The calibrated floor itself, on rows the sample never labels: 200
+/// documents against a 64-document sample, so most rows are decided by the
+/// floor alone. Matches embed at 1.0 against 'sync'; near-misses (which the
+/// model rejects) at ~0.71, above the default 0.35 cosine floor; plain
+/// negatives at 0.0. The scan must prune the unsampled near-misses as well
+/// as the negatives, without labels for them.
+///
+/// With vectors to fit, calibration thresholds a learned proxy's
+/// probability, which separates near-misses on its own, so this does not
+/// isolate the floor being *raised*; `tests/proxy.rs`
+/// (`a_one_class_sample_falls_back_and_stays_correct`) pins that, on cosine.
+#[tokio::test]
+async fn the_calibrated_floor_prunes_rows_outside_the_sample() {
+    const MATCHES: i64 = 30;
+    const NEAR_MISSES: i64 = 100;
+    const NEGATIVES: i64 = 70;
+    let model =
+        Arc::new(MockModel::answering_yes_to(["match"]).embedding_by_theme(["sync", "noise"]));
+    let ctx = semcast_context(Arc::clone(&model) as _);
+    let rows: Vec<String> = (1..=MATCHES)
+        .map(|id| format!("({id}, 'sync match {id}')"))
+        .chain((1..=NEAR_MISSES).map(|n| format!("({}, 'sync noise {n}')", MATCHES + n)))
+        .chain((1..=NEGATIVES).map(|n| format!("({}, '{:04}')", MATCHES + NEAR_MISSES + n, n * 7)))
+        .collect();
+    ctx.sql(&format!(
+        "CREATE TABLE meetings AS SELECT * FROM (VALUES {}) AS t(meeting_id, transcript)",
+        rows.join(", "),
+    ))
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    create_semantic_index(&ctx, "meetings", "transcript", index_options(&dir))
+        .await
+        .unwrap();
+
+    let metrics = calibrated_scan_metrics(&ctx).await;
+    let by_floor = metrics.sum_by_name("rows_pruned").unwrap().as_usize();
+    let by_label = metrics.sum_by_name("store_pruned").unwrap().as_usize();
+    assert_eq!(
+        by_floor + by_label,
+        (NEAR_MISSES + NEGATIVES) as usize,
+        "every non-match is dropped"
+    );
+    // The 0.0 negatives alone are at most 70: pruning more means the scan
+    // also dropped unsampled near-misses, which score above the default floor.
+    assert!(
+        by_floor > NEGATIVES as usize,
+        "the calibrated scan must prune unsampled near-misses: {by_floor} by \
+         the scan, {by_label} by their labels"
+    );
+    // Only the sample is labelled and only unsampled matches are verified:
+    // nowhere near one call per row.
+    assert!(model.completion_calls() < 64 + MATCHES as usize);
+    assert_eq!(
+        matching_ids(&ctx, CALIBRATED_QUERY).await,
+        (1..=MATCHES).collect::<Vec<_>>()
+    );
 }

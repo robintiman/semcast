@@ -58,6 +58,12 @@ pub trait SemanticCache: std::fmt::Debug + Send + Sync {
     fn get(&self, key: &CacheKey) -> Option<CachedValue>;
     fn put(&self, key: CacheKey, value: CachedValue);
 
+    /// Look up several keys at once, answers in the order asked. A durable
+    /// cache reads them in one round trip; the default asks one by one.
+    fn get_many(&self, keys: &[CacheKey]) -> Vec<Option<CachedValue>> {
+        keys.iter().map(|key| self.get(key)).collect()
+    }
+
     /// Store verdicts that only make sense together (an extraction unit's
     /// fields). A durable cache commits them atomically, so a crash never
     /// leaves part of a group behind to be mixed with a later run's answers.

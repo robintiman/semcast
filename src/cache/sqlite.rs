@@ -328,7 +328,89 @@ impl SqliteCache {
     }
 }
 
+/// Most keys one batched read binds, well under SQLite's variable limit.
+const MAX_READ_BATCH: usize = 512;
+
+impl SqliteCache {
+    /// The verdicts committed to disk under `row_keys`, read in batches of
+    /// [`MAX_READ_BATCH`]. A failed read is logged and leaves its keys
+    /// missing: a miss costs a model call, never an answer.
+    fn committed_many(&self, row_keys: &[RowKey]) -> HashMap<RowKey, CachedValue> {
+        let mut found = HashMap::new();
+        let reader = self.reader.lock().expect("store lock poisoned");
+        for chunk in row_keys.chunks(MAX_READ_BATCH) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql =
+                format!("SELECT key, is_error, value FROM verdicts WHERE key IN ({placeholders})");
+            let read = reader.prepare_cached(&sql).and_then(|mut statement| {
+                let rows =
+                    statement.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                        Ok((
+                            row.get::<_, Vec<u8>>(0)?,
+                            row.get::<_, bool>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+            });
+            match read {
+                Ok(rows) => {
+                    for (key, is_error, value) in rows {
+                        let Ok(key) = RowKey::try_from(key.as_slice()) else {
+                            continue;
+                        };
+                        let value = if is_error {
+                            CachedValue::Error(value)
+                        } else {
+                            CachedValue::Value(value)
+                        };
+                        found.insert(key, value);
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(target: "semcast::store", %error, "store read failed; treating as a miss");
+                }
+            }
+        }
+        found
+    }
+}
+
 impl SemanticCache for SqliteCache {
+    fn get_many(&self, keys: &[CacheKey]) -> Vec<Option<CachedValue>> {
+        let row_keys: Vec<RowKey> = keys.iter().map(row_key).collect();
+        // What this instance already holds answers first, as in `get`.
+        let mut answers: Vec<Option<CachedValue>> = {
+            let stored = self.stored.lock().expect("store lock poisoned");
+            row_keys
+                .iter()
+                .map(|key| stored.get(key).cloned())
+                .collect()
+        };
+        let missing: Vec<RowKey> = row_keys
+            .iter()
+            .zip(&answers)
+            .filter(|(_, answer)| answer.is_none())
+            .map(|(key, _)| *key)
+            .collect();
+        if missing.is_empty() {
+            return answers;
+        }
+        // Not remembered in memory, unlike `get`: a lookup reads every row of
+        // a table, and pinning each answer would grow with the table rather
+        // than with what this instance has asked. Puts follow misses, so a
+        // key read here is put again only by a query that missed it before
+        // this read, a race `get` closes and this does not; the store keeps
+        // its first value on disk regardless.
+        let mut committed = self.committed_many(&missing);
+        for (key, answer) in row_keys.iter().zip(answers.iter_mut()) {
+            if answer.is_none() {
+                *answer = committed.remove(key);
+            }
+        }
+        answers
+    }
+
     fn get(&self, key: &CacheKey) -> Option<CachedValue> {
         let row_key = row_key(key);
         if let Some(value) = self
