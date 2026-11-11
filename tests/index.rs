@@ -1222,17 +1222,27 @@ async fn certifying_keeps_at_least_what_estimating_keeps() {
 
 /// The calibrated floor itself, on rows the sample never labels: 200
 /// documents against a 64-document sample, so most rows are decided by the
-/// floor alone. Matches embed at 1.0 and negatives at 0.0; the floor must
-/// prune the unsampled negatives, and keep every match.
+/// floor alone. Matches embed at 1.0 against 'sync'; near-misses (which the
+/// model rejects) at ~0.71, above the default 0.35 cosine floor; plain
+/// negatives at 0.0. The scan must prune the unsampled near-misses as well
+/// as the negatives, without labels for them.
+///
+/// With vectors to fit, calibration thresholds a learned proxy's
+/// probability, which separates near-misses on its own, so this does not
+/// isolate the floor being *raised*; `tests/proxy.rs`
+/// (`a_one_class_sample_falls_back_and_stays_correct`) pins that, on cosine.
 #[tokio::test]
 async fn the_calibrated_floor_prunes_rows_outside_the_sample() {
     const MATCHES: i64 = 30;
-    const NEGATIVES: i64 = 170;
-    let model = Arc::new(MockModel::answering_yes_to(["sync"]).embedding_by_theme(["sync"]));
+    const NEAR_MISSES: i64 = 100;
+    const NEGATIVES: i64 = 70;
+    let model =
+        Arc::new(MockModel::answering_yes_to(["match"]).embedding_by_theme(["sync", "noise"]));
     let ctx = semcast_context(Arc::clone(&model) as _);
     let rows: Vec<String> = (1..=MATCHES)
-        .map(|id| format!("({id}, 'sync {id}')"))
-        .chain((1..=NEGATIVES).map(|n| format!("({}, '{:04}')", MATCHES + n, n * 7)))
+        .map(|id| format!("({id}, 'sync match {id}')"))
+        .chain((1..=NEAR_MISSES).map(|n| format!("({}, 'sync noise {n}')", MATCHES + n)))
+        .chain((1..=NEGATIVES).map(|n| format!("({}, '{:04}')", MATCHES + NEAR_MISSES + n, n * 7)))
         .collect();
     ctx.sql(&format!(
         "CREATE TABLE meetings AS SELECT * FROM (VALUES {}) AS t(meeting_id, transcript)",
@@ -1253,13 +1263,15 @@ async fn the_calibrated_floor_prunes_rows_outside_the_sample() {
     let by_label = metrics.sum_by_name("store_pruned").unwrap().as_usize();
     assert_eq!(
         by_floor + by_label,
-        NEGATIVES as usize,
-        "every negative is dropped"
+        (NEAR_MISSES + NEGATIVES) as usize,
+        "every non-match is dropped"
     );
+    // The 0.0 negatives alone are at most 70: pruning more means the scan
+    // also dropped unsampled near-misses, which score above the default floor.
     assert!(
-        by_floor >= 100,
-        "most negatives sit outside the sample, so the floor must prune them: \
-         {by_floor} by the floor, {by_label} by their labels"
+        by_floor > NEGATIVES as usize,
+        "the calibrated scan must prune unsampled near-misses: {by_floor} by \
+         the scan, {by_label} by their labels"
     );
     // Only the sample is labelled and only unsampled matches are verified:
     // nowhere near one call per row.
