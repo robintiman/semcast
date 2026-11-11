@@ -152,3 +152,10 @@ WHERE EXISTS (SELECT 1 FROM customers c
 SELECT t.id FROM tickets t JOIN customers c
   ON t.customer_id = c.id AND t.body MEANS 'asks for a refund'
 WITH RECALL 0.9
+--- analyst: condition over both sides of a join
+SELECT t.id FROM tickets t JOIN customers c ON t.customer_id = c.id
+WHERE (c.name || ': ' || t.body) MEANS 'a customer complains about their own staff'
+--- analyst: outer join, joined side, with a recall target
+SELECT t.id, c.name FROM tickets t LEFT JOIN customers c
+  ON t.customer_id = c.id AND c.notes MEANS 'enterprise account'
+WITH RECALL 0.9

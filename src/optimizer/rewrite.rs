@@ -100,6 +100,21 @@ impl OptimizerRule for MeansRewriteRule {
             return crate::optimizer::classify::rewrite_projection(projection);
         }
 
+        // DataFusion pushes a WHERE condition over both sides of an inner join
+        // into the join itself. For an inner join an ON condition is a WHERE
+        // condition, so take the marked ones back out into a filter above.
+        let plan = match plan {
+            LogicalPlan::Join(join)
+                if join.join_type == datafusion::logical_expr::JoinType::Inner
+                    && join
+                        .filter
+                        .as_ref()
+                        .is_some_and(|f| contains_means(f).unwrap_or(false)) =>
+            {
+                return self.rewrite_join_filter(join);
+            }
+            other => other,
+        };
         let LogicalPlan::Filter(filter) = plan else {
             let mut holds_marker = false;
             for expr in plan.expressions() {
@@ -110,14 +125,7 @@ impl OptimizerRule for MeansRewriteRule {
             }
             return lift_below(plan);
         };
-        let mut lifts = false;
-        for conjunct in split_conjunction(&filter.predicate) {
-            lifts |= !is_means_call(conjunct) && contains_means(conjunct)?;
-        }
-        if lifts {
-            return self.rewrite_lifted_filter(filter);
-        }
-        self.rewrite_filter(filter)
+        self.rewrite_any_filter(filter)
     }
 }
 
@@ -211,6 +219,35 @@ fn passthrough_columns(plan: &LogicalPlan) -> Vec<Expr> {
 }
 
 impl MeansRewriteRule {
+    fn rewrite_any_filter(&self, filter: Filter) -> Result<Transformed<LogicalPlan>> {
+        let mut lifts = false;
+        for conjunct in split_conjunction(&filter.predicate) {
+            lifts |= !is_means_call(conjunct) && contains_means(conjunct)?;
+        }
+        if lifts {
+            return self.rewrite_lifted_filter(filter);
+        }
+        self.rewrite_filter(filter)
+    }
+
+    /// An inner join whose condition holds a `MEANS` (typically one over
+    /// both sides' columns, which DataFusion pushed down from the `WHERE`):
+    /// the join keeps its other conditions, and the marked ones filter its
+    /// output, rewritten at once so nothing pushes them back.
+    fn rewrite_join_filter(
+        &self,
+        mut join: datafusion::logical_expr::Join,
+    ) -> Result<Transformed<LogicalPlan>> {
+        let (marked, rest): (Vec<Expr>, Vec<Expr>) =
+            split_conjunction_owned(join.filter.take().expect("checked by the caller"))
+                .into_iter()
+                .partition(|conjunct| contains_means(conjunct).unwrap_or(false));
+        join.filter = conjunction(rest);
+        let predicate = conjunction(marked).expect("the join filter holds a MEANS");
+        let filter = Filter::try_new(predicate, Arc::new(LogicalPlan::Join(join)))?;
+        Ok(Transformed::yes(self.rewrite_any_filter(filter)?.data))
+    }
+
     /// A `WHERE` with a `MEANS` used as a value rather than as a top-level
     /// `AND` condition: under `NOT` or `OR`, compared, inside a `CASE`, or
     /// read through `CONFIDENCE()`.
@@ -445,7 +482,7 @@ pub fn apply_recall(
         }
     }
     // Only a MEANS that filters — a top-level AND condition of a WHERE,
-    // HAVING or inner join's ON — has a lossy pre-filter to calibrate. One used as a value
+    // HAVING or join's ON — has a lossy pre-filter to calibrate. One used as a value
     // (a label, under NOT or OR, inside CONFIDENCE()) asks every row it sees
     // and is exact already.
     let mut rewrites = 0usize;
@@ -483,12 +520,11 @@ pub fn apply_recall(
                 Transformed::no(filter)
             })
         }
-        // An inner join's ON condition becomes a filter on its own; the
-        // optimizer moves it there before the MEANS rewrite sees it.
-        LogicalPlan::Join(mut join)
-            if join.join_type == datafusion::logical_expr::JoinType::Inner
-                && join.filter.is_some() =>
-        {
+        // A join's ON conditions: the optimizer moves an inner join's, and an
+        // outer join's on the joined side, into filters before the MEANS
+        // rewrite sees them. One that must stay in the join is refused later
+        // whatever its recall, so attaching it there changes nothing.
+        LogicalPlan::Join(mut join) if join.filter.is_some() => {
             let (predicate, changed) = attach(join.filter.take().expect("checked above"));
             join.filter = Some(predicate);
             Ok(Transformed::new(

@@ -204,3 +204,64 @@ async fn with_recall_reaches_an_inner_join_condition() {
         );
     }
 }
+
+#[tokio::test]
+async fn with_recall_reaches_an_outer_joins_joined_side() {
+    let ctx = fixture().await;
+    let plan = semcast::sql(
+        &ctx,
+        "SELECT t.id FROM tickets t LEFT JOIN customers c \
+           ON t.customer_id = c.id AND c.notes MEANS 'enterprise account' \
+         WITH RECALL 0.9",
+    )
+    .await
+    .unwrap()
+    .into_optimized_plan()
+    .unwrap()
+    .display_indent()
+    .to_string();
+    let line = plan
+        .lines()
+        .find(|line| line.contains("enterprise account"))
+        .unwrap_or_else(|| panic!("{plan}"));
+    assert!(line.contains("0.90"), "{plan}");
+}
+
+/// A WHERE condition over both sides of an inner join, which DataFusion
+/// pushes into the join, filters the join's output.
+#[tokio::test]
+async fn a_condition_over_both_sides_of_a_join_filters_its_output() {
+    let model = Arc::new(MockModel::answering_yes_to(["Acme: furious"]));
+    let ctx = SemcastContextBuilder::new(Arc::clone(&model) as _).build();
+    for ddl in [
+        "CREATE TABLE tickets AS SELECT * FROM (VALUES (1, 10, 'furious'), (2, 20, 'furious'), \
+         (3, 10, 'fine')) AS t(id, customer_id, body)",
+        "CREATE TABLE customers AS SELECT * FROM (VALUES (10, 'Acme'), (20, 'Globex')) \
+         AS c(id, name)",
+    ] {
+        ctx.sql(ddl).await.unwrap().collect().await.unwrap();
+    }
+    let batches = semcast::sql(
+        &ctx,
+        "SELECT t.id FROM tickets t JOIN customers c ON t.customer_id = c.id \
+         WHERE (c.name || ': ' || t.body) MEANS 'x'",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+    let ids: Vec<i64> = batches
+        .iter()
+        .flat_map(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect();
+    assert_eq!(ids, [1]);
+    assert_eq!(model.completion_calls(), 3, "one call per joined row");
+}
