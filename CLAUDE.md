@@ -92,6 +92,15 @@ and the physical planner reach it via
 `state.config().get_extension::<SemcastRuntime>()`; that's the plumbing to reuse
 rather than threading new parameters through.
 
+### SemIR
+
+`src/semir/` is the redesign's semantic IR, built over DataFusion's resolved
+plan (DataFusion keeps the SQL front end). Every semantic question is an
+`ASK(input, instruction, type)`: its `expr_id` names the question (normalized
+instruction, type, model, prompt version, not the input), and its answer key
+adds a digest of the input text, which is the verdict store's row key. Today
+only `MEANS` (`AskType::Bool`) is on it.
+
 ### The funnel
 
 For `MEANS`, `SemcastExtensionPlanner` (`src/physical/planner.rs`) builds
@@ -116,8 +125,12 @@ assembled in the physical planner, not there.
 
 - `index::doc_hash` (FNV-1a) and `cache::stable_digest` (BLAKE3, 128-bit) must
   never change: index and cache entries outlive the process, and golden tests
-  pin both. `DefaultHasher` is only stable within one binary and must not key
-  anything durable.
+  pin both. So must SemIR's `normalize_instruction`, `question_id` (the
+  `expr_id`) and `answer_key` (`src/semir/`), and the store's `row_key`: a
+  `MEANS` condition is normalized where it enters (`destructure_means`) and
+  every key is built from it, so stored answers keep matching.
+  `DefaultHasher` is only stable within one binary and must not key anything
+  durable.
 - Cache keys carry a prompt version (`MEANS_PROMPT_VERSION`,
   `EXTRACT_PROMPT_VERSION`, `SemanticType::version`). Change a synthesized prompt
   and bump its constant, so stale verdicts are invalidated honestly.

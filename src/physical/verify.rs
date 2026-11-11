@@ -23,7 +23,7 @@ use datafusion::physical_plan::{
 };
 use futures::TryStreamExt;
 
-use crate::cache::{CacheKey, CachedValue, SemanticCache, stable_digest};
+use crate::cache::{CacheKey, CachedValue, SemanticCache};
 use crate::index::doc_hash;
 use crate::model::{CompletionRequest, ModelId, ModelProvider};
 use crate::physical::index_scan::ChunkEvidence;
@@ -143,7 +143,9 @@ impl VerifyExec {
         Self {
             input,
             text,
-            condition: condition.into(),
+            // Public constructor: normalize here too, so a caller outside
+            // the rewrite still asks (and keys) the one question.
+            condition: crate::semir::normalize_instruction(&condition.into()),
             model,
             cache,
             evidence,
@@ -365,19 +367,22 @@ impl Verifier {
 /// conditions into one call. Passing [`MEANS_PROMPT_VERSION`] is what declares
 /// "this request is byte-identical to a verify call, so share the entry";
 /// anything else keeps the two apart, which is the honest default.
+///
+/// It is the answer key of `ASK(input, condition, BOOL)`: see
+/// [`crate::semir`].
 pub(crate) fn means_cache_key(
     condition: &str,
     input: &str,
     model_id: &ModelId,
     prompt_version: &str,
 ) -> CacheKey {
-    CacheKey {
-        type_version: condition.to_owned(),
-        field: "means".to_owned(),
-        input_digest: stable_digest(&[input.as_bytes()]),
-        model_id: model_id.clone(),
-        prompt_version: prompt_version.to_owned(),
-    }
+    crate::semir::answer_key(
+        condition,
+        crate::semir::AskType::Bool,
+        input,
+        model_id,
+        prompt_version,
+    )
 }
 
 /// Where a verdict's P("yes") is kept: the verdict's own key, another field.

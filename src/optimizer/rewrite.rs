@@ -494,10 +494,20 @@ pub(crate) fn destructure_means(expr: Expr) -> Result<(Expr, String, Option<f64>
     }
     let mut args = args.into_iter();
     let text = args.next().expect("length checked above");
+    // Normalized here, where every MEANS enters, so the filter, the label,
+    // CONFIDENCE() and calibration all ask — and store — one question.
     let condition = match args.next().expect("length checked above") {
         Expr::Literal(ScalarValue::Utf8(Some(s)), _)
         | Expr::Literal(ScalarValue::LargeUtf8(Some(s)), _)
-        | Expr::Literal(ScalarValue::Utf8View(Some(s)), _) => s,
+        | Expr::Literal(ScalarValue::Utf8View(Some(s)), _) => {
+            let condition = crate::semir::normalize_instruction(&s);
+            if condition.is_empty() {
+                return plan_err!(
+                    "a MEANS condition cannot be empty: say what the text should mean"
+                );
+            }
+            condition
+        }
         other => {
             return plan_err!(
                 "the second argument of means() must be a string literal \
