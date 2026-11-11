@@ -16,7 +16,7 @@
 
 <div align="center">
   <p align="center">
-    A semantic SQL query engine you connect to with any Postgres client.
+    A semantic SQL query engine you connect to with a Postgres client.
     <br />
     <br />
     <a href="https://github.com/robintiman/semcast/issues/new?labels=bug">Report Bug</a>
@@ -39,7 +39,7 @@ Pick a provider:
 
 * **Ollama** (default, local, free) — `ollama pull gemma4:e4b` plus
   `nomic-embed-text`. Completions and embeddings, no API key.
-* **Anthropic** — `export ANTHROPIC_API_KEY=...`; defaults to Haiku, the right
+* **Anthropic** — `export ANTHROPIC_API_KEY=...`; defaults to `claude-haiku-4-5`, the right
   tier for one-word verify calls. No embeddings, so pair with Ollama or Voyage
   to index. Select with `--provider anthropic`.
 * **Voyage** — `export VOYAGE_API_KEY=...`; hosted embeddings for the semantic
@@ -55,7 +55,7 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/robintiman/semcast/rele
 
 Or download a tarball from the
 [latest release](https://github.com/robintiman/semcast/releases/latest).
-Then start the server and connect with any Postgres client:
+Then start the server and connect with a Postgres client:
 
 ```sh
 semcast serve                                                 # fully local (Ollama)
@@ -63,21 +63,8 @@ semcast serve --provider anthropic --embed-provider voyage    # hosted
 psql -h 127.0.0.1 -p 5433
 ```
 
-`semcast serve --help` lists the knobs: `--port` (5433), `--provider`,
-`--model`, `--embed-provider`, `--embed-model`, `--ollama-url`, `--index-dir`,
-`--store`, `--max-in-flight`. `--max-in-flight` (8) caps the model requests
-sent at once across all queries, and a separate embedder gets the same cap of
-its own; identical requests in flight are sent once. Set `--store semcast.db` to keep state across restarts. A verdict
-paid for once is free after the restart. Databases, schemas, external
-tables, views, semantic types and semantic indexes come back too. Indexes are
-reattached from where they were built, without re-embedding, so set
-`--index-dir` to a directory that outlives the temp dir. Not kept: in-memory
-tables (`CREATE TABLE ... AS`) and the views and indexes over them. A view must read files
-by absolute path (`FROM '/data/t.csv'`) or through an external table. A definition
-that fails to restore, such as a table whose file is gone or a view whose
-table was dropped, is logged and kept until the name is defined again or
-dropped (`DROP ... IF EXISTS`).
-Remove a semantic type with `DROP SEMANTIC TYPE [IF EXISTS] Name`.
+Simple query protocol only for now: `psql` works; DBeaver, JDBC and Grafana
+need the extended protocol (on the [roadmap](#roadmap)).
 
 Build from source:
 
@@ -88,11 +75,51 @@ cargo test                                         # full suite, no network
 cargo test --test live_ollama -- --ignored         # end-to-end against local Ollama
 ```
 
+### Configuration
+
+Flags of `semcast serve`:
+
+| Flag | Default | |
+|------|---------|---|
+| `--host` | `127.0.0.1` | listen address |
+| `--port` | `5433` | leaves a local Postgres on 5432 alone |
+| `--provider` | `ollama` | completions: `ollama` or `anthropic` |
+| `--model` | per provider | `gemma4:e4b` (Ollama), `claude-haiku-4-5` (Anthropic) |
+| `--scorer-model` | off | small Ollama model that pre-filters an unindexed `MEANS` under [`WITH RECALL`](#with-recall) |
+| `--embed-provider` | `ollama` | embeddings: `ollama` or `voyage` |
+| `--embed-model` | `nomic-embed-text` | Ollama embedding model |
+| `--voyage-model` | `voyage-4-large` | Voyage embedding model |
+| `--ollama-url` | `http://localhost:11434` | |
+| `--index-dir` | temp dir | where semantic indexes live |
+| `--store` | memory only | SQLite file; see [Persistence](#persistence) |
+| `--jobs-dir` | temp dir | batch job state and results |
+| `--max-in-flight` | `8` | model requests in flight across all queries; a separate embedder gets its own cap; identical requests are sent once |
+| `--max-concurrent-jobs` | `4` | `SUBMIT`ted jobs running at once |
+
+### Persistence
+
+Set `--store semcast.db` to keep state across restarts:
+
+* **Verdicts.** One paid for once is free after the restart.
+* **Definitions.** Databases, schemas, external tables, views, semantic types
+  and semantic indexes come back.
+* **Indexes** are reattached where they were built, without re-embedding, so
+  set `--index-dir` to a directory that outlives the temp dir. Same for
+  `--jobs-dir` and job results.
+* **Not kept:** in-memory tables (`CREATE TABLE ... AS`) and the views and
+  indexes over them.
+
+A view must read files by absolute path (`FROM '/data/t.csv'`) or through an
+external table. A definition that fails to restore, such as a table whose file
+is gone or a view whose table was dropped, is logged and kept until the name
+is defined again or dropped (`DROP ... IF EXISTS`).
+
 ## Usage
 
 ### SQL reference
 
-Everything semcast adds to SQL. All other SQL is DataFusion, unchanged. See full SQL reference [here](https://datafusion.apache.org/user-guide/sql/index.html).
+Everything semcast adds to SQL. All other SQL is DataFusion, unchanged: see
+[DataFusion's SQL reference](https://datafusion.apache.org/user-guide/sql/index.html).
 
 #### `MEANS`
 
@@ -100,9 +127,10 @@ Everything semcast adds to SQL. All other SQL is DataFusion, unchanged. See full
 <text_column> MEANS '<natural-language condition>'
 ```
 
-True when a model reading the text would say the condition holds. Allowed
-only as a top-level `AND` conjunct of `WHERE`. Any predicates in the same `WHERE` run first, so the model only sees
-their survivors.
+True when a model reading the text would say the condition holds. As a
+top-level `AND` conjunct of `WHERE` it filters, and only there can it prune
+(index, scorer, `WITH RECALL`). Other predicates in the same `WHERE` run
+first, so the model only sees their survivors.
 
 ```sql
 SELECT meeting_id, title FROM meetings
@@ -126,13 +154,11 @@ indexed column keeps its stack instead, since pruning rows beats a floor of one
 call each. Fused verdicts are cached under their own key, so a query that fuses
 does not reuse verdicts cached by a single-condition query.
 
-`MEANS` works anywhere an expression does: under `NOT` or `OR`, as a `GROUP BY`
-key, inside an aggregate or window function. There it can't prune, so every row
-reaching it is asked; `EXPLAIN` shows the cost. In `a OR x MEANS '…'`, rows `a`
-already matches skip the model. Text that is NULL has no verdict (NULL, as with
-`LIKE`), so `NOT` doesn't keep it. The one refusal is a `MEANS` on the kept
-side of an outer join's `ON` (`t` in `t LEFT JOIN c ON … AND t.body MEANS …`),
-which decides which rows find a match: compute it in a subquery first.
+`MEANS` also works anywhere else an expression does: under `NOT` or `OR`, as a
+`GROUP BY` key, inside an aggregate or window function. There it can't prune,
+so every row reaching it is asked; `EXPLAIN` shows the cost. In
+`a OR x MEANS '…'`, rows `a` already matches skip the model. Text that is NULL
+has no verdict (NULL, as with `LIKE`), so `NOT` doesn't keep it.
 
 ```sql
 SELECT id FROM tickets
@@ -142,6 +168,37 @@ SELECT CASE WHEN body MEANS 'customer is angry' THEN 'angry' ELSE 'calm' END
          AS mood, count(*)
 FROM tickets GROUP BY 1;
 ```
+
+Refused, because the `MEANS` would have to stay inside a join — compute it as
+a column in a subquery first:
+
+* on the kept side of an outer join's `ON` (`t` in
+  `t LEFT JOIN c ON … AND t.body MEANS …`);
+* inside a correlated subquery (`EXISTS`, `IN`) that reads the outer query's
+  columns or shares an `OR` with the correlation.
+
+`UPDATE` and `DELETE` refuse `MEANS`, `CONFIDENCE()` and subqueries in their
+`WHERE` (DataFusion would apply them to every row). Keep the other rows
+instead:
+
+```sql
+CREATE TABLE open_tickets AS SELECT * FROM tickets
+WHERE id NOT IN (SELECT id FROM tickets WHERE body MEANS 'resolved');
+```
+
+#### `CREATE SEMANTIC INDEX`
+
+```sql
+CREATE SEMANTIC INDEX ON <table>(<column>);
+```
+
+Chunks each value, embeds the chunks into a Lance dataset, and gives `MEANS`
+a cheap stage: one embedding call per query prunes non-candidates by vector
+similarity, and the verify model reads each survivor's top-3 chunks instead
+of the whole document. Optional for `MEANS` but highly recommended; required
+by `RELEVANCE TO`, `GROUP BY MEANING OF` and `SEMANTIC DISTINCT ON`.
+
+No `DROP` or `REFRESH` yet: run it again to rebuild after a load.
 
 #### `MEANS` in a `SELECT` list
 
@@ -180,7 +237,7 @@ CONFIDENCE(<text_column> MEANS '<condition>')   -- a DOUBLE in [0, 1]
 ```
 
 The model's probability that the `MEANS` holds, read from its yes/no answer.
-Goes in a `SELECT` list, a `WHERE`, or an `ORDER BY`. One model call per row,
+Goes wherever `MEANS` does. One model call per row,
 never fused, and shared with the same `MEANS` in a `WHERE`: whichever runs
 first pays.
 
@@ -196,15 +253,6 @@ probabilities (Ollama does; Anthropic doesn't). `ORDER BY … DESC` puts NULLs
 first; add `NULLS LAST`. Not to be confused with `WITH CONFIDENCE`, which
 qualifies a recall target.
 
-`UPDATE` and `DELETE` refuse `MEANS`, `CONFIDENCE()` and subqueries in their
-`WHERE` (DataFusion would apply them to every row). Keep the other rows
-instead:
-
-```sql
-CREATE TABLE open_tickets AS SELECT * FROM tickets
-WHERE id NOT IN (SELECT id FROM tickets WHERE body MEANS 'resolved');
-```
-
 #### `WITH RECALL`
 
 ```sql
@@ -215,13 +263,10 @@ Requires a `MEANS`. Calibrates the index-pruning
 threshold instead of guessing it. The scan labels a sample of surviving rows and sets the floor so
 the given fraction of true matches survive. Without it, thresholds are best-effort.
 
-Those labels also buy a better score to threshold. Similarity ranks documents
-by how close they are to the condition's *wording*, which is the same geometry
-whatever you asked; the labels say which documents actually matched. So the
-scan fits a small classifier over vectors the index already holds, and
-thresholds its probability instead — no extra embedding, no extra model call.
-Too few labels, or all of them one class, and it falls back to plain
-similarity.
+The labels also train a small classifier over vectors the index already
+holds, and the scan thresholds its probability instead of raw similarity — no
+extra embedding or model call. Too few labels, or all one class, and it falls
+back to similarity.
 
 ```sql
 SELECT meeting_id FROM meetings
@@ -272,8 +317,8 @@ relevance(<text_column>, '<natural-language query>')   -- the score, as a value
 ```
 
 Orders rows by how well the text answers the query, best first. Two stages:
-the index picks 4× `k` candidates by similarity, then one model call each
-scores them 0–1. Cost tracks `k`, not the table.
+the index picks 4× `k` candidates (at least 32) by similarity, then one model
+call each scores them 0–1. Cost tracks `k`, not the table.
 
 `LIMIT` and a semantic index are both required — without either, ranking is
 one model call per row of the whole table. The result is an approximate
@@ -291,17 +336,6 @@ The two forms are the same plan; `relevance()` also makes the score a value
 you can select. A bare `ORDER BY relevance(...)` sorts best-first — write
 `ASC` for worst-first.
 
-#### `CREATE SEMANTIC INDEX`
-
-```sql
-CREATE SEMANTIC INDEX ON <table>(<column>);
-```
-
-Chunks each value, embeds the chunks into a Lance dataset, and gives `MEANS`
-a cheap stage: one embedding call per query prunes non-candidates by vector
-similarity, and the verify model reads each survivor's top-3 chunks instead
-of the whole document. Optional but highly recommended. 
-
 #### `GROUP BY MEANING OF`
 
 ```sql
@@ -310,7 +344,7 @@ meaning_of(<text_column> [, <k>])   -- the label, as a value
 ```
 
 Groups rows by what they are about, when you don't already know the
-categories. Three stages: the index's vectors are clustered, then one model
+categories. Two stages: the index's vectors are clustered, then one model
 call per group reads its most central documents and names it. Cost tracks the
 number of groups, not rows.
 
@@ -390,6 +424,8 @@ semcast synthesizes the prompt and constrains decoding.
 Fields are extracted independently. `TOGETHER` groups (two or more fields) are generated in
 one shot, never pruned apart.
 
+Remove one with `DROP SEMANTIC TYPE [IF EXISTS] <Name>`.
+
 #### `CAST` and `EXTRACT`
 
 ```sql
@@ -407,12 +443,36 @@ SELECT CAST(transcript AS MeetingFacts).launch_stage FROM meetings;
 SELECT EXTRACT(products TEXT[] 'product names discussed' FROM transcript) FROM meetings;
 ```
 
+#### `SUBMIT`, `CANCEL JOB`, `job_result()`
+
+```sql
+SUBMIT <statement>                 -- returns a job_id
+SELECT ... FROM semcast_jobs       -- status, rows, model_calls, progress, error, ...
+SELECT * FROM job_result('<job_id>')
+CANCEL JOB '<job_id>'
+```
+
+Runs one statement detached from the connection, so a dropped link doesn't
+throw away model calls already made. `status` is `queued`, `running`,
+`succeeded`, `failed`, `cancelled` or `interrupted`.
+
+Results are Parquet under `--jobs-dir`, so they never have to fit in memory
+and finished jobs stay queryable across restarts. `--max-concurrent-jobs`
+caps how many run at once; the rest wait in `queued`. Set it to what your
+provider serves concurrently — against a single local model, more jobs is
+slower, not faster.
+
+A restart marks a job still in flight as `interrupted` rather than re-running
+it: a job can be a CTAS or `CREATE SEMANTIC INDEX` that already partly
+applied, so resuming is not idempotent and stays your call.
+
 ### Examples
 
-**Ingest** 
+**Ingest**
 
-Local Parquet and CSV, mount them as tables, or materialize into memory. Paths resolve on
-the server. Object storage (s3) is on the roadmap.
+Query local Parquet and CSV by path, mount them as tables, or materialize
+them into memory. Paths resolve on the server. Object storage (s3) is on the
+roadmap.
 
 ```sql
 SELECT * FROM 'data/meetings.parquet';
@@ -430,7 +490,7 @@ CREATE TABLE mem AS SELECT * FROM 'data/meetings.csv';
 CREATE SEMANTIC INDEX ON meetings(transcript);
 ```
 
-**Query** 
+**Query**
 
 The date filter runs free, the index prunes by similarity, the
 model verifies the few survivors.
@@ -461,7 +521,7 @@ FROM meetings
 WHERE transcript MEANS 'discussed the launch of offline sync in Atlas';
 ```
 
-**Persist** 
+**Persist**
 
 Save results as tables or files:
 
@@ -502,17 +562,6 @@ WHERE job_id = 'job_1753711331000_0000';
 SELECT * FROM job_result('job_1753711331000_0000');
 ```
 
-Results are Parquet under `--jobs-dir`, so they outlive the process and never
-have to fit in memory. `--max-concurrent-jobs` (4 by default) caps how many
-run at once; the rest wait in `queued`. Set it to what your provider serves
-concurrently — against a single local model, more jobs is slower, not faster.
-`CANCEL JOB '<id>'` stops one.
-
-A restart marks any job that was still in flight as `interrupted` rather than
-re-running it: a job can be a CTAS or `CREATE SEMANTIC INDEX` that already
-partly applied, so resuming is not idempotent and stays your call. Finished
-jobs stay queryable across restarts. One statement per `SUBMIT`.
-
 ## Roadmap
 
 - [x] `MEANS` — planner-integrated semantic predicate with batched verify
@@ -522,13 +571,7 @@ jobs stay queryable across restarts. One statement per `SUBMIT`.
 - [x] pgwire server (simple protocol) with funnel progress as NOTICE messages
 - [x] Ingestion — Parquet/CSV on disk: path-literal `SELECT`, `CREATE EXTERNAL TABLE`, CTAS, `COPY TO`
 - [x] Batch jobs — `SUBMIT` a statement, poll `semcast_jobs`, read `job_result()`
-- [ ] Persistent, cross-session verdict cache
-- [ ] Run artifacts — a query returns rows; the evidence lands beside it. Per-run
-      table of calls, cost and funnel counts, plus a per-row table of verdict,
-      margin and the chunk that decided it, joinable back to the result
-- [ ] Eval harness — calls saved and recall vs. the LLM-on-every-row baseline
-- [ ] Extended protocol (DBeaver, Grafana, JDBC)
-- [ ] Object storage (s3)
+- [x] Persistent, cross-session verdict cache and catalog — `--store`
 - [x] Rank — `ORDER BY … RELEVANCE TO … LIMIT k` and `relevance()` as a
       two-stage funnel: index similarity picks the candidates, a rerank pass
       orders them
@@ -540,6 +583,12 @@ jobs stay queryable across restarts. One statement per `SUBMIT`.
       auto-`k` by silhouette sweep
 - [x] Semantic dedupe — `SEMANTIC DISTINCT ON … WITH SIMILARITY`, no model
       calls at all
+- [ ] Run artifacts — a query returns rows; the evidence lands beside it. Per-run
+      table of calls, cost and funnel counts, plus a per-row table of verdict,
+      margin and the chunk that decided it, joinable back to the result
+- [ ] Eval harness — calls saved and recall vs. the LLM-on-every-row baseline
+- [ ] Extended protocol (DBeaver, Grafana, JDBC)
+- [ ] Object storage (s3)
 - [ ] Semantic join — `JOIN … ON a MEANS MATCH b` for entity resolution and
       schema mapping. Needs `means()` to accept a second column instead of only a
       literal, and an index-blocked candidate stage so it isn't a cross product
@@ -583,15 +632,5 @@ Project Link: [https://github.com/robintiman/semcast](https://github.com/robinti
 * [Lance](https://lancedb.github.io/lance/) — backs the semantic index
 
 <!-- MARKDOWN LINKS & IMAGES -->
-[contributors-shield]: https://img.shields.io/github/contributors/robintiman/semcast.svg?style=for-the-badge
-[contributors-url]: https://github.com/robintiman/semcast/graphs/contributors
-[forks-shield]: https://img.shields.io/github/forks/robintiman/semcast.svg?style=for-the-badge
-[forks-url]: https://github.com/robintiman/semcast/network/members
-[stars-shield]: https://img.shields.io/github/stars/robintiman/semcast.svg?style=for-the-badge
-[stars-url]: https://github.com/robintiman/semcast/stargazers
-[issues-shield]: https://img.shields.io/github/issues/robintiman/semcast.svg?style=for-the-badge
-[issues-url]: https://github.com/robintiman/semcast/issues
-[license-shield]: https://img.shields.io/github/license/robintiman/semcast.svg?style=for-the-badge
-[license-url]: https://github.com/robintiman/semcast/blob/main/LICENSE
 [bug-url]: https://github.com/robintiman/semcast/issues/new?labels=bug
 [feature-url]: https://github.com/robintiman/semcast/issues/new?labels=enhancement
