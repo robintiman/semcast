@@ -84,8 +84,24 @@ pub trait ChunkStore: std::fmt::Debug + Send + Sync {
     /// Every document `index` holds a chunk of, and each chunk that has a
     /// vector, read from one snapshot.
     fn scan(&self, index: &str, visit: &mut ChunkVisitor<'_>) -> Result<HashSet<u64>>;
-    /// Every document `index` holds.
-    fn doc_hashes(&self, index: &str) -> Result<HashSet<u64>>;
+    /// Every document `index` holds a vector of `dim` values for.
+    fn doc_hashes(&self, index: &str, dim: usize) -> Result<HashSet<u64>>;
+    /// Forget `index` and any half-built copy of it a crashed build left.
+    fn drop_index(&self, index: &str) -> Result<()> {
+        self.reset(index)
+    }
+}
+
+/// A scratch name no other build of the same index uses, so two concurrent
+/// builds never mix their chunks or swap in each other's half.
+fn scratch_name(index: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static BUILDS: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "{index}\u{0}building\u{0}{}\u{0}{}",
+        std::process::id(),
+        BUILDS.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 /// Chunks and vectors for the process only — the default without a store.
@@ -177,14 +193,24 @@ impl ChunkStore for MemoryChunkStore {
         Ok(docs)
     }
 
-    fn doc_hashes(&self, index: &str) -> Result<HashSet<u64>> {
-        Ok(self
+    fn doc_hashes(&self, index: &str, dim: usize) -> Result<HashSet<u64>> {
+        let chunks = self
             .chunks
             .lock()
             .expect("chunk store poisoned")
             .get(index)
-            .map(|chunks| chunks.iter().map(|chunk| chunk.doc_hash).collect())
-            .unwrap_or_default())
+            .cloned()
+            .unwrap_or_default();
+        let vectors = self.vectors.lock().expect("chunk store poisoned");
+        Ok(chunks
+            .iter()
+            .filter(|chunk| {
+                vectors
+                    .get(&chunk.embedding_key)
+                    .is_some_and(|vector| vector.len() == dim)
+            })
+            .map(|chunk| chunk.doc_hash)
+            .collect())
     }
 }
 
@@ -317,11 +343,25 @@ impl ChunkStore for SqliteChunkStore {
         self.insert_chunks(index, chunks)
     }
 
+    /// The index and every scratch copy of it: names from `index` NUL up to
+    /// (not including) `index` followed by byte 1.
+    fn drop_index(&self, index: &str) -> Result<()> {
+        self.writer
+            .lock()
+            .expect("chunk store poisoned")
+            .execute(
+                "DELETE FROM index_chunks WHERE index_name = ?1 \
+                 OR (index_name >= ?2 AND index_name < ?3)",
+                params![index, format!("{index}\u{0}"), format!("{index}\u{1}")],
+            )
+            .map(|_| ())
+            .map_err(store_err)
+    }
+
     /// Built under a scratch name in batches, then swapped in with one short
     /// transaction: the index serves its old chunks until the swap.
     fn replace(&self, index: &str, chunks: &[StoredChunk]) -> Result<()> {
-        let scratch = format!("{index}\u{0}building");
-        self.reset(&scratch)?;
+        let scratch = scratch_name(index);
         self.insert_chunks(&scratch, chunks)?;
         let mut connection = self.writer.lock().expect("chunk store poisoned");
         let transaction = connection.transaction().map_err(store_err)?;
@@ -377,13 +417,17 @@ impl ChunkStore for SqliteChunkStore {
         Ok(docs)
     }
 
-    fn doc_hashes(&self, index: &str) -> Result<HashSet<u64>> {
+    fn doc_hashes(&self, index: &str, dim: usize) -> Result<HashSet<u64>> {
         let connection = self.reader.lock().expect("chunk store poisoned");
         let mut statement = connection
-            .prepare_cached("SELECT DISTINCT doc_hash FROM index_chunks WHERE index_name = ?1")
+            .prepare_cached(
+                "SELECT DISTINCT c.doc_hash FROM index_chunks c \
+                 JOIN embeddings e ON e.key = c.embedding \
+                 WHERE c.index_name = ?1 AND length(e.vector) = ?2",
+            )
             .map_err(store_err)?;
         let hashes = statement
-            .query_map(params![index], |row| row.get::<_, i64>(0))
+            .query_map(params![index, (dim * 4) as i64], |row| row.get::<_, i64>(0))
             .map_err(store_err)?
             .map(|hash| hash.map(|hash| hash as u64).map_err(store_err))
             .collect::<Result<HashSet<u64>>>()?;
@@ -627,10 +671,14 @@ impl SemanticIndex for StoredIndex {
         Ok(docs)
     }
 
+    /// Only documents with a vector of this index's size: one refreshed
+    /// through an index of another size has no score here, and must pass
+    /// through rather than read as indexed-and-pruned.
     async fn indexed_doc_hashes(&self) -> Result<HashSet<u64>> {
         let store = Arc::clone(&self.store);
         let name = self.name.clone();
-        blocking(move || store.doc_hashes(&name)).await
+        let dim = self.dim;
+        blocking(move || store.doc_hashes(&name, dim)).await
     }
 
     async fn filter_scan(&self, query: &str, score_floor: f32) -> Result<FilterScan> {
@@ -748,6 +796,48 @@ mod tests {
         }
     }
 
+    /// Two builds of one index swapping in at once: the index ends up holding
+    /// one complete build, never a mix and never nothing.
+    #[test]
+    fn concurrent_replaces_leave_one_whole_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteChunkStore::open(dir.path().join("s.sqlite")).unwrap());
+        let model = ModelId("m".to_owned());
+        let key = embedding_key(&model, 2, "chunk");
+        store.put_vectors(&model, &[(key, vec![1.0, 0.0])]).unwrap();
+        for _ in 0..20 {
+            let builds: Vec<Vec<StoredChunk>> = [(0_u64, 50_u64), (1000, 30)]
+                .into_iter()
+                .map(|(start, n)| (start..start + n).map(|h| chunk(key, "chunk", h)).collect())
+                .collect();
+            let threads: Vec<_> = builds
+                .clone()
+                .into_iter()
+                .map(|build| {
+                    let store = Arc::clone(&store);
+                    std::thread::spawn(move || store.replace("t.c", &build).unwrap())
+                })
+                .collect();
+            for thread in threads {
+                thread.join().unwrap();
+            }
+            let held = store.doc_hashes("t.c", 2).unwrap();
+            let whole: Vec<HashSet<u64>> = builds
+                .iter()
+                .map(|build| build.iter().map(|c| c.doc_hash).collect())
+                .collect();
+            assert!(whole.contains(&held), "held {} docs", held.len());
+        }
+        store.drop_index("t.c").unwrap();
+        let leftovers: i64 = store
+            .writer
+            .lock()
+            .unwrap()
+            .query_row("SELECT count(*) FROM index_chunks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(leftovers, 0, "no scratch rows left behind");
+    }
+
     #[test]
     fn both_stores_agree() {
         let dir = tempfile::tempdir().unwrap();
@@ -776,15 +866,23 @@ mod tests {
                 .unwrap();
             assert_eq!(docs, HashSet::from([u64::MAX]), "u64 survives SQLite's i64");
             assert_eq!(seen, [(u64::MAX, 0, "chunk".to_owned(), vec![1.0, 0.0])]);
-            assert_eq!(store.doc_hashes("t.c").unwrap(), HashSet::from([u64::MAX]));
-            assert!(store.doc_hashes("other").unwrap().is_empty());
+            assert_eq!(
+                store.doc_hashes("t.c", 2).unwrap(),
+                HashSet::from([u64::MAX])
+            );
+            assert!(store.doc_hashes("other", 2).unwrap().is_empty());
+
+            assert!(
+                store.doc_hashes("t.c", 3).unwrap().is_empty(),
+                "a vector of another size doesn't count as indexed"
+            );
 
             // Replace swaps the whole index at once.
             store.replace("t.c", &[chunk(key, "chunk", 7)]).unwrap();
-            assert_eq!(store.doc_hashes("t.c").unwrap(), HashSet::from([7]));
+            assert_eq!(store.doc_hashes("t.c", 2).unwrap(), HashSet::from([7]));
 
-            store.reset("t.c").unwrap();
-            assert!(store.doc_hashes("t.c").unwrap().is_empty());
+            store.drop_index("t.c").unwrap();
+            assert!(store.doc_hashes("t.c", 2).unwrap().is_empty());
             assert_eq!(
                 store.vectors(&[key]).unwrap(),
                 [Some(vec![1.0, 0.0])],

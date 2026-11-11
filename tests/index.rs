@@ -931,7 +931,9 @@ async fn a_chunk_store_keeps_ddl_created_indexes() {
     // Another connection to the same file sees the index's documents.
     use semcast::index::stored::ChunkStore;
     let reopened = semcast::index::stored::SqliteChunkStore::open(&path).unwrap();
-    let docs = reopened.doc_hashes("meetings(transcript)").unwrap();
+    let docs = reopened
+        .scan("meetings(transcript)", &mut |_, _, _, _| {})
+        .unwrap();
     assert_eq!(docs, HashSet::from([doc_hash(MATCHING)]));
 }
 

@@ -114,13 +114,29 @@ impl SemcastRuntime {
                 }
                 keep
             });
-        // Its chunks go too; the vectors stay, as answers other indexes over
-        // the same text may read.
-        for column in dropped {
-            let name = crate::catalog::index_name(table, &column);
-            if let Err(error) = self.chunk_store.reset(&name) {
-                tracing::warn!(%name, %error, "could not delete a dropped index's chunks");
+        // Its chunks go too, half-built copies included; the vectors stay,
+        // as answers other indexes over the same text may read. Off the
+        // async workers, and not awaited: a leftover costs only space.
+        let names: Vec<String> = dropped
+            .iter()
+            .map(|column| crate::catalog::index_name(table, column))
+            .collect();
+        if names.is_empty() {
+            return;
+        }
+        let store = Arc::clone(&self.chunk_store);
+        let delete = move || {
+            for name in names {
+                if let Err(error) = store.drop_index(&name) {
+                    tracing::warn!(%name, %error, "could not delete a dropped index's chunks");
+                }
             }
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn_blocking(delete);
+            }
+            Err(_) => delete(),
         }
     }
 
