@@ -6,7 +6,8 @@
 -- where the statement comes from. Deliberate error tests are left out: they
 -- probe the error, not a query anyone means to run. The `analyst` entries
 -- are hand-written to cover shapes the other sources don't, including ones
--- semcast rejects today; they are what keeps the number honest.
+-- semcast still rejects (a grouping-set key, a condition that must stay in
+-- a join): they are what keeps the number from reading 100% by construction.
 
 --- README: MEANS
 SELECT meeting_id, title FROM meetings
@@ -137,3 +138,17 @@ SELECT id FROM tickets WHERE status = 'open' AND NOT body MEANS 'already resolve
 SELECT id FROM tickets t
 WHERE t.body MEANS 'is angry'
   AND t.customer_id IN (SELECT id FROM customers WHERE notes MEANS 'at risk of churn')
+--- analyst: rollup over a label
+SELECT body MEANS 'is angry' AS angry, status, count(*) FROM tickets
+GROUP BY ROLLUP (body MEANS 'is angry', status)
+--- analyst: condition on an outer join's kept side
+SELECT t.id, c.name FROM tickets t LEFT JOIN customers c
+  ON t.customer_id = c.id AND t.body MEANS 'mentions the account manager'
+--- analyst: correlated subquery sharing an OR with a MEANS
+SELECT t.id FROM tickets t
+WHERE EXISTS (SELECT 1 FROM customers c
+              WHERE c.id = t.customer_id OR c.notes MEANS 'is a reseller')
+--- analyst: inner join condition with a recall target
+SELECT t.id FROM tickets t JOIN customers c
+  ON t.customer_id = c.id AND t.body MEANS 'asks for a refund'
+WITH RECALL 0.9

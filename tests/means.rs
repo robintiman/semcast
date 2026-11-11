@@ -153,6 +153,25 @@ async fn means_under_or_asks_only_rows_still_unmatched() {
     assert_eq!(model.completion_calls(), 2, "meeting 3 was already matched");
 }
 
+/// A volatile disjunct can't guard: it would be evaluated twice and could
+/// disagree with itself. Every row is asked.
+#[tokio::test]
+async fn a_volatile_disjunct_does_not_skip_the_model() {
+    let model = Arc::new(MockModel::answering_yes_to(["offline sync"]));
+    let ctx = meetings_context_with_model(Arc::clone(&model)).await;
+    let ids = matching_ids(
+        &ctx,
+        "SELECT meeting_id FROM meetings WHERE random() >= 0 OR transcript MEANS 'x'",
+    )
+    .await;
+    assert_eq!(ids.len(), 3);
+    assert_eq!(
+        model.completion_calls(),
+        2,
+        "both non-NULL transcripts asked"
+    );
+}
+
 /// NOT keeps what the model says doesn't hold. A NULL transcript has no
 /// verdict, so — as with `NOT (NULL LIKE 'x')` — it is not kept.
 #[tokio::test]

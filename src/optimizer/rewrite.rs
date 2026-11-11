@@ -69,9 +69,10 @@ impl MeansRewriteRule {
 /// Where a marker still cannot go, named in every rejection.
 const LEGAL_POSITIONS: &str = "MEANS and CONFIDENCE() work anywhere an expression does in a \
      single-input step (WHERE, SELECT, GROUP BY, HAVING, ORDER BY, window and \
-     aggregate arguments), but not in a JOIN condition that stays in the join \
-     (one on an outer join's preserved side): compute it in a subquery as a \
-     column first, and join on that";
+     aggregate arguments), but not where they would have to stay inside a join: \
+     a condition on an outer join's preserved side, or one that shares an OR \
+     with a correlated subquery's correlation. Compute it as a column in a \
+     subquery first, then join or filter on that column";
 
 impl OptimizerRule for MeansRewriteRule {
     fn name(&self) -> &str {
@@ -134,6 +135,18 @@ fn lift_below(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
     let [input] = inputs.as_slice() else {
         return plan_err!("{LEGAL_POSITIONS} (found it in a {} node)", plan.display());
     };
+    // A grouping set's keys sit inside one expression, so their names can't
+    // be preserved one by one, and the projection above would lose them.
+    if let LogicalPlan::Aggregate(aggregate) = &plan {
+        for group in &aggregate.group_expr {
+            if matches!(group, Expr::GroupingSet(_)) && contains_means(group)? {
+                return plan_err!(
+                    "MEANS and CONFIDENCE() can't be a ROLLUP, CUBE or GROUPING SETS key: \
+                     compute the label as a column in a subquery, then group by it"
+                );
+            }
+        }
+    }
     let input = (*input).clone();
     let original = Arc::clone(plan.schema());
     let preserver = NamePreserver::new(&plan);
@@ -170,7 +183,9 @@ fn or_guard(conjunct: &Expr) -> Result<Option<Expr>> {
     }
     let mut unmatched = Vec::new();
     for disjunct in disjuncts {
-        if !contains_means(disjunct)? {
+        // A volatile disjunct is evaluated twice, in the guard and in the
+        // filter, and could disagree: skip a row, then not match it either.
+        if !contains_means(disjunct)? && !disjunct.is_volatile() {
             unmatched.push(disjunct.clone().is_not_true());
         }
     }
@@ -429,17 +444,14 @@ pub fn apply_recall(
             );
         }
     }
-    // Only a MEANS that filters — a top-level AND condition of a WHERE or
-    // HAVING — has a lossy pre-filter to calibrate. One used as a value
+    // Only a MEANS that filters — a top-level AND condition of a WHERE,
+    // HAVING or inner join's ON — has a lossy pre-filter to calibrate. One used as a value
     // (a label, under NOT or OR, inside CONFIDENCE()) asks every row it sees
     // and is exact already.
     let mut rewrites = 0usize;
-    let transformed = plan.transform_up(|plan| {
-        let LogicalPlan::Filter(filter) = plan else {
-            return Ok(Transformed::no(plan));
-        };
+    let mut attach = |predicate: Expr| -> (Expr, bool) {
         let mut changed = false;
-        let conjuncts = split_conjunction_owned(filter.predicate)
+        let conjuncts = split_conjunction_owned(predicate)
             .into_iter()
             .map(|conjunct| match conjunct {
                 Expr::ScalarFunction(mut call)
@@ -458,13 +470,34 @@ pub fn apply_recall(
                 other => other,
             })
             .collect::<Vec<_>>();
-        let predicate = conjunction(conjuncts).expect("a filter has a predicate");
-        let filter = LogicalPlan::Filter(Filter::try_new(predicate, filter.input)?);
-        Ok(if changed {
-            Transformed::yes(filter)
-        } else {
-            Transformed::no(filter)
-        })
+        let predicate = conjunction(conjuncts).expect("a predicate has a conjunct");
+        (predicate, changed)
+    };
+    let transformed = plan.transform_up(|plan| match plan {
+        LogicalPlan::Filter(filter) => {
+            let (predicate, changed) = attach(filter.predicate);
+            let filter = LogicalPlan::Filter(Filter::try_new(predicate, filter.input)?);
+            Ok(if changed {
+                Transformed::yes(filter)
+            } else {
+                Transformed::no(filter)
+            })
+        }
+        // An inner join's ON condition becomes a filter on its own; the
+        // optimizer moves it there before the MEANS rewrite sees it.
+        LogicalPlan::Join(mut join)
+            if join.join_type == datafusion::logical_expr::JoinType::Inner
+                && join.filter.is_some() =>
+        {
+            let (predicate, changed) = attach(join.filter.take().expect("checked above"));
+            join.filter = Some(predicate);
+            Ok(Transformed::new(
+                LogicalPlan::Join(join),
+                changed,
+                TreeNodeRecursion::Continue,
+            ))
+        }
+        other => Ok(Transformed::no(other)),
     })?;
     if rewrites == 0 {
         return plan_err!(

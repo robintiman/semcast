@@ -164,6 +164,12 @@ fn case_guard(case: &Case, outer: &Option<Expr>) -> Result<Option<Expr>> {
         if contains_means(when)? {
             break;
         }
+        // A volatile condition would be evaluated twice, here and in the
+        // CASE, and the two could disagree: the guard would skip a row the
+        // CASE then sends to this branch. Leave it out; that only asks more.
+        if when.is_volatile() {
+            continue;
+        }
         leading.push((**when).clone().is_not_true());
     }
     Ok(match (outer.clone(), conjunction(leading)) {

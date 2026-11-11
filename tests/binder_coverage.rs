@@ -164,3 +164,43 @@ async fn only_an_outer_joins_preserved_side_condition_is_refused() {
     let error = bind(&ctx, outer).await.unwrap_err();
     assert!(error.contains("single-input step"), "{error}");
 }
+
+#[tokio::test]
+async fn a_grouping_set_over_a_label_is_refused_clearly() {
+    let ctx = fixture().await;
+    let error = bind(
+        &ctx,
+        "SELECT body MEANS 'is angry' AS angry, count(*) FROM tickets \
+         GROUP BY ROLLUP (body MEANS 'is angry')",
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("ROLLUP, CUBE or GROUPING SETS"), "{error}");
+}
+
+#[tokio::test]
+async fn with_recall_reaches_an_inner_join_condition() {
+    let ctx = fixture().await;
+    let plan = semcast::sql(
+        &ctx,
+        "SELECT t.id FROM tickets t JOIN customers c \
+           ON t.customer_id = c.id AND t.body MEANS 'asks for a refund' \
+         WHERE c.notes MEANS 'enterprise account' WITH RECALL 0.9",
+    )
+    .await
+    .unwrap()
+    .into_optimized_plan()
+    .unwrap()
+    .display_indent()
+    .to_string();
+    for condition in ["asks for a refund", "enterprise account"] {
+        let line = plan
+            .lines()
+            .find(|line| line.contains(condition))
+            .unwrap_or_else(|| panic!("{plan}"));
+        assert!(
+            line.contains("0.90"),
+            "{condition} should be calibrated: {plan}"
+        );
+    }
+}
