@@ -284,3 +284,60 @@ async fn means_and_cast_compose_extraction_runs_on_survivors_only() {
         .count();
     assert_eq!(schema_calls, 1, "extraction runs only on the survivor");
 }
+
+/// Regression: a flat `max_tokens` truncated a wide extraction mid-JSON, the
+/// truncated object failed to decode, and every row was dropped as an error —
+/// after paying for the model call. The ceiling has to scale with how many
+/// fields the request actually asks the model to fill.
+#[tokio::test]
+async fn generation_ceiling_scales_with_the_fields_requested() {
+    let mock = Arc::new(MockModel::answering_json_with(
+        |_| serde_json::json!({"launch_stage": "none", "stage_quote": "q"}),
+    ));
+    let ctx = facts_context_with(semcast_context(Arc::clone(&mock) as Arc<_>)).await;
+
+    // Two fields (the TOGETHER closure) sits at the floor.
+    rows(
+        &ctx,
+        "SELECT CAST(transcript AS MeetingFacts).launch_stage FROM meetings",
+    )
+    .await;
+    let narrow = mock.completion_max_tokens();
+    assert!(!narrow.is_empty(), "extraction made model calls");
+    let narrow_ceiling = narrow[0];
+
+    // A type wide enough to need more room than the floor gets it.
+    ctx.sql("CREATE TABLE docs AS SELECT 1 AS id, 'a doc' AS body")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let fields: Vec<String> = (0..20)
+        .map(|i| format!("f{i} TEXT 'field number {i}'"))
+        .collect();
+    semcast::sql(
+        &ctx,
+        &format!("CREATE SEMANTIC TYPE Wide AS ({})", fields.join(", ")),
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    let projection: Vec<String> = (0..20)
+        .map(|i| format!("CAST(body AS Wide).f{i} AS f{i}"))
+        .collect();
+    rows(&ctx, &format!("SELECT {} FROM docs", projection.join(", "))).await;
+
+    let wide_ceiling = *mock
+        .completion_max_tokens()
+        .last()
+        .expect("wide extraction made a model call");
+    assert!(
+        wide_ceiling > narrow_ceiling,
+        "a 20-field request must get more room than a 2-field one \
+         (narrow={narrow_ceiling}, wide={wide_ceiling})",
+    );
+}
