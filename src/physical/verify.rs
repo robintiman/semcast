@@ -307,12 +307,8 @@ impl Verifier {
                 continue;
             }
             let text = texts.value(row);
-            if let Some(verdict) = self
-                .store
-                .as_deref()
-                .and_then(|store| store.verdict(doc_hash(text)))
-            {
-                self.cache_hits.add(1);
+            if let Some(verdict) = self.store.as_deref().and_then(|store| store.verdict(text)) {
+                // Counted by the store lookup, not as a cache hit here.
                 *keep_row = verdict;
                 continue;
             }

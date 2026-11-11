@@ -110,8 +110,10 @@ column, and `StoreLookupExec → VerifyExec` otherwise (correct, full price).
 batch (`SemanticCache::get_many`) and records every stored full-text verdict in
 `StoreEvidence`; each later stage decides those rows by it (no pruning of a
 known match, no call for any known row). It drops nothing itself, so a
-calibrating stage samples the same rows every run and finds its labels stored. The two operators share a
-planning-time `ChunkEvidence` channel: the scan fills it with each surviving
+calibrating stage samples the same rows every run and finds its labels stored;
+calibration labels are recorded into the same evidence as they land.
+
+The index scan and verify also share a planning-time `ChunkEvidence` channel: the scan fills it with each surviving
 document's top chunks, verify reads it per row, keyed by `doc_hash` so it survives
 repartitioning. `WITH RECALL` makes the scan calibrate its own threshold at
 execution time (`src/optimizer/calibrate.rs`) by labeling a sample.

@@ -196,3 +196,50 @@ async fn get_many_reads_in_order_across_memory_and_disk() {
         ]
     );
 }
+
+/// A calibration label is a full-text verdict bought during the query; verify
+/// must not ask the weaker chunked question for the same document, and a
+/// repeat query must return the same rows.
+#[tokio::test]
+async fn calibration_labels_decide_their_rows_in_the_same_query() {
+    let model = Arc::new(MockModel::answering_yes_to(["qqqq"]));
+    let ctx = SemcastContextBuilder::new(Arc::clone(&model) as _).build();
+    ctx.sql(
+        "CREATE TABLE docs AS SELECT * FROM (VALUES
+             (1, 'sync sync sync qqqq qqqx qqqy'),
+             (2, 'filler words here')
+         ) AS t(id, body)",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    create_semantic_index(
+        &ctx,
+        "docs",
+        "body",
+        IndexOptions {
+            path: Some(dir.path().join("idx.lance")),
+            chunk: semcast::index::chunk::ChunkConfig {
+                max_tokens: 4,
+                overlap_tokens: 0,
+            },
+            search: SearchParams {
+                score_floor: f32::NEG_INFINITY,
+                chunks_per_doc: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let query = "SELECT id FROM docs WHERE body MEANS 'sync' WITH RECALL 0.9";
+    assert_eq!(ids(&ctx, query).await, [1], "the full-text label wins");
+    let calls = model.completion_calls();
+    assert_eq!(calls, 2, "two labels, no chunked call");
+    assert_eq!(ids(&ctx, query).await, [1], "the same rows again");
+    assert_eq!(model.completion_calls(), calls);
+}

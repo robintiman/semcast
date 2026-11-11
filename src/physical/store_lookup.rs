@@ -42,36 +42,51 @@ use datafusion::physical_plan::{
 };
 use futures::TryStreamExt;
 
-use crate::cache::{CachedValue, SemanticCache};
-use crate::index::doc_hash;
+use crate::cache::{CachedValue, SemanticCache, stable_digest};
 use crate::model::ModelId;
 use crate::physical::verify::{MEANS_PROMPT_VERSION, means_cache_key};
 use crate::semir::{AskType, question_id};
 
 /// The store's verdicts for a funnel's documents, shared from the lookup to
-/// every later stage of the same funnel. Keyed by [`doc_hash`], so it
-/// survives any repartitioning between the stages.
+/// every later stage of the same funnel (and filled in by calibration as it
+/// labels). Keyed by the text's 128-bit [`stable_digest`] — the digest the
+/// store's own keys use — so it survives any repartitioning between stages
+/// and two texts never share a verdict by a hash collision.
 #[derive(Debug, Default)]
 pub struct StoreEvidence {
-    known: RwLock<HashMap<u64, bool>>,
+    known: RwLock<HashMap<u128, bool>>,
 }
 
 impl StoreEvidence {
-    /// The stored verdict for this document, if the store has one.
-    pub fn verdict(&self, doc_hash: u64) -> Option<bool> {
+    /// The stored full-text verdict for this text, if there is one.
+    pub fn verdict(&self, text: &str) -> Option<bool> {
         self.known
             .read()
             .expect("store evidence lock poisoned")
-            .get(&doc_hash)
+            .get(&text_digest(text))
             .copied()
     }
 
-    fn record(&self, verdicts: impl IntoIterator<Item = (u64, bool)>) {
+    /// Remember full-text verdicts learned during the query — calibration
+    /// labels — so later stages read them as they read the store's.
+    pub(crate) fn record<'a>(&self, verdicts: impl IntoIterator<Item = (&'a str, bool)>) {
+        self.record_digests(
+            verdicts
+                .into_iter()
+                .map(|(text, verdict)| (text_digest(text), verdict)),
+        );
+    }
+
+    fn record_digests(&self, verdicts: impl IntoIterator<Item = (u128, bool)>) {
         self.known
             .write()
             .expect("store evidence lock poisoned")
             .extend(verdicts);
     }
+}
+
+fn text_digest(text: &str) -> u128 {
+    stable_digest(&[text.as_bytes()])
 }
 
 /// Learns what the store already knows about a `MEANS` filter's rows.
@@ -179,7 +194,14 @@ impl ExecutionPlan for StoreLookupExec {
         });
         let stream = input.and_then(move |batch| {
             let lookup = Arc::clone(&lookup);
-            async move { lookup.lookup_batch(batch) }
+            // The store read can block on disk: keep it off the async workers.
+            async move {
+                tokio::task::spawn_blocking(move || lookup.lookup_batch(batch))
+                    .await
+                    .map_err(|error| {
+                        datafusion::error::DataFusionError::External(Box::new(error))
+                    })?
+            }
         });
         let output = Box::pin(RecordBatchStreamAdapter::new(self.input.schema(), stream));
         Ok(crate::physical::trace::trace_stage(
@@ -258,9 +280,9 @@ impl Lookup {
             } else {
                 self.store_non_matches.add(1);
             }
-            verdicts.push((doc_hash(texts.value(row)), verdict));
+            verdicts.push((text_digest(texts.value(row)), verdict));
         }
-        self.evidence.record(verdicts);
+        self.evidence.record_digests(verdicts);
         Ok(batch)
     }
 }

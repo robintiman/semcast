@@ -289,8 +289,8 @@ struct Scanner {
 }
 
 impl Scanner {
-    fn stored_verdict(&self, hash: u64) -> Option<bool> {
-        self.store.as_deref().and_then(|store| store.verdict(hash))
+    fn stored_verdict(&self, text: &str) -> Option<bool> {
+        self.store.as_deref().and_then(|store| store.verdict(text))
     }
 
     async fn score_then_scan(
@@ -344,8 +344,9 @@ impl Scanner {
                     self.rows_pruned.add(1);
                     continue;
                 }
-                let hash = doc_hash(texts.value(row));
-                let stored = self.stored_verdict(hash);
+                let text = texts.value(row);
+                let hash = doc_hash(text);
+                let stored = self.stored_verdict(text);
                 match scores.get(&hash) {
                     _ if stored == Some(false) => self.rows_pruned.add(1),
                     _ if labelled.contains(&hash) || stored == Some(true) => *keep_row = true,
@@ -390,7 +391,7 @@ impl Scanner {
                 // A stored verdict decides the row whatever it scores: don't
                 // pay for a score.
                 if !asked.insert(hash)
-                    || (self.stored_verdict(hash).is_some() && !sampled.contains(&hash))
+                    || (self.stored_verdict(text).is_some() && !sampled.contains(&hash))
                 {
                     continue;
                 }
@@ -488,6 +489,7 @@ impl Scanner {
     ) -> (Calibration, Vec<Label>) {
         let calibration = &self.calibration;
         let labeler = Labeler {
+            evidence: self.store.as_deref(),
             condition: &self.condition,
             model: calibration.model.as_ref(),
             cache: calibration.cache.as_ref(),

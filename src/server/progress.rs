@@ -42,6 +42,8 @@ pub struct FunnelCounts {
     pub store_matches: usize,
     pub store_non_matches: usize,
     pub has_index_scan: bool,
+    pub index_store_decided: usize,
+    pub index_store_pruned: usize,
     pub has_scorer: bool,
     pub scorer_calls: usize,
     pub scorer_cache_hits: usize,
@@ -141,6 +143,8 @@ pub fn snapshot(plan: &Arc<dyn ExecutionPlan>) -> FunnelCounts {
                 counts.has_index_scan = true;
                 if let Some(metrics) = metrics {
                     counts.index_hits += counter_total(&metrics, "index_hits");
+                    counts.index_store_decided += counter_total(&metrics, "store_known");
+                    counts.index_store_pruned += counter_total(&metrics, "store_pruned");
                     counts.rows_pruned += counter_total(&metrics, "rows_pruned");
                     counts.calibration_sampled_rows +=
                         counter_total(&metrics, "calibration_sampled_rows");
@@ -258,10 +262,18 @@ pub fn render(counts: &FunnelCounts) -> String {
         ));
     }
     if counts.has_index_scan {
-        parts.push(format!(
+        let mut scan = format!(
             "index scan: {} hits, {} pruned",
-            counts.index_hits, counts.rows_pruned,
-        ));
+            counts.index_hits,
+            counts.rows_pruned + counts.index_store_pruned,
+        );
+        if counts.index_store_decided > 0 {
+            scan.push_str(&format!(
+                ", {} decided by the store ({} of them pruned)",
+                counts.index_store_decided, counts.index_store_pruned,
+            ));
+        }
+        parts.push(scan);
     }
     if counts.has_scorer {
         let mut scorer = format!(

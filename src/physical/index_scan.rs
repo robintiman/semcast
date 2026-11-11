@@ -307,6 +307,7 @@ impl ExecutionPlan for IndexScanExec {
             calibration_label_errors: MetricBuilder::new(&self.metrics)
                 .counter("calibration_label_errors", partition),
             store_known: MetricBuilder::new(&self.metrics).counter("store_known", partition),
+            store_pruned: MetricBuilder::new(&self.metrics).counter("store_pruned", partition),
         });
         let stream: BoxStream<'_, Result<RecordBatch>> = if scanner.calibration.is_some() {
             // Calibration samples the whole input before anything can be
@@ -370,6 +371,8 @@ struct Scanner {
     calibration_label_errors: Count,
     /// Rows decided by the store's verdict rather than the score.
     store_known: Count,
+    /// Of those, the known non-matches the scan dropped.
+    store_pruned: Count,
 }
 
 impl Scanner {
@@ -390,10 +393,16 @@ impl Scanner {
                 self.rows_pruned.add(1);
                 continue;
             }
-            let hash = doc_hash(texts.value(row));
-            if let Some(verdict) = self.store.as_deref().and_then(|store| store.verdict(hash)) {
+            let text = texts.value(row);
+            let hash = doc_hash(text);
+            if let Some(verdict) = self.store.as_deref().and_then(|store| store.verdict(text)) {
                 // The store's full-text verdict is final, whatever the score.
+                // Counted apart from `rows_pruned`, which stays what the
+                // score decided.
                 self.store_known.add(1);
+                if !verdict {
+                    self.store_pruned.add(1);
+                }
                 *keep_row = verdict;
             } else if result.chunks.contains_key(&hash) {
                 self.index_hits.add(1);
@@ -658,6 +667,7 @@ impl Scanner {
     /// Ground-truth labels for the sample; see [`Labeler`].
     async fn label_sample(&self, calibration: &CalibrationConfig, sample: &[String]) -> Vec<Label> {
         Labeler {
+            evidence: self.store.as_deref(),
             condition: &self.condition,
             model: calibration.model.as_ref(),
             cache: calibration.cache.as_ref(),

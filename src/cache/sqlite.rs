@@ -396,15 +396,16 @@ impl SemanticCache for SqliteCache {
         if missing.is_empty() {
             return answers;
         }
-        let committed = self.committed_many(&missing);
-        let mut stored = self.stored.lock().expect("store lock poisoned");
+        // Not remembered in memory, unlike `get`: a lookup reads every row of
+        // a table, and pinning each answer would grow with the table rather
+        // than with what this instance has asked. Puts follow misses, so a
+        // key read here is put again only by a query that missed it before
+        // this read, a race `get` closes and this does not; the store keeps
+        // its first value on disk regardless.
+        let mut committed = self.committed_many(&missing);
         for (key, answer) in row_keys.iter().zip(answers.iter_mut()) {
-            if answer.is_some() {
-                continue;
-            }
-            if let Some(value) = committed.get(key) {
-                // Remembered, so a later put backs off: see `get`.
-                *answer = Some(stored.entry(*key).or_insert_with(|| value.clone()).clone());
+            if answer.is_none() {
+                *answer = committed.remove(key);
             }
         }
         answers
