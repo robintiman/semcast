@@ -500,7 +500,13 @@ pub(crate) fn destructure_means(expr: Expr) -> Result<(Expr, String, Option<f64>
         Expr::Literal(ScalarValue::Utf8(Some(s)), _)
         | Expr::Literal(ScalarValue::LargeUtf8(Some(s)), _)
         | Expr::Literal(ScalarValue::Utf8View(Some(s)), _) => {
-            crate::semir::normalize_instruction(&s)
+            let condition = crate::semir::normalize_instruction(&s);
+            if condition.is_empty() {
+                return plan_err!(
+                    "a MEANS condition cannot be empty: say what the text should mean"
+                );
+            }
+            condition
         }
         other => {
             return plan_err!(

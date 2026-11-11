@@ -467,9 +467,9 @@ mod tests {
     /// read by the next. Pinned on the key SemIR builds for a `MEANS` answer.
     #[test]
     fn row_key_matches_golden_value() {
-        let key = crate::semir::answer_key(
+        // Through `means_cache_key`, the builder every MEANS call site uses.
+        let key = crate::physical::verify::means_cache_key(
             "the customer is angry",
-            crate::semir::AskType::Bool,
             "I am furious",
             &ModelId("ollama/gemma4:e4b".to_owned()),
             "means-v2",

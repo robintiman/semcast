@@ -19,7 +19,9 @@
 //! Both are durable — stored answers outlive the process — so, like
 //! [`crate::index::doc_hash`], the normalization and the digests must never
 //! change; golden tests pin them. The key layout is the one the store has
-//! always used, so introducing SemIR invalidates no stored answer.
+//! always used, so introducing SemIR invalidates only answers stored under a
+//! condition that wasn't already normalized (stray or repeated whitespace):
+//! those are asked once more, under the normalized key.
 
 use datafusion::logical_expr::Expr;
 
@@ -50,9 +52,15 @@ impl AskType {
 pub struct ExprId(pub u128);
 
 impl std::fmt::Display for ExprId {
-    /// The first 8 bytes in hex — enough to tell questions apart in a plan.
+    /// The digest's first 8 bytes in hex — enough to tell questions apart in
+    /// a plan.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:016x}", (self.0 >> 64) as u64)
+        // `stable_digest` reads its 16 bytes little-endian, so the first 8
+        // are the low half, in little-endian order.
+        for byte in (self.0 as u64).to_le_bytes() {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
     }
 }
 
@@ -88,13 +96,16 @@ impl Ask {
 ///
 /// A digest of exactly the [`CacheKey`] fields that name the question (every
 /// field but the input), so the question id and the store's row keys are two
-/// views of one layout.
+/// views of one layout. `instruction` must already be normalized
+/// ([`normalize_instruction`]); it is not normalized again here, since keys
+/// are built per row.
 pub fn question_id(
     instruction: &str,
     output: AskType,
     model: &ModelId,
     prompt_version: &str,
 ) -> ExprId {
+    debug_assert_eq!(normalize_instruction(instruction), instruction);
     ExprId(stable_digest(&[
         instruction.as_bytes(),
         output.field().as_bytes(),
@@ -105,7 +116,8 @@ pub fn question_id(
 
 /// The store key for one answer: the question, plus a digest of the text it
 /// was asked about. The same layout the store has always used, so stored
-/// answers are found by every build.
+/// answers are found by every build. `instruction` must already be
+/// normalized, as for [`question_id`].
 pub fn answer_key(
     instruction: &str,
     output: AskType,
@@ -113,6 +125,7 @@ pub fn answer_key(
     model: &ModelId,
     prompt_version: &str,
 ) -> CacheKey {
+    debug_assert_eq!(normalize_instruction(instruction), instruction);
     CacheKey {
         type_version: instruction.to_owned(),
         field: output.field().to_owned(),
@@ -148,6 +161,11 @@ mod tests {
             "the customer is angry"
         );
         assert_eq!(normalize_instruction("Is Angry?"), "Is Angry?");
+        // Unicode whitespace too: a no-break space, an ideographic space.
+        assert_eq!(
+            normalize_instruction("is\u{a0}very\u{3000}angry"),
+            "is very angry"
+        );
         assert_eq!(normalize_instruction(""), "");
     }
 
@@ -172,10 +190,8 @@ mod tests {
     fn ids_match_golden_values() {
         let id = question_id("the customer is angry", AskType::Bool, &model(), "means-v2");
         assert_eq!(id, ExprId(GOLDEN_QUESTION));
-        assert_eq!(
-            id.to_string(),
-            format!("{:016x}", (GOLDEN_QUESTION >> 64) as u64)
-        );
+        // The digest's first 8 bytes, in order.
+        assert_eq!(id.to_string(), "6db19d6a27db9def");
         let key = answer_key(
             "the customer is angry",
             AskType::Bool,

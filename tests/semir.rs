@@ -65,3 +65,26 @@ async fn the_model_is_asked_the_normalized_condition() {
         .to_string();
     assert!(text.contains("MEANS('is angry')"), "{text}");
 }
+
+#[tokio::test]
+async fn an_empty_condition_is_a_plan_error() {
+    let model = Arc::new(MockModel::answering_yes_to(["furious"]));
+    let ctx = SemcastContextBuilder::new(Arc::clone(&model) as _).build();
+    ctx.sql("CREATE TABLE t AS VALUES ('I am furious')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    for sql in [
+        "SELECT * FROM t WHERE column1 MEANS ' \t '",
+        "SELECT * FROM t WHERE column1 MEANS ''",
+    ] {
+        let error = match semcast::sql(&ctx, sql).await {
+            Err(e) => e.to_string(),
+            Ok(df) => df.collect().await.expect_err(sql).to_string(),
+        };
+        assert!(error.contains("cannot be empty"), "{sql}: {error}");
+    }
+    assert_eq!(model.completion_calls(), 0);
+}

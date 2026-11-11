@@ -128,8 +128,9 @@ assembled in the physical planner, not there.
   pin both. So must SemIR's `normalize_instruction`, `question_id` (the
   `expr_id`) and `answer_key` (`src/semir/`), and the store's `row_key`: a
   `MEANS` condition is normalized where it enters (`destructure_means`) and
-  every key is built from it, so stored answers keep matching. `DefaultHasher` is only stable within one binary and must not key
-  anything durable.
+  every key is built from it, so stored answers keep matching.
+  `DefaultHasher` is only stable within one binary and must not key anything
+  durable.
 - Cache keys carry a prompt version (`MEANS_PROMPT_VERSION`,
   `EXTRACT_PROMPT_VERSION`, `SemanticType::version`). Change a synthesized prompt
   and bump its constant, so stale verdicts are invalidated honestly.
