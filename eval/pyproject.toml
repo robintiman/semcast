@@ -1,0 +1,13 @@
+[project]
+name = "semcast-eval"
+version = "0.1.0"
+description = "Runs SemBench against a semcast server"
+requires-python = ">=3.11"
+dependencies = [
+    "duckdb",
+    "numpy",
+    "pandas>=2,<3",
+    "psycopg2-binary",
+    "scikit-learn",
+    "scipy",
+]
