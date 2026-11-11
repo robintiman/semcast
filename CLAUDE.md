@@ -26,6 +26,7 @@ cargo fmt --all --check                     # CI gate
 cargo clippy --all-targets -- -D warnings   # CI gate
 cargo run -- serve                          # start the server on 127.0.0.1:5433
 cargo run --example meetings                # README walk-through against the mock
+uv run --project eval eval/sembench.py      # SemBench against a local server; see eval/README.md
 ```
 
 Building needs a system `protoc` (lance's `prost-build`); CI installs it via
