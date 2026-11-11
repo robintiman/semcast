@@ -52,7 +52,7 @@ async fn means_filter_against_live_ollama() {
     );
 }
 
-/// Real embeddings end-to-end: build a Lance index with nomic-embed-text,
+/// Real embeddings end-to-end: build a semantic index with nomic-embed-text,
 /// plan the funnel, and verify the right row survives it.
 #[tokio::test]
 #[ignore = "requires a running Ollama server with gemma4:e4b and nomic-embed-text pulled"]

@@ -15,11 +15,9 @@ use tokio_postgres::{AsyncMessage, NoTls, SimpleQueryMessage};
 async fn connect(
     model: Arc<dyn ModelProvider>,
 ) -> (tokio_postgres::Client, Arc<Mutex<Vec<String>>>) {
-    let index_root = tempfile::tempdir().unwrap();
     let ctx = SemcastContextBuilder::new(model)
         .with_information_schema(true)
         .build();
-    std::mem::forget(index_root); // keep Lance datasets alive for the test
     let engine = Arc::new(QueryEngine::new(Arc::new(ctx)));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

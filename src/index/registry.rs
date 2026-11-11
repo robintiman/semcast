@@ -103,10 +103,25 @@ impl SemcastRuntime {
     /// Forget every index on `table` — the table was dropped, and an index
     /// must not outlive it into a same-named table created later.
     pub fn unregister_indexes(&self, table: &str) {
+        let mut dropped = Vec::new();
         self.indexes
             .lock()
             .expect("index registry poisoned")
-            .retain(|(indexed, _), _| indexed != table);
+            .retain(|(indexed, column), _| {
+                let keep = indexed != table;
+                if !keep {
+                    dropped.push(column.clone());
+                }
+                keep
+            });
+        // Its chunks go too; the vectors stay, as answers other indexes over
+        // the same text may read.
+        for column in dropped {
+            let name = crate::catalog::index_name(table, &column);
+            if let Err(error) = self.chunk_store.reset(&name) {
+                tracing::warn!(%name, %error, "could not delete a dropped index's chunks");
+            }
+        }
     }
 
     pub fn index_for(&self, table: &str, column: &str) -> Option<Arc<dyn SemanticIndex>> {

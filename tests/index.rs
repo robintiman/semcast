@@ -1,4 +1,4 @@
-//! Tests for roadmap step 2: the Lance-backed semantic index and its
+//! Tests for roadmap step 2: the stored semantic index and its
 //! programmatic API, against the deterministic mock model.
 
 use std::collections::HashSet;
@@ -437,7 +437,6 @@ async fn calibration_context(model: Arc<MockModel>) -> SessionContext {
     create_semantic_index(&ctx, "meetings", "transcript", IndexOptions::default())
         .await
         .unwrap();
-    // Leak the tempdir so the Lance dataset outlives this helper.
     ctx
 }
 
@@ -1253,7 +1252,11 @@ async fn recreating_an_index_reuses_stored_vectors() {
     let index = create_semantic_index(&ctx, "meetings", "transcript", IndexOptions::default())
         .await
         .unwrap();
-    assert_eq!(model.embed_calls(), first, "no chunk embedded twice");
+    assert_eq!(
+        model.embed_calls(),
+        first + 1,
+        "only the dimension probe: no chunk embedded twice"
+    );
     assert_eq!(index.indexed_doc_hashes().await.unwrap().len(), 2);
 }
 
@@ -1291,4 +1294,136 @@ async fn an_index_saved_by_a_lance_build_is_rebuilt() {
     .unwrap();
     let display = displayable(plan.as_ref()).indent(true).to_string();
     assert!(display.contains("IndexScanExec"), "{display}");
+}
+
+/// An embedder whose vector size can change under the same model id, as a
+/// re-pulled tag or a fallback chain can, and that can be made to fail.
+#[derive(Debug)]
+struct Shifting {
+    dim: std::sync::atomic::AtomicUsize,
+    failing: std::sync::atomic::AtomicBool,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl Shifting {
+    fn new(dim: usize) -> Arc<Self> {
+        Arc::new(Self {
+            dim: std::sync::atomic::AtomicUsize::new(dim),
+            failing: std::sync::atomic::AtomicBool::new(false),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl ModelProvider for Shifting {
+    fn id(&self) -> ModelId {
+        ModelId("shifting".to_owned())
+    }
+    async fn complete(
+        &self,
+        requests: Vec<semcast::model::CompletionRequest>,
+    ) -> Vec<semcast::Result<semcast::model::Completion>> {
+        MockModel::answering_yes_to(["sync"])
+            .complete(requests)
+            .await
+    }
+    async fn embed(&self, texts: Vec<String>) -> semcast::Result<Vec<semcast::model::Embedding>> {
+        use std::sync::atomic::Ordering;
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        // Fails only on the new text, so a re-create gets past its probe and
+        // fails mid-build.
+        if self.failing.load(Ordering::SeqCst) && texts.iter().any(|t| t.contains("again")) {
+            return Err(semcast::SemcastError::Index("embedder down".to_owned()));
+        }
+        let dim = self.dim.load(Ordering::SeqCst);
+        Ok(texts
+            .iter()
+            .map(|text| {
+                let mut v = vec![0.1; dim];
+                v[0] = if text.contains("sync") { 1.0 } else { 0.0 };
+                v
+            })
+            .collect())
+    }
+}
+
+async fn shifting_context(embedder: Arc<Shifting>) -> SessionContext {
+    let ctx = semcast_context(embedder as _);
+    ctx.sql(
+        "CREATE TABLE meetings AS SELECT * FROM (VALUES (1, 'sync now'), (2, 'sync later'), \
+         (3, 'lunch')) AS t(meeting_id, transcript)",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+    ctx
+}
+
+/// A vector size change under the same model id is loud, never a silently
+/// empty result, and re-creating the index embeds afresh rather than reading
+/// back vectors of the old size.
+#[tokio::test]
+async fn a_dimension_change_fails_loudly_and_a_recreate_heals_it() {
+    use std::sync::atomic::Ordering;
+    let embedder = Shifting::new(4);
+    let ctx = shifting_context(Arc::clone(&embedder)).await;
+    create_semantic_index(&ctx, "meetings", "transcript", IndexOptions::default())
+        .await
+        .unwrap();
+    let query = "SELECT meeting_id FROM meetings WHERE transcript MEANS 'sync'";
+    assert_eq!(matching_ids(&ctx, query).await, [1, 2]);
+
+    embedder.dim.store(5, Ordering::SeqCst);
+    let error = semcast::sql(&ctx, query)
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("dimensional query vector"), "{error}");
+
+    let before = embedder.calls.load(Ordering::SeqCst);
+    create_semantic_index(&ctx, "meetings", "transcript", IndexOptions::default())
+        .await
+        .unwrap();
+    assert!(
+        embedder.calls.load(Ordering::SeqCst) > before + 1,
+        "the chunks are embedded again at the new size"
+    );
+    assert_eq!(matching_ids(&ctx, query).await, [1, 2]);
+}
+
+/// A re-create that fails keeps the index it was replacing.
+#[tokio::test]
+async fn a_failed_recreate_keeps_the_old_index() {
+    use std::sync::atomic::Ordering;
+    let embedder = Shifting::new(4);
+    let ctx = shifting_context(Arc::clone(&embedder)).await;
+    let index = create_semantic_index(&ctx, "meetings", "transcript", IndexOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(index.indexed_doc_hashes().await.unwrap().len(), 3);
+
+    // New text the embedder can't reach.
+    ctx.sql("INSERT INTO meetings VALUES (4, 'sync again')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    embedder.failing.store(true, Ordering::SeqCst);
+    assert!(
+        create_semantic_index(&ctx, "meetings", "transcript", IndexOptions::default())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        index.indexed_doc_hashes().await.unwrap().len(),
+        3,
+        "the old chunks still serve"
+    );
 }

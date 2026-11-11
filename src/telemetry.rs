@@ -10,7 +10,7 @@
 //!
 //! `RUST_LOG=semcast=info` hides the verbose prompt/response bodies;
 //! `RUST_LOG=semcast=debug` (the default) shows everything. The
-//! `tracing-log` bridge also surfaces DataFusion/Lance internal `log` records.
+//! `tracing-log` bridge also surfaces DataFusion's internal `log` records.
 
 /// Install the global tracing subscriber. Safe to call more than once — the
 /// first call wins and later calls are ignored, so examples and tests can call

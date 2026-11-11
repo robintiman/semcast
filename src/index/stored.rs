@@ -3,12 +3,18 @@
 //!
 //! An index is two things: which chunks of which documents it holds, and the
 //! vector of each chunk. Vectors are `EMBED` answers, content-addressed like
-//! verdicts by a digest of (embed model, chunk text), so a chunk embedded
-//! once — by this index, an earlier build of it, or another index over the
-//! same text — is never paid for again.
+//! verdicts by a digest of (embed model, dimension, chunk text), so a chunk
+//! embedded once — by this index, an earlier build of it, or another index
+//! over the same text — is never paid for again. The dimension is part of the
+//! key because a model id doesn't pin it (a re-pulled tag, a fallback chain):
+//! a vector of another size is a different answer, not a stale copy.
 //!
 //! Search is exact: every chunk is scored against the query, streamed from
-//! the store, so memory stays bounded by the hits rather than the corpus.
+//! the store, so memory stays bounded by the hits rather than the corpus. A
+//! document with no vector of the index's dimension is not counted as
+//! indexed, so it passes through to verify rather than being pruned on a
+//! score it never had.
+//!
 //! Without a store file the same layout lives in memory for the process.
 
 use std::collections::{HashMap, HashSet};
@@ -16,7 +22,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, params};
 
 use crate::cache::sqlite::{open_store, store_err};
 use crate::cache::stable_digest;
@@ -26,9 +32,26 @@ use crate::{Result, SemcastError};
 use super::chunk::{ChunkConfig, chunk_text};
 use super::{ChunkHit, FilterScan, SearchParams, SemanticIndex, doc_hash};
 
+/// Embedded once when an index is built, to learn its vector dimension
+/// before any chunk is looked up.
+const DIM_PROBE: &str = "semcast embedding dimension probe";
+
+/// Most rows one write transaction carries, so a large index never holds
+/// the store's write lock long enough to time out the verdict cache or the
+/// catalog writing beside it.
+const WRITE_BATCH: usize = 2_000;
+
+/// Most keys one batched vector read binds.
+const MAX_READ_BATCH: usize = 512;
+
 /// The store key of one chunk's `EMBED` answer.
-fn embedding_key(model: &ModelId, text: &str) -> [u8; 16] {
-    stable_digest(&[model.0.as_bytes(), text.as_bytes()]).to_le_bytes()
+fn embedding_key(model: &ModelId, dim: usize, text: &str) -> [u8; 16] {
+    stable_digest(&[
+        model.0.as_bytes(),
+        &(dim as u64).to_le_bytes(),
+        text.as_bytes(),
+    ])
+    .to_le_bytes()
 }
 
 /// One chunk an index holds.
@@ -40,8 +63,8 @@ pub struct StoredChunk {
     pub embedding_key: [u8; 16],
 }
 
-/// Called once per scanned chunk: its document, its index within the
-/// document, its text and its vector.
+/// Called once per scanned chunk that has a vector: its document, its index
+/// within the document, its text and its vector.
 pub type ChunkVisitor<'a> = dyn FnMut(u64, u32, &str, &[f32]) + 'a;
 
 /// Where indexes keep their chunks and vectors: the store file, or memory.
@@ -50,12 +73,16 @@ pub trait ChunkStore: std::fmt::Debug + Send + Sync {
     fn vectors(&self, keys: &[[u8; 16]]) -> Result<Vec<Option<Embedding>>>;
     /// Store vectors; a key already stored keeps its first vector.
     fn put_vectors(&self, model: &ModelId, entries: &[([u8; 16], Embedding)]) -> Result<()>;
-    /// Replace everything `index` holds with `chunks`.
+    /// Forget everything `index` holds. Stored vectors stay: they are
+    /// answers, and other indexes may read them.
     fn reset(&self, index: &str) -> Result<()>;
     /// Add `chunks` to `index`.
     fn add_chunks(&self, index: &str, chunks: &[StoredChunk]) -> Result<()>;
-    /// Every document `index` holds, and each of its chunks with its vector,
-    /// read from one snapshot.
+    /// Make `chunks` all that `index` holds, at once: a reader sees either
+    /// the old chunks or the new ones, never an empty index in between.
+    fn replace(&self, index: &str, chunks: &[StoredChunk]) -> Result<()>;
+    /// Every document `index` holds a chunk of, and each chunk that has a
+    /// vector, read from one snapshot.
     fn scan(&self, index: &str, visit: &mut ChunkVisitor<'_>) -> Result<HashSet<u64>>;
     /// Every document `index` holds.
     fn doc_hashes(&self, index: &str) -> Result<HashSet<u64>>;
@@ -64,20 +91,26 @@ pub trait ChunkStore: std::fmt::Debug + Send + Sync {
 /// Chunks and vectors for the process only — the default without a store.
 #[derive(Debug, Default)]
 pub struct MemoryChunkStore {
-    vectors: Mutex<HashMap<[u8; 16], Embedding>>,
-    chunks: Mutex<HashMap<String, Vec<StoredChunk>>>,
+    vectors: Mutex<HashMap<[u8; 16], Arc<Embedding>>>,
+    /// Shared, so a scan takes a handle rather than copying the corpus.
+    chunks: Mutex<HashMap<String, Arc<Vec<StoredChunk>>>>,
 }
 
 impl ChunkStore for MemoryChunkStore {
     fn vectors(&self, keys: &[[u8; 16]]) -> Result<Vec<Option<Embedding>>> {
         let vectors = self.vectors.lock().expect("chunk store poisoned");
-        Ok(keys.iter().map(|key| vectors.get(key).cloned()).collect())
+        Ok(keys
+            .iter()
+            .map(|key| vectors.get(key).map(|vector| vector.as_ref().clone()))
+            .collect())
     }
 
     fn put_vectors(&self, _model: &ModelId, entries: &[([u8; 16], Embedding)]) -> Result<()> {
         let mut vectors = self.vectors.lock().expect("chunk store poisoned");
         for (key, vector) in entries {
-            vectors.entry(*key).or_insert_with(|| vector.clone());
+            vectors
+                .entry(*key)
+                .or_insert_with(|| Arc::new(vector.clone()));
         }
         Ok(())
     }
@@ -91,17 +124,36 @@ impl ChunkStore for MemoryChunkStore {
     }
 
     fn add_chunks(&self, index: &str, chunks: &[StoredChunk]) -> Result<()> {
+        let mut all = self.chunks.lock().expect("chunk store poisoned");
+        let entry = all.entry(index.to_owned()).or_default();
+        let mut merged: Vec<StoredChunk> = entry.as_ref().clone();
+        let mut position: HashMap<(u64, u32), usize> = merged
+            .iter()
+            .enumerate()
+            .map(|(i, chunk)| ((chunk.doc_hash, chunk.chunk_index), i))
+            .collect();
+        for chunk in chunks {
+            match position.get(&(chunk.doc_hash, chunk.chunk_index)) {
+                Some(&i) => merged[i] = chunk.clone(),
+                None => {
+                    position.insert((chunk.doc_hash, chunk.chunk_index), merged.len());
+                    merged.push(chunk.clone());
+                }
+            }
+        }
+        *entry = Arc::new(merged);
+        Ok(())
+    }
+
+    fn replace(&self, index: &str, chunks: &[StoredChunk]) -> Result<()> {
         self.chunks
             .lock()
             .expect("chunk store poisoned")
-            .entry(index.to_owned())
-            .or_default()
-            .extend(chunks.iter().cloned());
+            .insert(index.to_owned(), Arc::new(chunks.to_vec()));
         Ok(())
     }
 
     fn scan(&self, index: &str, visit: &mut ChunkVisitor<'_>) -> Result<HashSet<u64>> {
-        // One snapshot: copy the chunk list under the lock, then score.
         let chunks = self
             .chunks
             .lock()
@@ -109,12 +161,17 @@ impl ChunkStore for MemoryChunkStore {
             .get(index)
             .cloned()
             .unwrap_or_default();
-        let vectors = self.vectors.lock().expect("chunk store poisoned");
         let mut docs = HashSet::new();
-        for chunk in &chunks {
+        for chunk in chunks.iter() {
             docs.insert(chunk.doc_hash);
-            if let Some(vector) = vectors.get(&chunk.embedding_key) {
-                visit(chunk.doc_hash, chunk.chunk_index, &chunk.text, vector);
+            let vector = self
+                .vectors
+                .lock()
+                .expect("chunk store poisoned")
+                .get(&chunk.embedding_key)
+                .cloned();
+            if let Some(vector) = vector {
+                visit(chunk.doc_hash, chunk.chunk_index, &chunk.text, &vector);
             }
         }
         Ok(docs)
@@ -132,16 +189,52 @@ impl ChunkStore for MemoryChunkStore {
 }
 
 /// Chunks and vectors in the store file, next to the verdicts and catalog.
+///
+/// Two connections: scans read on their own, so a long scan never holds up
+/// a write (WAL lets the two proceed together), and writes go in batches of
+/// [`WRITE_BATCH`] so they never hold the file's write lock for long.
 #[derive(Debug)]
 pub struct SqliteChunkStore {
-    connection: Mutex<Connection>,
+    writer: Mutex<Connection>,
+    reader: Mutex<Connection>,
 }
 
 impl SqliteChunkStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Ok(Self {
-            connection: Mutex::new(open_store(path.as_ref())?),
+            writer: Mutex::new(open_store(path.as_ref())?),
+            reader: Mutex::new(open_store(path.as_ref())?),
         })
+    }
+
+    /// Insert `chunks` into `index`, a batch per transaction.
+    fn insert_chunks(&self, index: &str, chunks: &[StoredChunk]) -> Result<()> {
+        let mut connection = self.writer.lock().expect("chunk store poisoned");
+        for batch in chunks.chunks(WRITE_BATCH) {
+            let transaction = connection.transaction().map_err(store_err)?;
+            {
+                let mut statement = transaction
+                    .prepare_cached(
+                        "INSERT OR REPLACE INTO index_chunks \
+                         (index_name, doc_hash, chunk_index, text, embedding) \
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                    )
+                    .map_err(store_err)?;
+                for chunk in batch {
+                    statement
+                        .execute(params![
+                            index,
+                            chunk.doc_hash as i64,
+                            chunk.chunk_index,
+                            chunk.text,
+                            chunk.embedding_key
+                        ])
+                        .map_err(store_err)?;
+                }
+            }
+            transaction.commit().map_err(store_err)?;
+        }
+        Ok(())
     }
 }
 
@@ -162,41 +255,54 @@ fn decode(bytes: &[u8]) -> Embedding {
 
 impl ChunkStore for SqliteChunkStore {
     fn vectors(&self, keys: &[[u8; 16]]) -> Result<Vec<Option<Embedding>>> {
-        let connection = self.connection.lock().expect("chunk store poisoned");
-        let mut statement = connection
-            .prepare_cached("SELECT vector FROM embeddings WHERE key = ?1")
-            .map_err(store_err)?;
-        keys.iter()
-            .map(|key| {
-                statement
-                    .query_row(params![key], |row| row.get::<_, Vec<u8>>(0))
-                    .optional()
-                    .map(|bytes| bytes.map(|bytes| decode(&bytes)))
-                    .map_err(store_err)
-            })
-            .collect()
+        let connection = self.reader.lock().expect("chunk store poisoned");
+        let mut found: HashMap<[u8; 16], Embedding> = HashMap::new();
+        for chunk in keys.chunks(MAX_READ_BATCH) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let mut statement = connection
+                .prepare_cached(&format!(
+                    "SELECT key, vector FROM embeddings WHERE key IN ({placeholders})"
+                ))
+                .map_err(store_err)?;
+            let rows = statement
+                .query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                    Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })
+                .map_err(store_err)?;
+            for row in rows {
+                let (key, vector) = row.map_err(store_err)?;
+                if let Ok(key) = <[u8; 16]>::try_from(key.as_slice()) {
+                    found.insert(key, decode(&vector));
+                }
+            }
+        }
+        Ok(keys.iter().map(|key| found.remove(key)).collect())
     }
 
     fn put_vectors(&self, model: &ModelId, entries: &[([u8; 16], Embedding)]) -> Result<()> {
-        let mut connection = self.connection.lock().expect("chunk store poisoned");
-        let transaction = connection.transaction().map_err(store_err)?;
-        {
-            let mut statement = transaction
-                .prepare_cached(
-                    "INSERT OR IGNORE INTO embeddings (key, embed_model, vector) VALUES (?1, ?2, ?3)",
-                )
-                .map_err(store_err)?;
-            for (key, vector) in entries {
-                statement
-                    .execute(params![key, model.0, encode(vector)])
+        let mut connection = self.writer.lock().expect("chunk store poisoned");
+        for batch in entries.chunks(WRITE_BATCH) {
+            let transaction = connection.transaction().map_err(store_err)?;
+            {
+                let mut statement = transaction
+                    .prepare_cached(
+                        "INSERT OR IGNORE INTO embeddings (key, embed_model, vector) \
+                         VALUES (?1, ?2, ?3)",
+                    )
                     .map_err(store_err)?;
+                for (key, vector) in batch {
+                    statement
+                        .execute(params![key, model.0, encode(vector)])
+                        .map_err(store_err)?;
+                }
             }
+            transaction.commit().map_err(store_err)?;
         }
-        transaction.commit().map_err(store_err)
+        Ok(())
     }
 
     fn reset(&self, index: &str) -> Result<()> {
-        self.connection
+        self.writer
             .lock()
             .expect("chunk store poisoned")
             .execute(
@@ -208,35 +314,37 @@ impl ChunkStore for SqliteChunkStore {
     }
 
     fn add_chunks(&self, index: &str, chunks: &[StoredChunk]) -> Result<()> {
-        let mut connection = self.connection.lock().expect("chunk store poisoned");
+        self.insert_chunks(index, chunks)
+    }
+
+    /// Built under a scratch name in batches, then swapped in with one short
+    /// transaction: the index serves its old chunks until the swap.
+    fn replace(&self, index: &str, chunks: &[StoredChunk]) -> Result<()> {
+        let scratch = format!("{index}\u{0}building");
+        self.reset(&scratch)?;
+        self.insert_chunks(&scratch, chunks)?;
+        let mut connection = self.writer.lock().expect("chunk store poisoned");
         let transaction = connection.transaction().map_err(store_err)?;
-        {
-            let mut statement = transaction
-                .prepare_cached(
-                    "INSERT OR REPLACE INTO index_chunks \
-                     (index_name, doc_hash, chunk_index, text, embedding) \
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                )
-                .map_err(store_err)?;
-            for chunk in chunks {
-                statement
-                    .execute(params![
-                        index,
-                        chunk.doc_hash as i64,
-                        chunk.chunk_index,
-                        chunk.text,
-                        chunk.embedding_key
-                    ])
-                    .map_err(store_err)?;
-            }
-        }
+        transaction
+            .execute(
+                "DELETE FROM index_chunks WHERE index_name = ?1",
+                params![index],
+            )
+            .map_err(store_err)?;
+        transaction
+            .execute(
+                "UPDATE index_chunks SET index_name = ?1 WHERE index_name = ?2",
+                params![index, scratch],
+            )
+            .map_err(store_err)?;
         transaction.commit().map_err(store_err)
     }
 
-    /// One read transaction, so the documents listed and the chunks scored
-    /// are the same snapshot even while a refresh writes.
+    /// One read transaction on the reader connection, so the documents
+    /// listed and the chunks scored are the same snapshot even while a
+    /// refresh writes.
     fn scan(&self, index: &str, visit: &mut ChunkVisitor<'_>) -> Result<HashSet<u64>> {
-        let mut connection = self.connection.lock().expect("chunk store poisoned");
+        let mut connection = self.reader.lock().expect("chunk store poisoned");
         let transaction = connection.transaction().map_err(store_err)?;
         let mut docs = HashSet::new();
         {
@@ -251,12 +359,18 @@ impl ChunkStore for SqliteChunkStore {
             while let Some(row) = rows.next().map_err(store_err)? {
                 let hash = row.get::<_, i64>(0).map_err(store_err)? as u64;
                 docs.insert(hash);
-                let Some(vector) = row.get::<_, Option<Vec<u8>>>(3).map_err(store_err)? else {
+                let vector = row.get_ref(3).map_err(store_err)?;
+                let Ok(vector) = vector.as_blob() else {
                     continue;
                 };
                 let chunk_index = row.get::<_, u32>(1).map_err(store_err)?;
-                let text = row.get::<_, String>(2).map_err(store_err)?;
-                visit(hash, chunk_index, &text, &decode(&vector));
+                // Borrowed, not copied: most chunks score below the floor.
+                let text = row
+                    .get_ref(2)
+                    .map_err(store_err)?
+                    .as_str()
+                    .map_err(|error| SemcastError::Store(error.to_string()))?;
+                visit(hash, chunk_index, text, &decode(vector));
             }
         }
         transaction.commit().map_err(store_err)?;
@@ -264,7 +378,7 @@ impl ChunkStore for SqliteChunkStore {
     }
 
     fn doc_hashes(&self, index: &str) -> Result<HashSet<u64>> {
-        let connection = self.connection.lock().expect("chunk store poisoned");
+        let connection = self.reader.lock().expect("chunk store poisoned");
         let mut statement = connection
             .prepare_cached("SELECT DISTINCT doc_hash FROM index_chunks WHERE index_name = ?1")
             .map_err(store_err)?;
@@ -284,6 +398,8 @@ pub struct StoredIndex {
     embedder: Arc<dyn ModelProvider>,
     chunk_config: ChunkConfig,
     params: SearchParams,
+    /// The dimension every vector of this index has.
+    dim: usize,
 }
 
 impl std::fmt::Debug for StoredIndex {
@@ -291,20 +407,45 @@ impl std::fmt::Debug for StoredIndex {
         f.debug_struct("StoredIndex")
             .field("name", &self.name)
             .field("embed_model", &self.embedder.id().0)
+            .field("dim", &self.dim)
             .finish_non_exhaustive()
     }
 }
 
 impl StoredIndex {
-    /// An index named `name` (one per table and column) over `store`. Opening
-    /// one that already holds chunks reads them as they are; [`Self::reset`]
-    /// starts it over.
-    pub fn new(
+    /// A new index named `name` (one per table and column): one probe embed
+    /// call learns the embedder's dimension. It holds nothing until
+    /// [`Self::rebuild`] or [`SemanticIndex::add_documents`].
+    pub async fn create(
         name: impl Into<String>,
         store: Arc<dyn ChunkStore>,
         embedder: Arc<dyn ModelProvider>,
         chunk_config: ChunkConfig,
         params: SearchParams,
+    ) -> Result<Self> {
+        let probe = embedder.embed(vec![DIM_PROBE.to_owned()]).await?;
+        let dim = probe
+            .first()
+            .map(Vec::len)
+            .filter(|dim| *dim > 0)
+            .ok_or_else(|| {
+                SemcastError::Index(format!(
+                    "embedder {} returned an empty embedding",
+                    embedder.id().0
+                ))
+            })?;
+        Ok(Self::open(name, store, embedder, chunk_config, params, dim))
+    }
+
+    /// An index whose dimension is already known — one being reattached.
+    /// Nothing is embedded.
+    pub fn open(
+        name: impl Into<String>,
+        store: Arc<dyn ChunkStore>,
+        embedder: Arc<dyn ModelProvider>,
+        chunk_config: ChunkConfig,
+        params: SearchParams,
+        dim: usize,
     ) -> Self {
         Self {
             name: name.into(),
@@ -312,30 +453,78 @@ impl StoredIndex {
             embedder,
             chunk_config,
             params,
+            dim,
         }
     }
 
-    /// Forget every chunk this index holds. Stored vectors stay: they are
-    /// answers, and re-indexing the same text reads them back for free.
-    pub async fn reset(&self) -> Result<()> {
-        let store = Arc::clone(&self.store);
-        let name = self.name.clone();
-        blocking(move || store.reset(&name)).await
+    /// The dimension of this index's vectors.
+    pub fn dim(&self) -> usize {
+        self.dim
     }
 
-    /// The vectors for `texts`, from the store where they are, embedded (and
-    /// stored) where they aren't.
-    async fn vectors_for(&self, texts: &[String]) -> Result<Vec<Embedding>> {
-        let model = self.embedder.id();
-        let keys: Vec<[u8; 16]> = texts
-            .iter()
-            .map(|text| embedding_key(&model, text))
-            .collect();
+    /// Make `texts` all this index holds. Everything is embedded first and
+    /// swapped in at once, so the index keeps serving what it held until
+    /// the new chunks are ready — and keeps them if embedding fails.
+    pub async fn rebuild(&self, texts: Vec<String>) -> Result<usize> {
+        let (docs, chunks) = self.chunk(texts).await?;
         let store = Arc::clone(&self.store);
-        let lookup = keys.clone();
-        let mut vectors = blocking(move || store.vectors(&lookup)).await?;
-        let missing: Vec<usize> = (0..texts.len()).filter(|&i| vectors[i].is_none()).collect();
-        let mut fresh = Vec::with_capacity(missing.len());
+        let name = self.name.clone();
+        blocking(move || store.replace(&name, &chunks)).await?;
+        Ok(docs)
+    }
+
+    /// Chunk `texts` and make sure every chunk has a stored vector.
+    async fn chunk(&self, texts: Vec<String>) -> Result<(usize, Vec<StoredChunk>)> {
+        let mut chunk_texts = Vec::new();
+        let mut placements = Vec::new();
+        let mut docs = 0;
+        for text in &texts {
+            let doc_chunks = chunk_text(text, &self.chunk_config);
+            if doc_chunks.is_empty() {
+                continue;
+            }
+            docs += 1;
+            let hash = doc_hash(text);
+            for (i, chunk) in doc_chunks.into_iter().enumerate() {
+                placements.push((hash, i as u32));
+                chunk_texts.push(chunk);
+            }
+        }
+        if chunk_texts.is_empty() {
+            return Ok((0, Vec::new()));
+        }
+        let model = self.embedder.id();
+        let keys: Vec<[u8; 16]> = chunk_texts
+            .iter()
+            .map(|text| embedding_key(&model, self.dim, text))
+            .collect();
+        self.ensure_vectors(&chunk_texts, &keys).await?;
+        let chunks = placements
+            .into_iter()
+            .zip(chunk_texts)
+            .zip(keys)
+            .map(
+                |(((doc_hash, chunk_index), text), embedding_key)| StoredChunk {
+                    doc_hash,
+                    chunk_index,
+                    text,
+                    embedding_key,
+                },
+            )
+            .collect();
+        Ok((docs, chunks))
+    }
+
+    /// Embed (and store) every chunk the store has no vector for.
+    async fn ensure_vectors(&self, texts: &[String], keys: &[[u8; 16]]) -> Result<()> {
+        let model = self.embedder.id();
+        let store = Arc::clone(&self.store);
+        let lookup = keys.to_vec();
+        let stored = blocking(move || store.vectors(&lookup)).await?;
+        let mut seen = HashSet::new();
+        let missing: Vec<usize> = (0..texts.len())
+            .filter(|&i| stored[i].is_none() && seen.insert(keys[i]))
+            .collect();
         for batch in missing.chunks(self.embedder.embed_batch_size().max(1)) {
             let embedded = self
                 .embedder
@@ -349,41 +538,56 @@ impl StoredIndex {
                     batch.len()
                 )));
             }
-            for (&i, vector) in batch.iter().zip(embedded) {
-                fresh.push((keys[i], vector.clone()));
-                vectors[i] = Some(vector);
+            if let Some(vector) = embedded.iter().find(|vector| vector.len() != self.dim) {
+                return Err(SemcastError::Index(format!(
+                    "embedder {} returned dimension {}, the index stores {}; recreate the \
+                     index with CREATE SEMANTIC INDEX",
+                    model.0,
+                    vector.len(),
+                    self.dim
+                )));
             }
-        }
-        if !fresh.is_empty() {
+            let fresh: Vec<([u8; 16], Embedding)> =
+                batch.iter().map(|&i| keys[i]).zip(embedded).collect();
             let store = Arc::clone(&self.store);
+            let model = model.clone();
             blocking(move || store.put_vectors(&model, &fresh)).await?;
         }
-        Ok(vectors
-            .into_iter()
-            .map(|v| v.expect("filled above"))
-            .collect())
+        Ok(())
     }
 
     async fn embed_query(&self, query: &str) -> Result<Embedding> {
         let mut embedded = self.embedder.embed(vec![query.to_owned()]).await?;
-        embedded.pop().filter(|v| !v.is_empty()).ok_or_else(|| {
-            SemcastError::Index(format!(
-                "embedder {} returned no query vector",
-                self.embedder.id().0
-            ))
-        })
+        embedded
+            .pop()
+            .filter(|vector| vector.len() == self.dim)
+            .ok_or_else(|| {
+                SemcastError::Index(format!(
+                    "embedder {} did not return a {}-dimensional query vector; recreate \
+                     the index with CREATE SEMANTIC INDEX if the model changed",
+                    self.embedder.id().0,
+                    self.dim
+                ))
+            })
     }
 
     /// Score every chunk against `query`, keeping those at or above `floor`,
-    /// best first; and the documents indexed, from the same snapshot.
+    /// best first; and the documents indexed, from the same snapshot. Only a
+    /// document with a vector of the index's dimension counts as indexed.
     async fn scored(&self, query: &str, floor: f32) -> Result<FilterScan> {
         let mut query = self.embed_query(query).await?;
         normalize(&mut query);
         let store = Arc::clone(&self.store);
         let name = self.name.clone();
+        let dim = self.dim;
         let (mut hits, indexed) = blocking(move || {
             let mut hits = Vec::new();
-            let indexed = store.scan(&name, &mut |doc_hash, chunk_index, text, vector| {
+            let mut scorable = HashSet::new();
+            store.scan(&name, &mut |doc_hash, chunk_index, text, vector| {
+                if vector.len() != dim {
+                    return;
+                }
+                scorable.insert(doc_hash);
                 let score = cosine(&query, vector);
                 if score >= floor {
                     hits.push(ChunkHit {
@@ -394,7 +598,7 @@ impl StoredIndex {
                     });
                 }
             })?;
-            Ok((hits, indexed))
+            Ok((hits, scorable))
         })
         .await?;
         hits.sort_by(|a, b| b.score.total_cmp(&a.score));
@@ -413,37 +617,10 @@ impl SemanticIndex for StoredIndex {
     }
 
     async fn add_documents(&self, texts: Vec<String>) -> Result<usize> {
-        let mut chunk_texts = Vec::new();
-        let mut placements = Vec::new();
-        let mut docs = 0;
-        for text in &texts {
-            let doc_chunks = chunk_text(text, &self.chunk_config);
-            if doc_chunks.is_empty() {
-                continue;
-            }
-            docs += 1;
-            let hash = doc_hash(text);
-            for (i, chunk) in doc_chunks.into_iter().enumerate() {
-                placements.push((hash, i as u32));
-                chunk_texts.push(chunk);
-            }
+        let (docs, chunks) = self.chunk(texts).await?;
+        if chunks.is_empty() {
+            return Ok(docs);
         }
-        if chunk_texts.is_empty() {
-            return Ok(0);
-        }
-        // Vectors first: a chunk listed in the index always has one.
-        self.vectors_for(&chunk_texts).await?;
-        let model = self.embedder.id();
-        let chunks: Vec<StoredChunk> = placements
-            .into_iter()
-            .zip(chunk_texts)
-            .map(|((doc_hash, chunk_index), text)| StoredChunk {
-                doc_hash,
-                chunk_index,
-                embedding_key: embedding_key(&model, &text),
-                text,
-            })
-            .collect();
         let store = Arc::clone(&self.store);
         let name = self.name.clone();
         blocking(move || store.add_chunks(&name, &chunks)).await?;
@@ -471,12 +648,14 @@ impl SemanticIndex for StoredIndex {
     async fn doc_vectors(&self) -> Result<HashMap<u64, Embedding>> {
         let store = Arc::clone(&self.store);
         let name = self.name.clone();
+        let dim = self.dim;
         let sums = blocking(move || {
             let mut sums: HashMap<u64, (Embedding, usize)> = HashMap::new();
             store.scan(&name, &mut |doc_hash, _, _, vector| {
-                let (sum, count) = sums
-                    .entry(doc_hash)
-                    .or_insert_with(|| (vec![0.0; vector.len()], 0));
+                if vector.len() != dim {
+                    return;
+                }
+                let (sum, count) = sums.entry(doc_hash).or_insert_with(|| (vec![0.0; dim], 0));
                 for (slot, value) in sum.iter_mut().zip(vector) {
                     *slot += value;
                 }
@@ -516,12 +695,9 @@ fn normalize(vector: &mut [f32]) {
     }
 }
 
-/// Cosine similarity of a unit `query` and any `vector`; 0 for a zero
-/// vector or a dimension mismatch.
+/// Cosine similarity of a unit `query` and a `vector` of the same length;
+/// 0 for a zero vector.
 fn cosine(query: &[f32], vector: &[f32]) -> f32 {
-    if query.len() != vector.len() {
-        return 0.0;
-    }
     let norm = vector.iter().map(|v| v * v).sum::<f32>().sqrt();
     if norm == 0.0 {
         return 0.0;
@@ -546,17 +722,31 @@ mod tests {
         assert!((cosine(&query, &[6.0, 8.0]) - 1.0).abs() < 1e-6);
         assert!(cosine(&query, &[4.0, -3.0]).abs() < 1e-6);
         assert_eq!(cosine(&query, &[0.0, 0.0]), 0.0);
-        assert_eq!(cosine(&query, &[1.0]), 0.0, "a dimension mismatch scores 0");
     }
 
     /// The `EMBED` answer key must never change: vectors are stored under it.
     #[test]
     fn embedding_key_matches_golden_value() {
-        let key = embedding_key(&ModelId("ollama/nomic-embed-text".to_owned()), "hello");
+        let model = ModelId("ollama/nomic-embed-text".to_owned());
+        let key = embedding_key(&model, 768, "hello");
         assert_eq!(u128::from_le_bytes(key), GOLDEN_EMBEDDING_KEY);
+        assert_ne!(
+            key,
+            embedding_key(&model, 1024, "hello"),
+            "another dimension is another answer"
+        );
     }
 
-    const GOLDEN_EMBEDDING_KEY: u128 = 289648415725612861662131911017099935454;
+    const GOLDEN_EMBEDDING_KEY: u128 = 38664561312866180288865513835267829184;
+
+    fn chunk(key: [u8; 16], text: &str, doc_hash: u64) -> StoredChunk {
+        StoredChunk {
+            doc_hash,
+            chunk_index: 0,
+            text: text.to_owned(),
+            embedding_key: key,
+        }
+    }
 
     #[test]
     fn both_stores_agree() {
@@ -567,7 +757,7 @@ mod tests {
         ];
         let model = ModelId("m".to_owned());
         for store in stores {
-            let key = embedding_key(&model, "chunk");
+            let key = embedding_key(&model, 2, "chunk");
             store.put_vectors(&model, &[(key, vec![1.0, 0.0])]).unwrap();
             store.put_vectors(&model, &[(key, vec![0.0, 1.0])]).unwrap();
             assert_eq!(
@@ -575,13 +765,9 @@ mod tests {
                 [Some(vec![1.0, 0.0])],
                 "first wins"
             );
-            let chunk = StoredChunk {
-                doc_hash: u64::MAX,
-                chunk_index: 0,
-                text: "chunk".to_owned(),
-                embedding_key: key,
-            };
-            store.add_chunks("t.c", &[chunk]).unwrap();
+            store
+                .add_chunks("t.c", &[chunk(key, "chunk", u64::MAX)])
+                .unwrap();
             let mut seen = Vec::new();
             let docs = store
                 .scan("t.c", &mut |hash, i, text, vector| {
@@ -592,6 +778,11 @@ mod tests {
             assert_eq!(seen, [(u64::MAX, 0, "chunk".to_owned(), vec![1.0, 0.0])]);
             assert_eq!(store.doc_hashes("t.c").unwrap(), HashSet::from([u64::MAX]));
             assert!(store.doc_hashes("other").unwrap().is_empty());
+
+            // Replace swaps the whole index at once.
+            store.replace("t.c", &[chunk(key, "chunk", 7)]).unwrap();
+            assert_eq!(store.doc_hashes("t.c").unwrap(), HashSet::from([7]));
+
             store.reset("t.c").unwrap();
             assert!(store.doc_hashes("t.c").unwrap().is_empty());
             assert_eq!(

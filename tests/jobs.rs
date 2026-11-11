@@ -26,7 +26,6 @@ async fn connect(model: Arc<dyn ModelProvider>) -> Server {
 /// [`connect`] with the concurrency ceiling as a parameter, for tests about
 /// what happens to a job that is still waiting for a slot.
 async fn connect_with_slots(model: Arc<dyn ModelProvider>, max_concurrent: usize) -> Server {
-    let index_root = tempfile::tempdir().unwrap();
     let jobs_root = tempfile::tempdir().unwrap();
     let ctx = Arc::new(
         SemcastContextBuilder::new(model)
@@ -36,7 +35,6 @@ async fn connect_with_slots(model: Arc<dyn ModelProvider>, max_concurrent: usize
     let registry = Arc::new(JobRegistry::new(jobs_root.path(), max_concurrent).unwrap());
     jobs::register(&ctx, &registry).unwrap();
     // Keep Lance datasets and job artifacts alive for the whole test.
-    std::mem::forget(index_root);
     std::mem::forget(jobs_root);
 
     let engine = Arc::new(QueryEngine::new(ctx).with_jobs(Arc::clone(&registry)));

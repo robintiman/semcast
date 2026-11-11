@@ -165,15 +165,18 @@ pub async fn create_semantic_index(
         .embedder
         .unwrap_or_else(|| Arc::clone(runtime.embedder()));
     let texts = read_column_texts(ctx, table, column).await?;
-    let stored = StoredIndex::new(
+    let stored = StoredIndex::create(
         crate::catalog::index_name(table, column),
         Arc::clone(runtime.chunk_store()),
         Arc::clone(&embedder),
         options.chunk.clone(),
         options.search,
-    );
-    stored.reset().await?;
-    stored.add_documents(texts).await?;
+    )
+    .await?;
+    // Embedded first, swapped in at once: an index being re-created keeps
+    // serving its old chunks until the new ones are ready.
+    stored.rebuild(texts).await?;
+    let dim = stored.dim();
     let index: Arc<dyn SemanticIndex> = Arc::new(stored);
     runtime.register_index(table, column, Arc::clone(&index));
     if let Some(catalog) = runtime.catalog() {
@@ -196,6 +199,7 @@ pub async fn create_semantic_index(
             table: table.to_owned(),
             column: column.to_owned(),
             embed_model: Some(embedder.id().0),
+            dim: Some(dim),
             chunk_max_tokens: Some(options.chunk.max_tokens),
             chunk_overlap_tokens: Some(options.chunk.overlap_tokens),
             path: None,
@@ -227,6 +231,9 @@ struct SavedIndex {
     column: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     embed_model: Option<String>,
+    /// The dimension of the index's vectors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dim: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     chunk_max_tokens: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -291,16 +298,27 @@ pub async fn reattach_semantic_index(
             embedder.id().0
         )));
     }
-    let index: Arc<dyn SemanticIndex> = Arc::new(StoredIndex::new(
-        crate::catalog::index_name(&saved.table, &saved.column),
-        Arc::clone(runtime.chunk_store()),
-        embedder,
-        ChunkConfig {
-            max_tokens,
-            overlap_tokens,
-        },
-        search,
-    ));
+    let name = crate::catalog::index_name(&saved.table, &saved.column);
+    let chunk = ChunkConfig {
+        max_tokens,
+        overlap_tokens,
+    };
+    let store = Arc::clone(runtime.chunk_store());
+    let stored = match saved.dim {
+        Some(dim) => StoredIndex::open(name, store, embedder, chunk, search, dim),
+        // Saved before the dimension was recorded: learn it with one probe.
+        None => StoredIndex::create(name, store, embedder, chunk, search).await?,
+    };
+    let index: Arc<dyn SemanticIndex> = Arc::new(stored);
+    if index.indexed_doc_hashes().await?.is_empty() {
+        tracing::warn!(
+            table = %saved.table,
+            column = %saved.column,
+            "restored a semantic index with no documents in the store (was the store \
+             file replaced?); rows pass through to full verification until \
+             CREATE SEMANTIC INDEX rebuilds it"
+        );
+    }
     runtime.register_index(&saved.table, &saved.column, Arc::clone(&index));
     Ok(index)
 }
