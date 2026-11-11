@@ -508,6 +508,7 @@ pub(crate) fn open_store(path: &Path) -> Result<Connection> {
                      chunk_index INTEGER NOT NULL,
                      text        TEXT NOT NULL,
                      embedding   BLOB NOT NULL,
+                     dim         INTEGER NOT NULL,
                      PRIMARY KEY (index_name, doc_hash, chunk_index)
                  ) WITHOUT ROWID;",
             )

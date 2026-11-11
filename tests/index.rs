@@ -1429,3 +1429,36 @@ async fn a_failed_recreate_keeps_the_old_index() {
         "the old chunks still serve"
     );
 }
+
+/// Replacing a table drops its index's chunks, and that delete is done
+/// before the next statement can build a new index under the same name.
+#[tokio::test]
+async fn an_index_built_right_after_its_table_is_replaced_keeps_its_documents() {
+    let dir = tempfile::tempdir().unwrap();
+    let store =
+        semcast::index::stored::SqliteChunkStore::open(dir.path().join("s.sqlite")).unwrap();
+    let ctx = semcast::SemcastContextBuilder::new(Arc::new(MockModel::answering_yes_to(["sync"])))
+        .with_chunk_store(Arc::new(store))
+        .build();
+    for sql in [
+        "CREATE TABLE t AS SELECT * FROM (VALUES (1, 'sync one'), (2, 'two')) AS v(id, body)",
+        "CREATE SEMANTIC INDEX ON t(body)",
+        "CREATE OR REPLACE TABLE t AS SELECT * FROM (VALUES (1, 'sync a'), (2, 'b'), (3, 'c')) \
+         AS v(id, body)",
+        "CREATE SEMANTIC INDEX ON t(body)",
+    ] {
+        semcast::sql(&ctx, sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+            .collect()
+            .await
+            .unwrap();
+    }
+    let runtime = ctx
+        .state()
+        .config()
+        .get_extension::<semcast::index::registry::SemcastRuntime>()
+        .unwrap();
+    let index = runtime.index_for("t", "body").unwrap();
+    assert_eq!(index.indexed_doc_hashes().await.unwrap().len(), 3);
+}

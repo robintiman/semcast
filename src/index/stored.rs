@@ -61,6 +61,9 @@ pub struct StoredChunk {
     pub chunk_index: u32,
     pub text: String,
     pub embedding_key: [u8; 16],
+    /// The size of the chunk's vector, kept beside it so counting an
+    /// index's documents of one size needs no vector read.
+    pub dim: usize,
 }
 
 /// Called once per scanned chunk that has a vector: its document, its index
@@ -204,11 +207,7 @@ impl ChunkStore for MemoryChunkStore {
         let vectors = self.vectors.lock().expect("chunk store poisoned");
         Ok(chunks
             .iter()
-            .filter(|chunk| {
-                vectors
-                    .get(&chunk.embedding_key)
-                    .is_some_and(|vector| vector.len() == dim)
-            })
+            .filter(|chunk| chunk.dim == dim && vectors.contains_key(&chunk.embedding_key))
             .map(|chunk| chunk.doc_hash)
             .collect())
     }
@@ -242,8 +241,8 @@ impl SqliteChunkStore {
                 let mut statement = transaction
                     .prepare_cached(
                         "INSERT OR REPLACE INTO index_chunks \
-                         (index_name, doc_hash, chunk_index, text, embedding) \
-                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                         (index_name, doc_hash, chunk_index, text, embedding, dim) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     )
                     .map_err(store_err)?;
                 for chunk in batch {
@@ -253,7 +252,8 @@ impl SqliteChunkStore {
                             chunk.doc_hash as i64,
                             chunk.chunk_index,
                             chunk.text,
-                            chunk.embedding_key
+                            chunk.embedding_key,
+                            chunk.dim as i64
                         ])
                         .map_err(store_err)?;
                 }
@@ -362,7 +362,11 @@ impl ChunkStore for SqliteChunkStore {
     /// transaction: the index serves its old chunks until the swap.
     fn replace(&self, index: &str, chunks: &[StoredChunk]) -> Result<()> {
         let scratch = scratch_name(index);
-        self.insert_chunks(&scratch, chunks)?;
+        if let Err(error) = self.insert_chunks(&scratch, chunks) {
+            // Best effort: a half-written scratch only costs space.
+            let _ = self.reset(&scratch);
+            return Err(error);
+        }
         let mut connection = self.writer.lock().expect("chunk store poisoned");
         let transaction = connection.transaction().map_err(store_err)?;
         transaction
@@ -421,13 +425,12 @@ impl ChunkStore for SqliteChunkStore {
         let connection = self.reader.lock().expect("chunk store poisoned");
         let mut statement = connection
             .prepare_cached(
-                "SELECT DISTINCT c.doc_hash FROM index_chunks c \
-                 JOIN embeddings e ON e.key = c.embedding \
-                 WHERE c.index_name = ?1 AND length(e.vector) = ?2",
+                "SELECT DISTINCT doc_hash FROM index_chunks \
+                 WHERE index_name = ?1 AND dim = ?2",
             )
             .map_err(store_err)?;
         let hashes = statement
-            .query_map(params![index, (dim * 4) as i64], |row| row.get::<_, i64>(0))
+            .query_map(params![index, dim as i64], |row| row.get::<_, i64>(0))
             .map_err(store_err)?
             .map(|hash| hash.map(|hash| hash as u64).map_err(store_err))
             .collect::<Result<HashSet<u64>>>()?;
@@ -553,6 +556,7 @@ impl StoredIndex {
                     chunk_index,
                     text,
                     embedding_key,
+                    dim: self.dim,
                 },
             )
             .collect();
@@ -793,6 +797,7 @@ mod tests {
             chunk_index: 0,
             text: text.to_owned(),
             embedding_key: key,
+            dim: 2,
         }
     }
 

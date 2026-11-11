@@ -441,7 +441,7 @@ pub(crate) async fn execute_ddl(
             let table = name.table().to_owned();
             // A replaced table's indexes described the old rows.
             if existed && let Some(runtime) = &runtime {
-                runtime.unregister_indexes(&table);
+                runtime.unregister_indexes(&table).await;
             }
             let name = resolve(ctx, &name);
             let failure = format!(
@@ -517,7 +517,7 @@ async fn forget_relation(
     if let Some(runtime) = runtime
         && !bare_name_in_use(ctx, &table)
     {
-        runtime.unregister_indexes(&table);
+        runtime.unregister_indexes(&table).await;
     }
     let Some(catalog) = catalog else {
         return Ok(());

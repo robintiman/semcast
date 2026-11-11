@@ -101,8 +101,12 @@ impl SemcastRuntime {
     }
 
     /// Forget every index on `table` — the table was dropped, and an index
-    /// must not outlive it into a same-named table created later.
-    pub fn unregister_indexes(&self, table: &str) {
+    /// must not outlive it into a same-named table created later. Its chunks
+    /// go too, half-built copies included (the vectors stay, as answers other
+    /// indexes over the same text may read), and that delete is finished
+    /// before this returns: a delete still queued could otherwise land on an
+    /// index the next statement builds under the same name.
+    pub async fn unregister_indexes(&self, table: &str) {
         let mut dropped = Vec::new();
         self.indexes
             .lock()
@@ -110,33 +114,24 @@ impl SemcastRuntime {
             .retain(|(indexed, column), _| {
                 let keep = indexed != table;
                 if !keep {
-                    dropped.push(column.clone());
+                    dropped.push(crate::catalog::index_name(table, column));
                 }
                 keep
             });
-        // Its chunks go too, half-built copies included; the vectors stay,
-        // as answers other indexes over the same text may read. Off the
-        // async workers, and not awaited: a leftover costs only space.
-        let names: Vec<String> = dropped
-            .iter()
-            .map(|column| crate::catalog::index_name(table, column))
-            .collect();
-        if names.is_empty() {
+        if dropped.is_empty() {
             return;
         }
         let store = Arc::clone(&self.chunk_store);
-        let delete = move || {
-            for name in names {
+        let deleted = tokio::task::spawn_blocking(move || {
+            for name in dropped {
                 if let Err(error) = store.drop_index(&name) {
                     tracing::warn!(%name, %error, "could not delete a dropped index's chunks");
                 }
             }
-        };
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                handle.spawn_blocking(delete);
-            }
-            Err(_) => delete(),
+        })
+        .await;
+        if let Err(error) = deleted {
+            tracing::warn!(%error, "deleting a dropped index's chunks failed");
         }
     }
 
