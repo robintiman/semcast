@@ -120,6 +120,23 @@ indexed column keeps its stack instead, since pruning rows beats a floor of one
 call each. Fused verdicts are cached under their own key, so a query that fuses
 does not reuse verdicts cached by a single-condition query.
 
+`MEANS` works anywhere an expression does: under `NOT` or `OR`, as a `GROUP BY`
+key, inside an aggregate or window function. There it can't prune, so every row
+reaching it is asked; `EXPLAIN` shows the cost. In `a OR x MEANS '…'`, rows `a`
+already matches skip the model. Text that is NULL has no verdict (NULL, as with
+`LIKE`), so `NOT` doesn't keep it. The one refusal is a `MEANS` on the kept
+side of an outer join's `ON` (`t` in `t LEFT JOIN c ON … AND t.body MEANS …`),
+which decides which rows find a match: compute it in a subquery first.
+
+```sql
+SELECT id FROM tickets
+WHERE priority = 'urgent' OR body MEANS 'threatens to cancel';
+
+SELECT CASE WHEN body MEANS 'customer is angry' THEN 'angry' ELSE 'calm' END
+         AS mood, count(*)
+FROM tickets GROUP BY 1;
+```
+
 #### `MEANS` in a `SELECT` list
 
 ```sql

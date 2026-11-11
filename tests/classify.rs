@@ -367,20 +367,22 @@ async fn with_recall_on_a_classify_is_a_plan_time_error() {
     );
 }
 
+/// A MEANS inside an aggregate in a HAVING is computed per row below the
+/// aggregate, then aggregated like any column.
 #[tokio::test]
-async fn means_in_a_having_clause_is_still_a_plan_time_error() {
+async fn means_inside_a_having_aggregate_is_computed_per_row() {
     let ctx = tickets_context(classify_model()).await;
-    let message = error(
+    let batches = run(
         &ctx,
-        "SELECT status, count(*) FROM tickets GROUP BY status
+        "SELECT status, count(*) AS n FROM tickets GROUP BY status
          HAVING bool_or(body MEANS 'the customer is angry')",
     )
     .await;
-
-    assert!(
-        message.contains("WHERE") && message.contains("SELECT list"),
-        "error should name the legal positions: {message}"
-    );
+    let text = datafusion::arrow::util::pretty::pretty_format_batches(&batches)
+        .unwrap()
+        .to_string();
+    assert!(text.contains("| open   | 3 |"), "{text}");
+    assert!(!text.contains("closed"), "{text}");
 }
 
 #[tokio::test]

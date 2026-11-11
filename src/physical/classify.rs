@@ -93,8 +93,9 @@ fn classify_schema(count: usize) -> serde_json::Value {
 /// Labels each input row against a set of natural-language conditions,
 /// appending one boolean column per condition.
 ///
-/// Row semantics ("rows fail, queries don't"): a NULL text, or a row the guard
-/// excludes, costs no call and gets `false` throughout. A row whose call fails
+/// Row semantics ("rows fail, queries don't"): a row the guard excludes costs
+/// no call and gets `false` throughout; a NULL text costs no call and gets
+/// NULL, like `NULL LIKE 'x'`. A row whose call fails
 /// or answers unparseably gets NULL — which no `CASE` branch matches, so the
 /// row falls through to the next branch or `ELSE` instead of taking the query
 /// down with it.
@@ -439,11 +440,10 @@ impl Classifier {
                 }
                 continue;
             }
-            // NULL text can't satisfy anything, and costs no call.
+            // NULL text costs no call and has no verdict: NULL, as SQL reads
+            // `NULL LIKE 'x'`. No CASE branch matches it, and NOT keeps it
+            // out too, which `false` would not.
             if !texts.is_valid(row) {
-                for verdict in verdicts.iter_mut() {
-                    verdict[row] = Some(false);
-                }
                 continue;
             }
             let text = texts.value(row);

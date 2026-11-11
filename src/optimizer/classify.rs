@@ -21,7 +21,7 @@
 
 use std::sync::Arc;
 
-use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
+use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{Column, Result, plan_err};
 use datafusion::logical_expr::expr::Case;
 use datafusion::logical_expr::expr_rewriter::NamePreserver;
@@ -102,28 +102,6 @@ pub(crate) fn rewrite_expr(
         .data)
 }
 
-/// Replace each `confidence()` in a `WHERE` predicate with its column,
-/// leaving any bare `means()` for the filter rewrite — which decides whether
-/// its position is legal.
-pub(crate) fn lift_confidence(expr: Expr, builder: &mut Builder) -> Result<Expr> {
-    // Top-down, so an outer call is checked before anything inside it is
-    // replaced: a CONFIDENCE() reading another one must still be refused.
-    Ok(expr
-        .transform_down(|expr| {
-            if is_confidence_call(&expr) {
-                let (text, condition) = destructure_confidence(expr)?;
-                let column = builder.register_confidence(text, condition, &None);
-                return Ok(Transformed::new(
-                    Expr::Column(column),
-                    true,
-                    TreeNodeRecursion::Jump,
-                ));
-            }
-            Ok(Transformed::no(expr))
-        })?
-        .data)
-}
-
 /// A `CASE` gates its `MEANS` branches by the ordinary conditions that precede
 /// them: a row an earlier branch already claimed never reaches the model.
 ///
@@ -185,6 +163,12 @@ fn case_guard(case: &Case, outer: &Option<Expr>) -> Result<Option<Expr>> {
     for (when, _) in &case.when_then_expr {
         if contains_means(when)? {
             break;
+        }
+        // A volatile condition would be evaluated twice, here and in the
+        // CASE, and the two could disagree: the guard would skip a row the
+        // CASE then sends to this branch. Leave it out; that only asks more.
+        if when.is_volatile() {
+            continue;
         }
         leading.push((**when).clone().is_not_true());
     }

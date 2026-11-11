@@ -137,39 +137,60 @@ async fn direct_means_udf_call_works_through_ctx_sql() {
     assert_eq!(rows, 1);
 }
 
+/// Under OR, a MEANS is lifted into a yes/no column; a row the cheap
+/// disjunct already matches skips the model.
 #[tokio::test]
-async fn means_under_or_is_a_plan_time_error() {
-    let ctx = meetings_context().await;
-    let err = semcast::sql(
+async fn means_under_or_asks_only_rows_still_unmatched() {
+    let model = Arc::new(MockModel::answering_yes_to(["offline sync"]));
+    let ctx = meetings_context_with_model(Arc::clone(&model)).await;
+    let mut ids = matching_ids(
         &ctx,
         "SELECT meeting_id FROM meetings WHERE meeting_id = 3 OR transcript MEANS 'x'",
     )
-    .await
-    .unwrap()
-    .into_optimized_plan()
-    .unwrap_err();
-    assert!(
-        err.to_string().contains("top-level AND conjunct"),
-        "unexpected error: {err}"
+    .await;
+    ids.sort_unstable();
+    assert_eq!(ids, vec![1, 3]);
+    assert_eq!(model.completion_calls(), 2, "meeting 3 was already matched");
+}
+
+/// A volatile disjunct can't guard: it would be evaluated twice and could
+/// disagree with itself. Every row is asked.
+#[tokio::test]
+async fn a_volatile_disjunct_does_not_skip_the_model() {
+    let model = Arc::new(MockModel::answering_yes_to(["offline sync"]));
+    let ctx = meetings_context_with_model(Arc::clone(&model)).await;
+    let ids = matching_ids(
+        &ctx,
+        "SELECT meeting_id FROM meetings WHERE random() >= 0 OR transcript MEANS 'x'",
+    )
+    .await;
+    assert_eq!(ids.len(), 3);
+    assert_eq!(
+        model.completion_calls(),
+        2,
+        "both non-NULL transcripts asked"
     );
 }
 
+/// NOT keeps what the model says doesn't hold. A NULL transcript has no
+/// verdict, so — as with `NOT (NULL LIKE 'x')` — it is not kept.
 #[tokio::test]
-async fn means_under_not_is_a_plan_time_error() {
-    let ctx = meetings_context().await;
-    let err = semcast::sql(
+async fn means_under_not_keeps_the_rows_that_dont_match() {
+    let model = Arc::new(MockModel::answering_yes_to(["offline sync"]));
+    let ctx = meetings_context_with_model(Arc::clone(&model)).await;
+    let ids = matching_ids(
         &ctx,
         "SELECT meeting_id FROM meetings WHERE NOT transcript MEANS 'x'",
     )
-    .await
-    .unwrap()
-    .into_optimized_plan()
-    .unwrap_err();
-    assert!(err.to_string().contains("top-level AND conjunct"), "{err}");
+    .await;
+    assert_eq!(ids, vec![2]);
+    assert_eq!(
+        model.completion_calls(),
+        2,
+        "the NULL transcript costs nothing"
+    );
 }
 
-/// A SELECT-list `MEANS` is a label, not a filter — it plans a `SemClassify`
-/// rather than the `SemFilter` a `WHERE` gets. See `tests/classify.rs`.
 #[tokio::test]
 async fn means_in_select_list_plans_a_classify() {
     let ctx = meetings_context().await;
@@ -183,19 +204,29 @@ async fn means_in_select_list_plans_a_classify() {
     assert!(!display.contains("SemFilter"), "{display}");
 }
 
+/// A MEANS can be a GROUP BY key: one group per verdict, NULL for the
+/// NULL transcript.
 #[tokio::test]
-async fn means_in_a_group_by_is_a_plan_time_error() {
-    let ctx = meetings_context().await;
-    let err = semcast::sql(
+async fn means_as_a_group_by_key_groups_by_verdict() {
+    let model = Arc::new(MockModel::answering_yes_to(["offline sync"]));
+    let ctx = meetings_context_with_model(Arc::clone(&model)).await;
+    let batches = semcast::sql(
         &ctx,
-        "SELECT count(*) FROM meetings GROUP BY transcript MEANS 'x'",
+        "SELECT transcript MEANS 'x' AS synced, count(*) AS n FROM meetings \
+         GROUP BY transcript MEANS 'x' ORDER BY synced NULLS LAST",
     )
     .await
     .unwrap()
-    .into_optimized_plan()
-    .unwrap_err();
-    assert!(err.to_string().contains("WHERE"), "{err}");
-    assert!(err.to_string().contains("SELECT list"), "{err}");
+    .collect()
+    .await
+    .unwrap();
+    let text = datafusion::arrow::util::pretty::pretty_format_batches(&batches)
+        .unwrap()
+        .to_string();
+    for row in ["| false  | 1 |", "| true   | 1 |", "|        | 1 |"] {
+        assert!(text.contains(row), "{text}");
+    }
+    assert_eq!(model.completion_calls(), 2);
 }
 
 #[tokio::test]
@@ -331,7 +362,7 @@ async fn with_recall_without_means_is_an_error() {
         .unwrap_err();
     let message = err.to_string();
     assert!(
-        message.contains("requires a MEANS predicate"),
+        message.contains("requires a MEANS that filters"),
         "got: {message}"
     );
 }
