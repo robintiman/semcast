@@ -1219,3 +1219,53 @@ async fn certifying_keeps_at_least_what_estimating_keeps() {
     assert_eq!(kept[0], vec![1]);
     assert_eq!(kept[1], vec![1], "the certified funnel is at least as wide");
 }
+
+/// The calibrated floor itself, on rows the sample never labels: 200
+/// documents against a 64-document sample, so most rows are decided by the
+/// floor alone. Matches embed at 1.0 and negatives at 0.0; the floor must
+/// prune the unsampled negatives, and keep every match.
+#[tokio::test]
+async fn the_calibrated_floor_prunes_rows_outside_the_sample() {
+    const MATCHES: i64 = 30;
+    const NEGATIVES: i64 = 170;
+    let model = Arc::new(MockModel::answering_yes_to(["sync"]).embedding_by_theme(["sync"]));
+    let ctx = semcast_context(Arc::clone(&model) as _);
+    let rows: Vec<String> = (1..=MATCHES)
+        .map(|id| format!("({id}, 'sync {id}')"))
+        .chain((1..=NEGATIVES).map(|n| format!("({}, '{:04}')", MATCHES + n, n * 7)))
+        .collect();
+    ctx.sql(&format!(
+        "CREATE TABLE meetings AS SELECT * FROM (VALUES {}) AS t(meeting_id, transcript)",
+        rows.join(", "),
+    ))
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    create_semantic_index(&ctx, "meetings", "transcript", index_options(&dir))
+        .await
+        .unwrap();
+
+    let metrics = calibrated_scan_metrics(&ctx).await;
+    let by_floor = metrics.sum_by_name("rows_pruned").unwrap().as_usize();
+    let by_label = metrics.sum_by_name("store_pruned").unwrap().as_usize();
+    assert_eq!(
+        by_floor + by_label,
+        NEGATIVES as usize,
+        "every negative is dropped"
+    );
+    assert!(
+        by_floor >= 100,
+        "most negatives sit outside the sample, so the floor must prune them: \
+         {by_floor} by the floor, {by_label} by their labels"
+    );
+    // Only the sample is labelled and only unsampled matches are verified:
+    // nowhere near one call per row.
+    assert!(model.completion_calls() < 64 + MATCHES as usize);
+    assert_eq!(
+        matching_ids(&ctx, CALIBRATED_QUERY).await,
+        (1..=MATCHES).collect::<Vec<_>>()
+    );
+}
