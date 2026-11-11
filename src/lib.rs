@@ -292,7 +292,7 @@ pub struct SemcastContextBuilder {
     embedder: Option<Arc<dyn ModelProvider>>,
     scorer: Option<Arc<dyn ModelProvider>>,
     cache: Arc<dyn SemanticCache>,
-    index_root: Option<std::path::PathBuf>,
+    chunk_store: Option<Arc<dyn crate::index::stored::ChunkStore>>,
     information_schema: bool,
     memory_limit: Option<usize>,
     catalog: Option<catalog::Catalog>,
@@ -307,7 +307,7 @@ impl SemcastContextBuilder {
             embedder: None,
             scorer: None,
             cache: Arc::new(InMemoryCache::default()),
-            index_root: None,
+            chunk_store: None,
             information_schema: false,
             memory_limit: None,
             catalog: None,
@@ -354,9 +354,11 @@ impl SemcastContextBuilder {
         self
     }
 
-    /// Where `CREATE SEMANTIC INDEX` puts Lance datasets; defaults to the temp dir.
-    pub fn with_index_root(mut self, root: impl Into<std::path::PathBuf>) -> Self {
-        self.index_root = Some(root.into());
+    /// Keep semantic-index chunks and vectors in `store` (the store file,
+    /// via [`index::stored::SqliteChunkStore`]) so indexes survive a
+    /// restart without re-embedding. In memory by default.
+    pub fn with_chunk_store(mut self, store: Arc<dyn crate::index::stored::ChunkStore>) -> Self {
+        self.chunk_store = Some(store);
         self
     }
 
@@ -420,8 +422,8 @@ impl SemcastContextBuilder {
         let scorer: Option<Arc<dyn ModelProvider>> = self
             .scorer
             .map(|scorer| Arc::new(crate::model::Scheduler::new(scorer, self.max_in_flight)) as _);
-        if let Some(root) = self.index_root {
-            runtime = runtime.with_index_root(root);
+        if let Some(store) = self.chunk_store {
+            runtime = runtime.with_chunk_store(store);
         }
         if let Some(catalog) = self.catalog {
             runtime = runtime.with_catalog(catalog);

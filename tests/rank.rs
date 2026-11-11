@@ -68,7 +68,6 @@ async fn indexed_context(model: Arc<MockModel>) -> (SessionContext, tempfile::Te
         "meetings",
         "transcript",
         IndexOptions {
-            path: Some(dir.path().join("meetings.transcript.lance")),
             ..Default::default()
         },
     )

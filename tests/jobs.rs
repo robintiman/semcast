@@ -30,7 +30,6 @@ async fn connect_with_slots(model: Arc<dyn ModelProvider>, max_concurrent: usize
     let jobs_root = tempfile::tempdir().unwrap();
     let ctx = Arc::new(
         SemcastContextBuilder::new(model)
-            .with_index_root(index_root.path())
             .with_information_schema(true)
             .build(),
     );

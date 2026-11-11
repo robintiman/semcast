@@ -17,7 +17,6 @@ async fn connect(
 ) -> (tokio_postgres::Client, Arc<Mutex<Vec<String>>>) {
     let index_root = tempfile::tempdir().unwrap();
     let ctx = SemcastContextBuilder::new(model)
-        .with_index_root(index_root.path())
         .with_information_schema(true)
         .build();
     std::mem::forget(index_root); // keep Lance datasets alive for the test

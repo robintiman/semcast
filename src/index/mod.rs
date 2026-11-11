@@ -5,21 +5,20 @@
 //! double duty: the same chunk vectors that pre-filter candidates also tell
 //! the verify step *which* chunks to show the model.
 //!
-//! Backing store: [Lance] (Arrow-native). Documents are identified by
-//! [`doc_hash`] of their text value, not row position — robust to joins,
-//! projections, and reordering, and it lets the pre-filter pass unindexed
-//! rows through to full-text verification instead of silently dropping them.
-//!
-//! [Lance]: https://lancedb.github.io/lance/
+//! Backing store: [`stored`] — chunk vectors are `EMBED` answers kept in the
+//! store file (or memory), content-addressed by embedder and chunk text, and
+//! searched exactly. Documents are identified by [`doc_hash`] of their text
+//! value, not row position — robust to joins, projections, and reordering,
+//! and it lets the pre-filter pass unindexed rows through to full-text
+//! verification instead of silently dropping them.
 
 pub mod chunk;
 pub mod dedupe;
 pub mod kmeans;
-pub mod lance;
 pub mod registry;
+pub mod stored;
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -34,7 +33,7 @@ use crate::{Result, SemcastError};
 use chunk::ChunkConfig;
 use registry::SemcastRuntime;
 
-use self::lance::LanceIndex;
+use self::stored::StoredIndex;
 
 /// Stable identity of a document: FNV-1a over the text value. Index entries
 /// outlive the process, so this must never change — `DefaultHasher` (which
@@ -138,23 +137,23 @@ pub trait SemanticIndex: std::fmt::Debug + Send + Sync {
     async fn doc_vectors(&self) -> Result<HashMap<u64, Embedding>>;
 }
 
-/// Options for [`create_semantic_index`]. The defaults index into a
-/// temp-dir Lance dataset using the session's model as embedder.
+/// Options for [`create_semantic_index`]. The defaults use the session's
+/// embedder and keep the index wherever the session keeps indexes (the
+/// store file, or memory).
 #[derive(Debug, Clone, Default)]
 pub struct IndexOptions {
     /// Embedding provider; defaults to the runtime's embedder — the session
     /// model, unless the context builder set one (e.g. Voyage, or Ollama
     /// when the session model can't embed).
     pub embedder: Option<Arc<dyn ModelProvider>>,
-    /// Where the Lance dataset lives; defaults under the runtime's index root.
-    pub path: Option<PathBuf>,
     pub chunk: ChunkConfig,
     pub search: SearchParams,
 }
 
 /// Chunk, embed, and index `table.column`, and register the index with the
 /// session so `MEANS` predicates over that column plan an index pre-filter
-/// stage. Re-creating an existing index overwrites it.
+/// stage. Re-creating an existing index starts it over; vectors already
+/// stored for the same chunks are read back rather than embedded again.
 pub async fn create_semantic_index(
     ctx: &SessionContext,
     table: &str,
@@ -166,15 +165,16 @@ pub async fn create_semantic_index(
         .embedder
         .unwrap_or_else(|| Arc::clone(runtime.embedder()));
     let texts = read_column_texts(ctx, table, column).await?;
-    let path = options
-        .path
-        .unwrap_or_else(|| runtime.index_root().join(format!("{table}.{column}.lance")));
-    let uri = path
-        .to_str()
-        .ok_or_else(|| SemcastError::Index("index path is not valid UTF-8".to_owned()))?;
-    let index = LanceIndex::create(uri, embedder, options.chunk, options.search).await?;
-    index.add_documents(texts).await?;
-    let index: Arc<dyn SemanticIndex> = Arc::new(index);
+    let stored = StoredIndex::new(
+        crate::catalog::index_name(table, column),
+        Arc::clone(runtime.chunk_store()),
+        Arc::clone(&embedder),
+        options.chunk.clone(),
+        options.search,
+    );
+    stored.reset().await?;
+    stored.add_documents(texts).await?;
+    let index: Arc<dyn SemanticIndex> = Arc::new(stored);
     runtime.register_index(table, column, Arc::clone(&index));
     if let Some(catalog) = runtime.catalog() {
         let _guard = catalog.lock().await;
@@ -192,13 +192,13 @@ pub async fn create_semantic_index(
             );
             return Ok(index);
         }
-        // Absolute, so a restart from another directory finds the dataset.
-        let path =
-            std::path::absolute(&path).map_err(|error| SemcastError::Index(error.to_string()))?;
         let saved = SavedIndex {
             table: table.to_owned(),
             column: column.to_owned(),
-            path,
+            embed_model: Some(embedder.id().0),
+            chunk_max_tokens: Some(options.chunk.max_tokens),
+            chunk_overlap_tokens: Some(options.chunk.overlap_tokens),
+            path: None,
             fetch_k: options.search.fetch_k,
             score_floor: options.search.score_floor,
             chunks_per_doc: options.search.chunks_per_doc,
@@ -217,14 +217,23 @@ pub async fn create_semantic_index(
     Ok(index)
 }
 
-/// What the durable catalog keeps of a semantic index: enough to reopen it
-/// without embedding anything. Chunking and the embed model are recorded in
-/// the dataset itself.
+/// What the durable catalog keeps of a semantic index: enough to reopen its
+/// stored chunks without embedding anything. An entry written by a build
+/// that kept indexes in Lance has a `path` and none of the chunking fields;
+/// it is rebuilt on restore.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct SavedIndex {
     table: String,
     column: String,
-    path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    embed_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    chunk_max_tokens: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    chunk_overlap_tokens: Option<usize>,
+    /// The Lance dataset an older build kept the index in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    path: Option<std::path::PathBuf>,
     fetch_k: usize,
     score_floor: f32,
     chunks_per_doc: usize,
@@ -232,9 +241,12 @@ struct SavedIndex {
 
 /// Reopen a semantic index from its saved catalog `definition` and register
 /// it with the session — no documents are read and nothing is embedded.
-/// Fails when the dataset is gone or was built with another embed model
-/// than the session's. Documents added to the table since stay unindexed
-/// until a refresh, and pass through to full verification meanwhile.
+/// Fails when the index was built with another embed model than the
+/// session's. Documents added to the table since stay unindexed until a
+/// refresh, and pass through to full verification meanwhile.
+///
+/// An index saved by a build that kept it in Lance is rebuilt from its
+/// column: its vectors were never in the store, so this embeds once.
 pub async fn reattach_semantic_index(
     ctx: &SessionContext,
     definition: &str,
@@ -242,17 +254,53 @@ pub async fn reattach_semantic_index(
     let runtime = runtime(ctx)?;
     let saved: SavedIndex = serde_json::from_str(definition)
         .map_err(|error| SemcastError::Index(format!("unreadable saved index: {error}")))?;
-    let uri = saved
-        .path
-        .to_str()
-        .ok_or_else(|| SemcastError::Index("index path is not valid UTF-8".to_owned()))?;
     let search = SearchParams {
         fetch_k: saved.fetch_k,
         score_floor: saved.score_floor,
         chunks_per_doc: saved.chunks_per_doc,
     };
-    let index = LanceIndex::open(uri, Arc::clone(runtime.embedder()), search).await?;
-    let index: Arc<dyn SemanticIndex> = Arc::new(index);
+    let embedder = Arc::clone(runtime.embedder());
+    let (Some(embed_model), Some(max_tokens), Some(overlap_tokens)) = (
+        saved.embed_model.as_ref(),
+        saved.chunk_max_tokens,
+        saved.chunk_overlap_tokens,
+    ) else {
+        tracing::warn!(
+            table = %saved.table,
+            column = %saved.column,
+            "semantic index saved by an older build (Lance); rebuilding it from its column"
+        );
+        return create_semantic_index(
+            ctx,
+            &saved.table,
+            &saved.column,
+            IndexOptions {
+                embedder: None,
+                chunk: ChunkConfig::default(),
+                search,
+            },
+        )
+        .await;
+    };
+    if &embedder.id().0 != embed_model {
+        return Err(SemcastError::Index(format!(
+            "the semantic index on {}({}) was built with embedder {embed_model}, but the \
+             session embeds with {}; recreate it with CREATE SEMANTIC INDEX",
+            saved.table,
+            saved.column,
+            embedder.id().0
+        )));
+    }
+    let index: Arc<dyn SemanticIndex> = Arc::new(StoredIndex::new(
+        crate::catalog::index_name(&saved.table, &saved.column),
+        Arc::clone(runtime.chunk_store()),
+        embedder,
+        ChunkConfig {
+            max_tokens,
+            overlap_tokens,
+        },
+        search,
+    ));
     runtime.register_index(&saved.table, &saved.column, Arc::clone(&index));
     Ok(index)
 }

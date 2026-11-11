@@ -1,12 +1,12 @@
 //! Tests for roadmap step 2: the Lance-backed semantic index and its
 //! programmatic API, against the deterministic mock model.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{Int64Array, RecordBatch};
 use datafusion::execution::context::SessionContext;
 use datafusion::physical_plan::displayable;
-use semcast::index::lance::LanceIndex;
 use semcast::index::{SearchParams, doc_hash};
 use semcast::model::{MockModel, ModelId, ModelProvider};
 use semcast::{IndexOptions, create_semantic_index, refresh_semantic_index, semcast_context};
@@ -34,18 +34,10 @@ async fn meetings_context() -> SessionContext {
     ctx
 }
 
-fn index_options(dir: &tempfile::TempDir) -> IndexOptions {
-    IndexOptions {
-        path: Some(dir.path().join("meetings.transcript.lance")),
-        ..Default::default()
-    }
-}
-
 #[tokio::test]
 async fn index_skips_nulls_and_knows_its_documents() {
     let ctx = meetings_context().await;
-    let dir = tempfile::tempdir().unwrap();
-    let index = create_semantic_index(&ctx, "meetings", "transcript", index_options(&dir))
+    let index = create_semantic_index(&ctx, "meetings", "transcript", IndexOptions::default())
         .await
         .unwrap();
 
@@ -58,8 +50,7 @@ async fn index_skips_nulls_and_knows_its_documents() {
 #[tokio::test]
 async fn search_ranks_the_identical_document_first() {
     let ctx = meetings_context().await;
-    let dir = tempfile::tempdir().unwrap();
-    let index = create_semantic_index(&ctx, "meetings", "transcript", index_options(&dir))
+    let index = create_semantic_index(&ctx, "meetings", "transcript", IndexOptions::default())
         .await
         .unwrap();
 
@@ -82,8 +73,7 @@ async fn search_ranks_the_identical_document_first() {
 #[tokio::test]
 async fn refresh_indexes_only_new_documents() {
     let ctx = meetings_context().await;
-    let dir = tempfile::tempdir().unwrap();
-    create_semantic_index(&ctx, "meetings", "transcript", index_options(&dir))
+    create_semantic_index(&ctx, "meetings", "transcript", IndexOptions::default())
         .await
         .unwrap();
 
@@ -111,22 +101,7 @@ async fn refresh_indexes_only_new_documents() {
 }
 
 #[tokio::test]
-async fn opening_with_a_different_embedder_errors() {
-    let ctx = meetings_context().await;
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("meetings.transcript.lance");
-    create_semantic_index(
-        &ctx,
-        "meetings",
-        "transcript",
-        IndexOptions {
-            path: Some(path.clone()),
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
-
+async fn reattaching_with_a_different_embedder_errors() {
     #[derive(Debug)]
     struct OtherEmbedder(MockModel);
 
@@ -149,18 +124,18 @@ async fn opening_with_a_different_embedder_errors() {
         }
     }
 
-    let err = LanceIndex::open(
-        path.to_str().unwrap(),
-        Arc::new(OtherEmbedder(MockModel::default())),
-        SearchParams::default(),
-    )
-    .await
-    .unwrap_err();
+    // What the catalog saves for an index built with the mock embedder.
+    let definition = r#"{"table":"meetings","column":"transcript","embed_model":"mock",
+        "chunk_max_tokens":512,"chunk_overlap_tokens":64,
+        "fetch_k":256,"score_floor":0.35,"chunks_per_doc":3}"#;
+    let ctx = semcast_context(Arc::new(OtherEmbedder(MockModel::default())));
+    let err = semcast::reattach_semantic_index(&ctx, definition)
+        .await
+        .unwrap_err();
     let message = err.to_string();
-    assert!(message.contains("built with embed model"), "got: {message}");
     assert!(
-        message.contains("mock"),
-        "names the recorded model: {message}"
+        message.contains("built with embedder mock"),
+        "got: {message}"
     );
     assert!(
         message.contains("other-model"),
@@ -180,16 +155,8 @@ async fn opening_with_a_different_embedder_errors() {
 
 /// Fixture with byte-histogram-separable transcripts: doc 1 is exactly the
 /// query, doc 2 scores ~0.58 against it, doc 3 is NULL.
-/// Each context gets its own index root: `CREATE SEMANTIC INDEX` writes
-/// `<root>/meetings.transcript.lance`, and tests sharing the default root
-/// race on the same dataset (Lance rejects the second concurrent overwrite).
 async fn separable_context(model: Arc<MockModel>) -> SessionContext {
-    let root = tempfile::tempdir().unwrap();
-    let ctx = semcast::SemcastContextBuilder::new(model)
-        .with_index_root(root.path())
-        .build();
-    // Leak the tempdir so the Lance dataset outlives this helper.
-    std::mem::forget(root);
+    let ctx = semcast::SemcastContextBuilder::new(model).build();
     ctx.sql(
         "CREATE TABLE meetings AS
          SELECT * FROM (VALUES
@@ -232,13 +199,11 @@ async fn matching_ids(ctx: &SessionContext, sql: &str) -> Vec<i64> {
 async fn indexed_query_plans_the_funnel_and_prunes() {
     let model = Arc::new(MockModel::answering_yes_to(["sync"]));
     let ctx = separable_context(Arc::clone(&model)).await;
-    let dir = tempfile::tempdir().unwrap();
     create_semantic_index(
         &ctx,
         "meetings",
         "transcript",
         IndexOptions {
-            path: Some(dir.path().join("idx.lance")),
             search: SearchParams {
                 score_floor: 0.9,
                 ..Default::default()
@@ -282,13 +247,11 @@ async fn indexed_query_plans_the_funnel_and_prunes() {
 async fn unindexed_rows_pass_through_to_full_text_verify() {
     let model = Arc::new(MockModel::answering_yes_to(["sync"]));
     let ctx = separable_context(Arc::clone(&model)).await;
-    let dir = tempfile::tempdir().unwrap();
     create_semantic_index(
         &ctx,
         "meetings",
         "transcript",
         IndexOptions {
-            path: Some(dir.path().join("idx.lance")),
             search: SearchParams {
                 score_floor: 0.9,
                 ..Default::default()
@@ -335,13 +298,11 @@ async fn verify_reads_chunks_not_the_full_document() {
     .collect()
     .await
     .unwrap();
-    let dir = tempfile::tempdir().unwrap();
     create_semantic_index(
         &ctx,
         "meetings",
         "transcript",
         IndexOptions {
-            path: Some(dir.path().join("idx.lance")),
             ..Default::default()
         },
     )
@@ -473,12 +434,10 @@ async fn calibration_context(model: Arc<MockModel>) -> SessionContext {
     .collect()
     .await
     .unwrap();
-    let dir = tempfile::tempdir().unwrap();
-    create_semantic_index(&ctx, "meetings", "transcript", index_options(&dir))
+    create_semantic_index(&ctx, "meetings", "transcript", IndexOptions::default())
         .await
         .unwrap();
     // Leak the tempdir so the Lance dataset outlives this helper.
-    std::mem::forget(dir);
     ctx
 }
 
@@ -604,13 +563,11 @@ async fn oversubscribed_context(model: Arc<MockModel>) -> SessionContext {
     .collect()
     .await
     .unwrap();
-    let dir = tempfile::tempdir().unwrap();
     create_semantic_index(
         &ctx,
         "meetings",
         "transcript",
         IndexOptions {
-            path: Some(dir.path().join("idx.lance")),
             search: SearchParams {
                 fetch_k: 16,
                 ..Default::default()
@@ -620,7 +577,6 @@ async fn oversubscribed_context(model: Arc<MockModel>) -> SessionContext {
     )
     .await
     .unwrap();
-    std::mem::forget(dir);
     ctx
 }
 
@@ -741,11 +697,9 @@ async fn sorted_matches_context(model: Arc<MockModel>) -> SessionContext {
     .collect()
     .await
     .unwrap();
-    let dir = tempfile::tempdir().unwrap();
-    create_semantic_index(&ctx, "meetings", "transcript", index_options(&dir))
+    create_semantic_index(&ctx, "meetings", "transcript", IndexOptions::default())
         .await
         .unwrap();
-    std::mem::forget(dir);
     ctx
 }
 
@@ -796,8 +750,7 @@ async fn calibration_buffer_respects_the_memory_limit() {
     .collect()
     .await
     .unwrap();
-    let dir = tempfile::tempdir().unwrap();
-    create_semantic_index(&ctx, "meetings", "transcript", index_options(&dir))
+    create_semantic_index(&ctx, "meetings", "transcript", IndexOptions::default())
         .await
         .unwrap();
 
@@ -854,11 +807,9 @@ async fn failure_context(model: Arc<MockModel>, extra: &[&str]) -> SessionContex
     .collect()
     .await
     .unwrap();
-    let dir = tempfile::tempdir().unwrap();
-    create_semantic_index(&ctx, "meetings", "transcript", index_options(&dir))
+    create_semantic_index(&ctx, "meetings", "transcript", IndexOptions::default())
         .await
         .unwrap();
-    std::mem::forget(dir);
     ctx
 }
 
@@ -954,10 +905,12 @@ fn find_node(
 }
 
 #[tokio::test]
-async fn builder_index_root_hosts_ddl_created_indexes() {
+async fn a_chunk_store_keeps_ddl_created_indexes() {
     let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store.sqlite");
+    let store = semcast::index::stored::SqliteChunkStore::open(&path).unwrap();
     let ctx = semcast::SemcastContextBuilder::new(Arc::new(MockModel::answering_yes_to(["sync"])))
-        .with_index_root(dir.path())
+        .with_chunk_store(Arc::new(store))
         .build();
     ctx.sql(&format!(
         "CREATE TABLE meetings AS
@@ -976,20 +929,19 @@ async fn builder_index_root_hosts_ddl_created_indexes() {
         .await
         .unwrap();
 
-    assert!(
-        dir.path().join("meetings.transcript.lance").is_dir(),
-        "Lance dataset lands under the builder's index root",
-    );
+    // Another connection to the same file sees the index's documents.
+    use semcast::index::stored::ChunkStore;
+    let reopened = semcast::index::stored::SqliteChunkStore::open(&path).unwrap();
+    let docs = reopened.doc_hashes("meetings(transcript)").unwrap();
+    assert_eq!(docs, HashSet::from([doc_hash(MATCHING)]));
 }
 
 #[tokio::test]
 async fn builder_embedder_serves_ddl_created_indexes() {
     let model = Arc::new(MockModel::answering_yes_to(["sync"]));
     let embedder = Arc::new(MockModel::default());
-    let dir = tempfile::tempdir().unwrap();
     let ctx = semcast::SemcastContextBuilder::new(Arc::clone(&model) as Arc<dyn ModelProvider>)
         .with_embedder(Arc::clone(&embedder) as Arc<dyn ModelProvider>)
-        .with_index_root(dir.path())
         .build();
     ctx.sql(
         "CREATE TABLE meetings AS
@@ -1043,7 +995,7 @@ fn depth_of(display: &str, needle: &str) -> usize {
 
 /// Both a title and a transcript can match, so a two-predicate query returns
 /// a row rather than trivially nothing.
-async fn indexed_transcript_context(dir: &tempfile::TempDir) -> SessionContext {
+async fn indexed_transcript_context() -> SessionContext {
     let ctx = semcast_context(Arc::new(MockModel::answering_yes_to([
         "offline sync",
         "atlas planning",
@@ -1062,7 +1014,7 @@ async fn indexed_transcript_context(dir: &tempfile::TempDir) -> SessionContext {
     .await
     .unwrap();
     // Only `transcript` gets an index; `title` pays full price.
-    create_semantic_index(&ctx, "meetings", "transcript", index_options(dir))
+    create_semantic_index(&ctx, "meetings", "transcript", IndexOptions::default())
         .await
         .unwrap();
     ctx
@@ -1081,8 +1033,7 @@ async fn an_indexed_predicate_is_stacked_below_an_unindexed_one() {
         ("indexed written last", INDEXED_LAST),
         ("indexed written first", INDEXED_FIRST),
     ] {
-        let dir = tempfile::tempdir().unwrap();
-        let ctx = indexed_transcript_context(&dir).await;
+        let ctx = indexed_transcript_context().await;
         let plan = semcast::sql(&ctx, query)
             .await
             .unwrap()
@@ -1102,8 +1053,7 @@ async fn an_indexed_predicate_is_stacked_below_an_unindexed_one() {
 async fn conjunct_ordering_does_not_change_the_rows() {
     let mut answers = Vec::new();
     for query in [INDEXED_LAST, INDEXED_FIRST] {
-        let dir = tempfile::tempdir().unwrap();
-        let ctx = indexed_transcript_context(&dir).await;
+        let ctx = indexed_transcript_context().await;
         answers.push(matching_ids(&ctx, query).await);
     }
     assert_eq!(answers[0], vec![1], "the one meeting matching both");
@@ -1210,8 +1160,7 @@ async fn certifying_keeps_at_least_what_estimating_keeps() {
     let mut kept = Vec::new();
     for sql in [query, certified_query] {
         let ctx = meetings_context().await;
-        let dir = tempfile::tempdir().unwrap();
-        create_semantic_index(&ctx, "meetings", "transcript", index_options(&dir))
+        create_semantic_index(&ctx, "meetings", "transcript", IndexOptions::default())
             .await
             .unwrap();
         kept.push(matching_ids(&ctx, sql).await);
@@ -1253,8 +1202,7 @@ async fn the_calibrated_floor_prunes_rows_outside_the_sample() {
     .collect()
     .await
     .unwrap();
-    let dir = tempfile::tempdir().unwrap();
-    create_semantic_index(&ctx, "meetings", "transcript", index_options(&dir))
+    create_semantic_index(&ctx, "meetings", "transcript", IndexOptions::default())
         .await
         .unwrap();
 
@@ -1280,4 +1228,67 @@ async fn the_calibrated_floor_prunes_rows_outside_the_sample() {
         matching_ids(&ctx, CALIBRATED_QUERY).await,
         (1..=MATCHES).collect::<Vec<_>>()
     );
+}
+
+/// Vectors are `EMBED` answers, kept by embedder and chunk text: re-creating
+/// an index over the same text reads them back instead of embedding again.
+#[tokio::test]
+async fn recreating_an_index_reuses_stored_vectors() {
+    let model = Arc::new(MockModel::answering_yes_to(["offline sync"]));
+    let ctx = semcast_context(Arc::clone(&model) as _);
+    ctx.sql(&format!(
+        "CREATE TABLE meetings AS SELECT * FROM (VALUES (1, '{MATCHING}'), (2, '{OTHER}')) \
+         AS t(meeting_id, transcript)",
+    ))
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+    create_semantic_index(&ctx, "meetings", "transcript", IndexOptions::default())
+        .await
+        .unwrap();
+    let first = model.embed_calls();
+    assert!(first > 0);
+    let index = create_semantic_index(&ctx, "meetings", "transcript", IndexOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(model.embed_calls(), first, "no chunk embedded twice");
+    assert_eq!(index.indexed_doc_hashes().await.unwrap().len(), 2);
+}
+
+/// An index saved by a build that kept it in Lance has a dataset path and no
+/// chunking fields. Restoring it rebuilds it from its column.
+#[tokio::test]
+async fn an_index_saved_by_a_lance_build_is_rebuilt() {
+    let model = Arc::new(MockModel::answering_yes_to(["offline sync"]));
+    let ctx = semcast_context(Arc::clone(&model) as _);
+    ctx.sql(&format!(
+        "CREATE TABLE meetings AS SELECT * FROM (VALUES (1, '{MATCHING}'), (2, '{OTHER}')) \
+         AS t(meeting_id, transcript)",
+    ))
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+    let definition = r#"{"table":"meetings","column":"transcript",
+        "path":"/gone/meetings.transcript.lance",
+        "fetch_k":256,"score_floor":0.35,"chunks_per_doc":3}"#;
+    let index = semcast::reattach_semantic_index(&ctx, definition)
+        .await
+        .unwrap();
+    assert!(model.embed_calls() > 0, "rebuilt by embedding its column");
+    assert_eq!(index.indexed_doc_hashes().await.unwrap().len(), 2);
+    let plan = semcast::sql(
+        &ctx,
+        "SELECT meeting_id FROM meetings WHERE transcript MEANS 'offline sync'",
+    )
+    .await
+    .unwrap()
+    .create_physical_plan()
+    .await
+    .unwrap();
+    let display = displayable(plan.as_ref()).indent(true).to_string();
+    assert!(display.contains("IndexScanExec"), "{display}");
 }

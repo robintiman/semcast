@@ -46,7 +46,6 @@ async fn notes_context(model: Arc<MockModel>) -> (SessionContext, tempfile::Temp
         "notes",
         "body",
         IndexOptions {
-            path: Some(dir.path().join("notes.body.lance")),
             ..Default::default()
         },
     )

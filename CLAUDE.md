@@ -28,8 +28,8 @@ cargo run -- serve                          # start the server on 127.0.0.1:5433
 cargo run --example meetings                # README walk-through against the mock
 ```
 
-Building needs a system `protoc` (lance's `prost-build`); CI installs it via
-`arduino/setup-protoc`. Live tests read `SEMCAST_OLLAMA_MODEL` (default
+Building needs no system tools beyond Rust (CI still installs `protoc`, which
+Lance needed, until `release.yml` is regenerated with `dist`). Live tests read `SEMCAST_OLLAMA_MODEL` (default
 `gemma4:e4b`), `ANTHROPIC_API_KEY`, `VOYAGE_API_KEY`.
 
 Releases go through `./scripts/release.sh <version>` (try `--dry-run` first) — it
@@ -86,7 +86,8 @@ before `statement_to_plan`.
 
 `SemcastRuntime` (`src/index/registry.rs`) is a `SessionConfig` extension holding
 the completion model, the embedder (separate — Anthropic can't embed, Voyage can't
-complete), the index root, the `(table, column) → index` map, the semantic type
+complete), the chunk store semantic indexes keep their vectors in
+(`src/index/stored.rs`: SQLite with `--store`, memory otherwise), the `(table, column) → index` map, the semantic type
 registry and the optional durable catalog (`src/catalog.rs`). Both the public API
 and the physical planner reach it via
 `state.config().get_extension::<SemcastRuntime>()`; that's the plumbing to reuse

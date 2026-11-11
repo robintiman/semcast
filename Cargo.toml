@@ -15,8 +15,6 @@ blake3 = "1.8"
 clap = { version = "4.6", features = ["derive"] }
 datafusion = "54"
 futures = "0.3.32"
-lance = { version = "8", default-features = false }
-lance-linalg = "8"
 linfa = "0.8.1"
 linfa-logistic = "0.8.1"
 ndarray = "0.16"
@@ -26,7 +24,7 @@ rusqlite = { version = "0.41", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 thiserror = "2.0.18"
-tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "time", "signal"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "time", "signal", "fs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

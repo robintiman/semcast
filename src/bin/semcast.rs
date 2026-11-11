@@ -61,11 +61,13 @@ struct ServeArgs {
     /// Voyage embedding model (with `--embed-provider voyage`).
     #[arg(long, default_value = semcast::model::DEFAULT_VOYAGE_MODEL)]
     voyage_model: String,
-    /// Where semantic indexes are stored; temp dir if unset.
-    #[arg(long)]
+    /// No longer used: semantic indexes live in the --store file (or in
+    /// memory without one). Accepted so existing scripts keep starting.
+    #[arg(long, hide = true)]
     index_dir: Option<PathBuf>,
-    /// SQLite file that keeps model verdicts and definitions (tables, views,
-    /// semantic types and indexes) across restarts, created if missing. A
+    /// SQLite file that keeps model verdicts, semantic-index vectors and
+    /// definitions (tables, views, semantic types and indexes) across
+    /// restarts, created if missing. A
     /// restarted server has the same tables, and a query answered once costs
     /// no model calls. Both live in memory only if unset.
     #[arg(long)]
@@ -155,8 +157,11 @@ async fn main() -> std::io::Result<()> {
             OllamaProvider::new(scorer).with_base_url(&args.ollama_url),
         ));
     }
-    if let Some(dir) = &args.index_dir {
-        builder = builder.with_index_root(dir);
+    if args.index_dir.is_some() {
+        eprintln!(
+            "warning: --index-dir is no longer used; semantic indexes are kept in the \
+             --store file, or in memory without one"
+        );
     }
     // Kept beside the context so shutdown can flush it: connections hold the
     // session, so the cache is never dropped while the server runs.
@@ -167,6 +172,10 @@ async fn main() -> std::io::Result<()> {
         })?;
         let opened = Arc::new(opened);
         builder = builder.with_cache(Arc::clone(&opened) as Arc<dyn semcast::cache::SemanticCache>);
+        let chunks = semcast::index::stored::SqliteChunkStore::open(path).map_err(|error| {
+            std::io::Error::other(format!("opening {}: {error}", path.display()))
+        })?;
+        builder = builder.with_chunk_store(Arc::new(chunks));
         store = Some(opened);
         let catalog = semcast::catalog::Catalog::open(path).map_err(|error| {
             std::io::Error::other(format!("opening {}: {error}", path.display()))

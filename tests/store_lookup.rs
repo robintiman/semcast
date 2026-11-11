@@ -17,13 +17,11 @@ const QUERY: &str = "SELECT meeting_id FROM meetings WHERE transcript MEANS 'syn
 /// Meeting 2 never mentions "sync", so its embedding is far from the
 /// condition, but the model says it matches.
 async fn meetings(model: Arc<MockModel>, cache: Option<Arc<dyn SemanticCache>>) -> SessionContext {
-    let root = tempfile::tempdir().unwrap();
-    let mut builder = SemcastContextBuilder::new(model).with_index_root(root.path());
+    let mut builder = SemcastContextBuilder::new(model);
     if let Some(cache) = cache {
         builder = builder.with_cache(cache);
     }
     let ctx = builder.build();
-    std::mem::forget(root);
     ctx.sql(
         "CREATE TABLE meetings AS SELECT * FROM (VALUES
              (1, 'sync'),
@@ -62,13 +60,11 @@ async fn ids(ctx: &SessionContext, sql: &str) -> Vec<i64> {
 }
 
 async fn index_with_floor(ctx: &SessionContext, floor: f32) {
-    let dir = tempfile::tempdir().unwrap();
     create_semantic_index(
         ctx,
         "meetings",
         "transcript",
         IndexOptions {
-            path: Some(dir.path().join("idx.lance")),
             search: SearchParams {
                 score_floor: floor,
                 ..Default::default()
@@ -78,7 +74,6 @@ async fn index_with_floor(ctx: &SessionContext, floor: f32) {
     )
     .await
     .unwrap();
-    std::mem::forget(dir);
 }
 
 #[tokio::test]
@@ -215,13 +210,11 @@ async fn calibration_labels_decide_their_rows_in_the_same_query() {
     .collect()
     .await
     .unwrap();
-    let dir = tempfile::tempdir().unwrap();
     create_semantic_index(
         &ctx,
         "docs",
         "body",
         IndexOptions {
-            path: Some(dir.path().join("idx.lance")),
             chunk: semcast::index::chunk::ChunkConfig {
                 max_tokens: 4,
                 overlap_tokens: 0,

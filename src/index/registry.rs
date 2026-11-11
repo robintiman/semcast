@@ -4,7 +4,6 @@
 //! physical planner reach it without new plumbing.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use datafusion::common::{Column, DFSchema, DataFusionError, Result};
@@ -23,7 +22,9 @@ pub struct SemcastRuntime {
     /// is unset. The session model itself unless the builder brought a
     /// dedicated one (Voyage, or Ollama next to an Anthropic session model).
     embedder: Arc<dyn ModelProvider>,
-    index_root: PathBuf,
+    /// Where semantic indexes keep their chunks and vectors: memory unless
+    /// the builder brought the store file.
+    chunk_store: Arc<dyn crate::index::stored::ChunkStore>,
     /// Registered indexes keyed by `(table, column)`. Resolution is exact:
     /// a same-named column on a different table never borrows an index.
     indexes: Mutex<HashMap<(String, String), Arc<dyn SemanticIndex>>>,
@@ -40,7 +41,7 @@ impl SemcastRuntime {
         Self {
             embedder: Arc::clone(&model),
             model,
-            index_root: std::env::temp_dir().join("semcast-indexes"),
+            chunk_store: Arc::new(crate::index::stored::MemoryChunkStore::default()),
             indexes: Mutex::new(HashMap::new()),
             types: Arc::new(TypeRegistry::default()),
             catalog: None,
@@ -70,15 +71,15 @@ impl SemcastRuntime {
         &self.types
     }
 
-    /// Store Lance datasets under `root` instead of the temp-dir default.
-    pub fn with_index_root(mut self, root: impl Into<PathBuf>) -> Self {
-        self.index_root = root.into();
+    /// Keep semantic-index chunks and vectors in `store` instead of memory.
+    pub fn with_chunk_store(mut self, store: Arc<dyn crate::index::stored::ChunkStore>) -> Self {
+        self.chunk_store = store;
         self
     }
 
-    /// Where Lance datasets go when `IndexOptions.path` is not set.
-    pub fn index_root(&self) -> &Path {
-        &self.index_root
+    /// Where semantic indexes keep their chunks and vectors.
+    pub fn chunk_store(&self) -> &Arc<dyn crate::index::stored::ChunkStore> {
+        &self.chunk_store
     }
 
     /// Save definitions to `catalog` as they are made.
