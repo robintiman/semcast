@@ -6,7 +6,7 @@
     uv run --project eval eval/sembench.py       # Movie, all queries, one cold run
 
 Each query gets a fresh server by default, so no query pays less because an
-earlier one filled the verdict cache. `--warm` keeps one server for the run.
+earlier one filled the verdict cache (unless `--server-arg=--store=...`). `--warm` keeps one server for the run.
 Queries go over the Postgres wire, the surface users see; model calls are
 read from the funnel NOTICE the server sends when a statement finishes.
 """
@@ -32,8 +32,14 @@ import psycopg2
 EVAL = Path(__file__).resolve().parent
 REPO = EVAL.parent
 SEMBENCH = EVAL / ".sembench"
-# Columns the benchmarked system must not see: the ground-truth labels.
-HIDDEN = {"movie": {"Reviews.csv": ["scoreSentiment"]}}
+# Columns the benchmarked system must not see: the ground-truth labels, and
+# the columns that give them away (`reviewState` mirrors `scoreSentiment`).
+HIDDEN = {
+    "movie": {
+        "Reviews.csv": ["scoreSentiment", "reviewState", "originalScore"],
+        "Movies.csv": ["audienceScore", "tomatoMeter"],
+    }
+}
 
 
 class Notices:
@@ -49,17 +55,36 @@ class Notices:
 class Server:
     """A semcast server this run owns, or one that is already listening."""
 
-    def __init__(self, args: argparse.Namespace) -> None:
+    def __init__(self, args: argparse.Namespace, setup: list[str]) -> None:
         self.args = args
+        self.setup = setup
         self.process: subprocess.Popen | None = None
+        self.prepared = False
         self.host, self.port = "127.0.0.1", 0
         if args.connect:
             self.host, port = args.connect.rsplit(":", 1)
             self.port = int(port)
 
-    def start(self) -> None:
-        if self.args.connect:
-            return
+    def ensure(self) -> None:
+        """Have a server listening with the scenario's tables defined."""
+        if not self.args.connect and (self.process is None or self.process.poll() is not None):
+            self.process = None
+            self.prepared = False
+            self._start()
+        if not self.prepared:
+            connection = self.connect()
+            cursor = connection.cursor()
+            for statement in self.setup:
+                try:
+                    cursor.execute(statement)
+                except psycopg2.Error as error:
+                    # A server we did not start may have the tables already.
+                    if not (self.args.connect and "already exists" in str(error)):
+                        raise
+            connection.close()
+            self.prepared = True
+
+    def _start(self) -> None:
         with socket.socket() as probe:
             probe.bind((self.host, 0))
             self.port = probe.getsockname()[1]
@@ -68,26 +93,22 @@ class Server:
         if self.args.model:
             command += ["--model", self.args.model]
         command += self.args.server_arg
-        log = open(self.args.work / "server.log", "ab")
-        self.process = subprocess.Popen(command, stdout=log, stderr=log, cwd=REPO)
+        with open(self.args.work / "server.log", "ab") as log:
+            process = subprocess.Popen(command, stdout=log, stderr=log, cwd=REPO)
         deadline = time.monotonic() + 60
-        while time.monotonic() < deadline:
-            if self.process.poll() is not None:
-                raise RuntimeError(f"server exited, see {log.name}")
+        while time.monotonic() < deadline and process.poll() is None:
             try:
                 socket.create_connection((self.host, self.port), 0.2).close()
+                self.process = process
                 return
             except OSError:
                 time.sleep(0.1)
-        raise RuntimeError("server did not start listening within 60 s")
+        kill(process)
+        raise RuntimeError(f"server did not start, see {self.args.work / 'server.log'}")
 
     def stop(self) -> None:
         if self.process is not None:
-            self.process.terminate()
-            try:
-                self.process.wait(10)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
+            kill(self.process)
             self.process = None
 
     def connect(self):
@@ -96,6 +117,15 @@ class Server:
         )
         connection.autocommit = True
         return connection
+
+
+def kill(process: subprocess.Popen) -> None:
+    process.terminate()
+    try:
+        process.wait(10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
 
 
 def statements(path: Path, **placeholders: str) -> list[str]:
@@ -131,24 +161,23 @@ def funnel_counts(notices: list[str]) -> dict:
     return {"model_calls": calls, "cache_hits": hits, "funnel": done}
 
 
-def run_query(server: Server, query: Path, setup: list[str], timeout: float) -> dict:
+def run_query(server: Server, query: Path, timeout: float) -> dict:
     """Execute one query file; the last statement's rows are the result."""
     timed_out = threading.Event()
-
-    def expire() -> None:
-        timed_out.set()
-        server.stop()
-
-    timer = threading.Timer(timeout, expire)
     notices = Notices()
     metric: dict = {"status": "failed", "results": pd.DataFrame()}
+    timer = None
     try:
+        server.ensure()
+        # The timer kills the process this query runs on, and only that one:
+        # by the time it fires the server may have been replaced.
+        process = server.process
+        if process is not None:
+            timer = threading.Timer(timeout, lambda: (timed_out.set(), kill(process)))
         connection = server.connect()
-        cursor = connection.cursor()
-        for statement in setup:
-            cursor.execute(statement)
         connection.notices = notices
-        if server.process is not None:
+        cursor = connection.cursor()
+        if timer is not None:
             timer.start()
         started = time.monotonic()
         for statement in statements(query):
@@ -162,7 +191,8 @@ def run_query(server: Server, query: Path, setup: list[str], timeout: float) -> 
     except Exception as error:  # a failed query is a result, not a crash
         metric["error"] = f"timed out after {timeout:.0f} s" if timed_out.is_set() else str(error).strip()
     finally:
-        timer.cancel()
+        if timer is not None:
+            timer.cancel()
     metric.update(funnel_counts(notices.lines))
     return metric
 
@@ -174,7 +204,7 @@ def evaluator(scenario: str, scale_factor: int):
     stub = types.ModuleType("cdlib")
     stub.NodeClustering = stub.evaluation = None
     sys.modules.setdefault("cdlib", stub)
-    sys.path.insert(0, str(SEMBENCH / "src"))
+    sys.path.append(str(SEMBENCH / "src"))
     if scenario == "movie":
         from scenario.movie.evaluation.evaluate import MovieEvaluator
 
@@ -214,6 +244,8 @@ def main() -> None:
 
     if not SEMBENCH.is_dir():
         sys.exit("SemBench is missing; run eval/setup.sh")
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", args.system) or args.system == "ground_truth":
+        sys.exit("--system must be a plain name (letters, digits, - and _)")
     if not args.connect and not args.server.exists():
         sys.exit(f"{args.server} is missing; run cargo build --release")
     args.work = EVAL / ".work"
@@ -233,43 +265,47 @@ def main() -> None:
     out = EVAL / "results" / args.scenario / args.system
     scorer = evaluator(args.scenario, args.scale_factor)
     runs: list[dict] = []
+    for stale in out.glob("run*"):
+        shutil.rmtree(stale)
+    server = Server(args, setup)
 
-    for repeat in range(1, args.repeats + 1):
-        shutil.rmtree(raw, ignore_errors=True)
-        raw.mkdir(parents=True)
-        metrics_file.parent.mkdir(parents=True, exist_ok=True)
-        server = Server(args)
-        run: dict = {}
-        if warm:
-            server.start()
-        for query_id in query_ids:
-            if not warm:
-                server.start()
-            metric = run_query(server, queries_dir / f"Q{query_id}.sql", setup, args.timeout)
-            if not warm:
-                server.stop()
-            results = metric.pop("results")
-            results.to_csv(raw / f"Q{query_id}.csv", index=False)
-            metric.update(query_id=str(query_id), row_count=len(results), model_name=model,
-                          scale_factor=args.scale_factor, cold=not warm)
-            run[f"Q{query_id}"] = metric
-            print(f"run {repeat} Q{query_id}: {metric['status']}, {len(results)} rows, "
-                  f"{metric.get('execution_time', 0):.1f} s, {metric['model_calls']} model calls"
-                  + (f" — {metric['error']}" if "error" in metric else ""), flush=True)
+    try:
+        for repeat in range(1, args.repeats + 1):
+            shutil.rmtree(raw, ignore_errors=True)
+            raw.mkdir(parents=True)
+            metrics_file.parent.mkdir(parents=True, exist_ok=True)
+            run: dict = {}
+            for query_id in query_ids:
+                metric = run_query(server, queries_dir / f"Q{query_id}.sql", args.timeout)
+                if not warm:
+                    server.stop()
+                results = metric.pop("results")
+                results.to_csv(raw / f"Q{query_id}.csv", index=False)
+                metric.update(query_id=str(query_id), row_count=len(results), model_name=model,
+                              scale_factor=args.scale_factor, cold=not warm)
+                run[f"Q{query_id}"] = metric
+                print(f"run {repeat} Q{query_id}: {metric['status']}, {len(results)} rows, "
+                      f"{metric.get('execution_time', 0):.1f} s, {metric['model_calls']} model calls"
+                      + (f" — {metric['error']}" if "error" in metric else ""), flush=True)
+            server.stop()
+            metrics_file.write_text(json.dumps(run, indent=2))
+            scorer.evaluate_system(args.system, queries=query_ids)
+            run = json.loads(metrics_file.read_text())
+            for metric in run.values():
+                metric["quality"] = quality(metric)
+            target = out / f"run{repeat}"
+            shutil.copytree(raw, target)
+            (target / "metrics.json").write_text(json.dumps(run, indent=2))
+            runs.append(run)
+    finally:
         server.stop()
-        metrics_file.write_text(json.dumps(run, indent=2))
-        scorer.evaluate_system(args.system, queries=query_ids)
-        run = json.loads(metrics_file.read_text())
-        for metric in run.values():
-            metric["quality"] = quality(metric)
-        target = out / f"run{repeat}"
-        shutil.rmtree(target, ignore_errors=True)
-        shutil.copytree(raw, target)
-        (target / "metrics.json").write_text(json.dumps(run, indent=2))
-        runs.append(run)
 
     def mean(key: str, name: str) -> float | None:
-        values = [run[name][key] for run in runs if run[name].get(key) is not None]
+        # Quality counts a failed run as 0; time and calls of a run that did
+        # not finish say nothing about what the query costs.
+        values = [run[name][key] for run in runs
+                  if run[name].get(key) is not None
+                  and (key == "quality" or run[name]["status"] == "success")]
         return statistics.fmean(values) if values else None
 
     summary = {}
