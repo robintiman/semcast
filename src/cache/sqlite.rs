@@ -463,6 +463,22 @@ mod tests {
     use super::*;
     use crate::model::ModelId;
 
+    /// The store's row key must never change: rows written by one build are
+    /// read by the next. Pinned on the key SemIR builds for a `MEANS` answer.
+    #[test]
+    fn row_key_matches_golden_value() {
+        let key = crate::semir::answer_key(
+            "the customer is angry",
+            crate::semir::AskType::Bool,
+            "I am furious",
+            &ModelId("ollama/gemma4:e4b".to_owned()),
+            "means-v2",
+        );
+        assert_eq!(u128::from_le_bytes(row_key(&key)), GOLDEN_ROW_KEY);
+    }
+
+    const GOLDEN_ROW_KEY: u128 = 137170530867284571163207860107501048400;
+
     fn key(input: &str) -> CacheKey {
         CacheKey {
             type_version: "the customer is angry".to_owned(),
