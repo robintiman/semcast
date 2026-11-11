@@ -46,6 +46,7 @@ use crate::optimizer::calibrate::{
 };
 use crate::optimizer::proxy::LearnedProxy;
 use crate::physical::sample::{Label, Labeler, draw_sample};
+use crate::physical::store_lookup::StoreEvidence;
 
 /// Where each labeled document sits against the index: scored, never indexed
 /// (passes through at any floor, so it helps recall for free), or indexed but
@@ -166,6 +167,9 @@ pub struct IndexScanExec {
     params: SearchParams,
     calibration: Option<CalibrationConfig>,
     evidence: Arc<ChunkEvidence>,
+    /// The store's verdicts: a known match is never pruned, a known
+    /// non-match always is.
+    store: Option<Arc<StoreEvidence>>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -194,9 +198,19 @@ impl IndexScanExec {
             params,
             calibration,
             evidence,
+            store: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
+    }
+
+    /// Honour what an upstream [`StoreLookupExec`] learned: a document with
+    /// a stored verdict is kept or pruned by it, whatever its score.
+    ///
+    /// [`StoreLookupExec`]: crate::physical::StoreLookupExec
+    pub fn with_store_evidence(mut self, store: Arc<StoreEvidence>) -> Self {
+        self.store = Some(store);
+        self
     }
 }
 
@@ -253,7 +267,7 @@ impl ExecutionPlan for IndexScanExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(Self::new(
+        let mut scan = Self::new(
             Arc::clone(&children[0]),
             Arc::clone(&self.text),
             self.condition.clone(),
@@ -261,7 +275,9 @@ impl ExecutionPlan for IndexScanExec {
             self.params,
             self.calibration.clone(),
             Arc::clone(&self.evidence),
-        )))
+        );
+        scan.store = self.store.clone();
+        Ok(Arc::new(scan))
     }
 
     fn execute(
@@ -277,6 +293,7 @@ impl ExecutionPlan for IndexScanExec {
             params: self.params,
             calibration: self.calibration.clone(),
             evidence: Arc::clone(&self.evidence),
+            store: self.store.clone(),
             index_hits: MetricBuilder::new(&self.metrics).counter("index_hits", partition),
             rows_pruned: MetricBuilder::new(&self.metrics).counter("rows_pruned", partition),
             passthrough_rows: MetricBuilder::new(&self.metrics)
@@ -289,6 +306,7 @@ impl ExecutionPlan for IndexScanExec {
                 .counter("calibration_model_calls_merged", partition),
             calibration_label_errors: MetricBuilder::new(&self.metrics)
                 .counter("calibration_label_errors", partition),
+            store_known: MetricBuilder::new(&self.metrics).counter("store_known", partition),
         });
         let stream: BoxStream<'_, Result<RecordBatch>> = if scanner.calibration.is_some() {
             // Calibration samples the whole input before anything can be
@@ -341,6 +359,7 @@ struct Scanner {
     params: SearchParams,
     calibration: Option<CalibrationConfig>,
     evidence: Arc<ChunkEvidence>,
+    store: Option<Arc<StoreEvidence>>,
     index_hits: Count,
     rows_pruned: Count,
     passthrough_rows: Count,
@@ -349,6 +368,8 @@ struct Scanner {
     /// Of `calibration_model_calls`, those merged onto an identical call.
     calibration_model_calls_merged: Count,
     calibration_label_errors: Count,
+    /// Rows decided by the store's verdict rather than the score.
+    store_known: Count,
 }
 
 impl Scanner {
@@ -370,7 +391,11 @@ impl Scanner {
                 continue;
             }
             let hash = doc_hash(texts.value(row));
-            if result.chunks.contains_key(&hash) {
+            if let Some(verdict) = self.store.as_deref().and_then(|store| store.verdict(hash)) {
+                // The store's full-text verdict is final, whatever the score.
+                self.store_known.add(1);
+                *keep_row = verdict;
+            } else if result.chunks.contains_key(&hash) {
                 self.index_hits.add(1);
                 *keep_row = true;
             } else if result.indexed.contains(&hash) {

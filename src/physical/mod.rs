@@ -10,6 +10,7 @@ pub mod planner;
 pub mod rank;
 pub(crate) mod sample;
 pub mod score_scan;
+pub mod store_lookup;
 pub mod trace;
 pub mod verify;
 
@@ -20,4 +21,5 @@ pub use extract::SemExtractExec;
 pub use index_scan::IndexScanExec;
 pub use rank::SemRankExec;
 pub use score_scan::ScoreScanExec;
+pub use store_lookup::StoreLookupExec;
 pub use verify::VerifyExec;

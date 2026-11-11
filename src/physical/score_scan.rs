@@ -45,6 +45,7 @@ use crate::model::{CompletionRequest, ModelProvider};
 use crate::optimizer::calibrate::{Calibration, SampledScores, calibrate_threshold};
 use crate::physical::index_scan::CalibrationConfig;
 use crate::physical::sample::{Label, Labeler, draw_sample};
+use crate::physical::store_lookup::StoreEvidence;
 use crate::physical::verify::{
     MEANS_PROMPT_VERSION, cache_verdict, cached_score, means_cache_key, merged_calls,
     parse_verdict, synthesize_means_prompt,
@@ -99,6 +100,9 @@ pub struct ScoreScanExec {
     scorer: Arc<dyn ModelProvider>,
     health: Arc<ScorerHealth>,
     calibration: CalibrationConfig,
+    /// The store's verdicts: those documents are decided by them, and never
+    /// scored.
+    store: Option<Arc<StoreEvidence>>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -127,9 +131,19 @@ impl ScoreScanExec {
             scorer,
             health,
             calibration,
+            store: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
+    }
+
+    /// Honour what an upstream [`StoreLookupExec`] learned: a document with
+    /// a stored verdict is kept or pruned by it, and costs no scorer call.
+    ///
+    /// [`StoreLookupExec`]: crate::physical::StoreLookupExec
+    pub fn with_store_evidence(mut self, store: Arc<StoreEvidence>) -> Self {
+        self.store = Some(store);
+        self
     }
 }
 
@@ -189,14 +203,16 @@ impl ExecutionPlan for ScoreScanExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(Self::new(
+        let mut scan = Self::new(
             Arc::clone(&children[0]),
             Arc::clone(&self.text),
             self.condition.clone(),
             Arc::clone(&self.scorer),
             Arc::clone(&self.health),
             self.calibration.clone(),
-        )))
+        );
+        scan.store = self.store.clone();
+        Ok(Arc::new(scan))
     }
 
     fn execute(
@@ -213,6 +229,7 @@ impl ExecutionPlan for ScoreScanExec {
             scorer: Arc::clone(&self.scorer),
             health: Arc::clone(&self.health),
             calibration: self.calibration.clone(),
+            store: self.store.clone(),
             scorer_calls: metric("scorer_calls"),
             scorer_calls_merged: metric("scorer_calls_merged"),
             scorer_cache_hits: metric("scorer_cache_hits"),
@@ -256,6 +273,7 @@ struct Scanner {
     condition: String,
     scorer: Arc<dyn ModelProvider>,
     health: Arc<ScorerHealth>,
+    store: Option<Arc<StoreEvidence>>,
     calibration: CalibrationConfig,
     scorer_calls: Count,
     /// Of `scorer_calls`, those merged onto an identical call in flight.
@@ -271,6 +289,10 @@ struct Scanner {
 }
 
 impl Scanner {
+    fn stored_verdict(&self, hash: u64) -> Option<bool> {
+        self.store.as_deref().and_then(|store| store.verdict(hash))
+    }
+
     async fn score_then_scan(
         self: Arc<Self>,
         mut input: SendableRecordBatchStream,
@@ -298,8 +320,12 @@ impl Scanner {
         }
         let strings: Vec<&StringArray> = texts.iter().map(as_strings).collect();
 
-        let scores = self.score(&strings).await;
-        let (calibrated, labels) = self.calibrate(&strings, &scores).await;
+        // The sample first: its documents need scores even when the store
+        // already knows their verdict, or calibration has nothing to read.
+        let pool = draw_sample(&strings, self.label_budget());
+        let sampled: HashSet<u64> = pool.iter().map(|text| doc_hash(text)).collect();
+        let scores = self.score(&strings, &sampled).await;
+        let (calibrated, labels) = self.calibrate(&pool, &scores).await;
         // A sampled match is already paid for, and a failed label may be
         // one: never prune either, whatever the scorer said. Verify reads
         // their labels from the cache.
@@ -319,8 +345,10 @@ impl Scanner {
                     continue;
                 }
                 let hash = doc_hash(texts.value(row));
+                let stored = self.stored_verdict(hash);
                 match scores.get(&hash) {
-                    _ if labelled.contains(&hash) => *keep_row = true,
+                    _ if stored == Some(false) => self.rows_pruned.add(1),
+                    _ if labelled.contains(&hash) || stored == Some(true) => *keep_row = true,
                     Some(score) if *score >= calibrated.threshold => *keep_row = true,
                     Some(_) => self.rows_pruned.add(1),
                     None => {
@@ -345,7 +373,7 @@ impl Scanner {
 
     /// The scorer's P("yes") for every distinct document, from the cache
     /// where it has one. A document with no usable probability is absent.
-    async fn score(&self, texts: &[&StringArray]) -> HashMap<u64, f32> {
+    async fn score(&self, texts: &[&StringArray], sampled: &HashSet<u64>) -> HashMap<u64, f32> {
         let scorer_id = self.scorer.id();
         let prompt = synthesize_means_prompt(&self.condition);
         let mut scores = HashMap::new();
@@ -359,7 +387,11 @@ impl Scanner {
                 }
                 let text = array.value(row);
                 let hash = doc_hash(text);
-                if !asked.insert(hash) {
+                // A stored verdict decides the row whatever it scores: don't
+                // pay for a score.
+                if !asked.insert(hash)
+                    || (self.stored_verdict(hash).is_some() && !sampled.contains(&hash))
+                {
                     continue;
                 }
                 let key = means_cache_key(&self.condition, text, &scorer_id, MEANS_PROMPT_VERSION);
@@ -441,9 +473,17 @@ impl Scanner {
     /// The floor: label a random sample with the session model and set it
     /// at the recall target, one tranche at a time when certifying.
     /// Returns the calibration and the labels it was drawn from.
+    fn label_budget(&self) -> usize {
+        match self.calibration.confidence {
+            Some(_) => crate::optimizer::calibrate::CALIBRATION_LABEL_BUDGET
+                .max(self.calibration.sample_size),
+            None => self.calibration.sample_size,
+        }
+    }
+
     async fn calibrate(
         &self,
-        texts: &[&StringArray],
+        pool: &[String],
         scores: &HashMap<u64, f32>,
     ) -> (Calibration, Vec<Label>) {
         let calibration = &self.calibration;
@@ -455,13 +495,6 @@ impl Scanner {
             calls_merged: &self.calibration_model_calls_merged,
             errors: &self.calibration_label_errors,
         };
-        let budget = match calibration.confidence {
-            Some(_) => {
-                crate::optimizer::calibrate::CALIBRATION_LABEL_BUDGET.max(calibration.sample_size)
-            }
-            None => calibration.sample_size,
-        };
-        let pool = draw_sample(texts, budget);
         let mut labels: Vec<Label> = Vec::new();
         let mut labelled = 0;
         let mut calibrated = None;

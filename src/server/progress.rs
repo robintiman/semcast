@@ -37,6 +37,10 @@ impl ProgressEvent {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FunnelCounts {
+    pub has_store_lookup: bool,
+    pub store_rows: usize,
+    pub store_matches: usize,
+    pub store_non_matches: usize,
     pub has_index_scan: bool,
     pub has_scorer: bool,
     pub scorer_calls: usize,
@@ -94,7 +98,8 @@ pub struct FunnelCounts {
 
 impl FunnelCounts {
     pub fn is_semantic(&self) -> bool {
-        self.has_index_scan
+        self.has_store_lookup
+            || self.has_index_scan
             || self.has_scorer
             || self.has_verify
             || self.has_extract
@@ -124,6 +129,14 @@ pub fn snapshot(plan: &Arc<dyn ExecutionPlan>) -> FunnelCounts {
     for node in semcast_nodes(plan) {
         let metrics = node.metrics();
         match node.name() {
+            "StoreLookupExec" => {
+                counts.has_store_lookup = true;
+                if let Some(metrics) = metrics {
+                    counts.store_rows += counter_total(&metrics, "rows_looked_up");
+                    counts.store_matches += counter_total(&metrics, "store_matches");
+                    counts.store_non_matches += counter_total(&metrics, "store_non_matches");
+                }
+            }
             "IndexScanExec" => {
                 counts.has_index_scan = true;
                 if let Some(metrics) = metrics {
@@ -235,6 +248,15 @@ pub fn final_totals(plan: &Arc<dyn ExecutionPlan>) -> Option<ProgressEvent> {
 
 pub fn render(counts: &FunnelCounts) -> String {
     let mut parts = Vec::new();
+    if counts.has_store_lookup {
+        parts.push(format!(
+            "store: {} of {} rows already answered ({} match, {} don't)",
+            counts.store_matches + counts.store_non_matches,
+            counts.store_rows,
+            counts.store_matches,
+            counts.store_non_matches,
+        ));
+    }
     if counts.has_index_scan {
         parts.push(format!(
             "index scan: {} hits, {} pruned",
@@ -367,6 +389,7 @@ fn collect(plan: &Arc<dyn ExecutionPlan>, out: &mut Vec<Arc<dyn ExecutionPlan>>)
     if matches!(
         plan.name(),
         "IndexScanExec"
+            | "StoreLookupExec"
             | "ScoreScanExec"
             | "VerifyExec"
             | "SemExtractExec"

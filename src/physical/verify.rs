@@ -27,6 +27,7 @@ use crate::cache::{CacheKey, CachedValue, SemanticCache};
 use crate::index::doc_hash;
 use crate::model::{CompletionRequest, ModelId, ModelProvider};
 use crate::physical::index_scan::ChunkEvidence;
+use crate::physical::store_lookup::StoreEvidence;
 
 /// Version of the synthesized `MEANS` verify prompt. Participates in cache
 /// keys: bump it and every cached verdict is honestly invalidated.
@@ -84,6 +85,8 @@ pub struct VerifyExec {
     ///
     /// [`IndexScanExec`]: crate::physical::index_scan::IndexScanExec
     evidence: Option<Arc<ChunkEvidence>>,
+    /// The store's full-text verdicts: those rows are decided without a call.
+    store: Option<Arc<StoreEvidence>>,
     /// How many chunks the evidence holds per document — display only.
     chunks_per_doc: usize,
     properties: Arc<PlanProperties>,
@@ -149,10 +152,22 @@ impl VerifyExec {
             model,
             cache,
             evidence,
+            store: None,
             chunks_per_doc,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
+    }
+
+    /// Honour what an upstream [`StoreLookupExec`] learned: a document with a
+    /// stored full-text verdict is decided by it without a call — not even a
+    /// chunked one, which would ask a weaker question than the one already
+    /// answered.
+    ///
+    /// [`StoreLookupExec`]: crate::physical::StoreLookupExec
+    pub fn with_store_evidence(mut self, store: Arc<StoreEvidence>) -> Self {
+        self.store = Some(store);
+        self
     }
 }
 
@@ -198,7 +213,7 @@ impl ExecutionPlan for VerifyExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(Self::build(
+        let mut verify = Self::build(
             Arc::clone(&children[0]),
             Arc::clone(&self.text),
             self.condition.clone(),
@@ -206,7 +221,9 @@ impl ExecutionPlan for VerifyExec {
             Arc::clone(&self.cache),
             self.evidence.clone(),
             self.chunks_per_doc,
-        )))
+        );
+        verify.store = self.store.clone();
+        Ok(Arc::new(verify))
     }
 
     fn execute(
@@ -224,6 +241,7 @@ impl ExecutionPlan for VerifyExec {
             model: Arc::clone(&self.model),
             cache: Arc::clone(&self.cache),
             evidence: self.evidence.clone(),
+            store: self.store.clone(),
             model_calls: MetricBuilder::new(&self.metrics).counter("model_calls", partition),
             model_calls_merged: MetricBuilder::new(&self.metrics)
                 .counter("model_calls_merged", partition),
@@ -250,6 +268,7 @@ impl ExecutionPlan for VerifyExec {
 /// Everything one partition's stream needs, bundled so the closure stays
 /// cheap to clone.
 struct Verifier {
+    store: Option<Arc<StoreEvidence>>,
     text: Arc<dyn PhysicalExpr>,
     condition: String,
     prompt: String,
@@ -288,6 +307,15 @@ impl Verifier {
                 continue;
             }
             let text = texts.value(row);
+            if let Some(verdict) = self
+                .store
+                .as_deref()
+                .and_then(|store| store.verdict(doc_hash(text)))
+            {
+                self.cache_hits.add(1);
+                *keep_row = verdict;
+                continue;
+            }
             // With index evidence, the model reads the document's best
             // chunks; without (no index, or an unindexed passthrough row),
             // the full text. The cache keys the input and the prompt version
