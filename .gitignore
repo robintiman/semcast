@@ -7,3 +7,4 @@
 /eval/.work/
 /eval/.venv/
 /eval/results/
+__pycache__/
