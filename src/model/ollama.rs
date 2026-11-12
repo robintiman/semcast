@@ -3,14 +3,20 @@
 //! The free-local-dev path: completions through `/api/chat`, embeddings
 //! through `/api/embed` (which the semantic index needs at roadmap step 2).
 //!
-//! Every request sets the context length (`num_ctx`) and turns truncation
-//! off. Left to Ollama, the context falls back to a default (16k tokens in
-//! 0.40) and a longer prompt is cut to fit, keeping its end, so a long
-//! document's verdict would be about its last pages with nothing said. With
-//! `truncate: false` Ollama refuses such a prompt instead (an HTTP 400 that
-//! counts with its own tokenizer, before any generation), and the row fails:
-//! rows fail, they are never answered from part of the text. `shift: false`
-//! likewise stops a long answer from sliding the prompt out of the context.
+//! Every chat request sets the context length (`num_ctx`) and turns
+//! truncation off. Left to Ollama, the context falls back to a default that
+//! depends on the version and machine (16k tokens on 0.40 here) and a longer
+//! prompt is cut to fit, keeping its end, so a long document's verdict would
+//! be about its last pages with nothing said. With `truncate: false` Ollama
+//! refuses such a prompt instead (an HTTP 400 that counts with its own
+//! tokenizer, before any generation), and the row fails: rows fail, they are
+//! never answered from part of the text. With `shift: false` an answer that
+//! runs out of context stops instead of sliding the prompt out, and an answer
+//! that stopped there, short of its own token cap, fails too.
+//!
+//! Needs an Ollama that knows `truncate` and `shift` (0.40 does); an older
+//! one ignores them and cuts silently. Embeddings (`/api/embed`) still
+//! truncate an over-long chunk silently: a known gap.
 //!
 //! [Ollama]: https://ollama.com
 
@@ -28,6 +34,12 @@ pub const DEFAULT_EMBED_MODEL: &str = "nomic-embed-text";
 /// `--ollama-num-ctx` for longer ones, up to the model's own limit; memory
 /// grows with it.
 pub const DEFAULT_NUM_CTX: usize = 32_768;
+
+/// Whether generation stopped because the context filled, not because the
+/// answer reached its own cap: a `"length"` stop short of `max_tokens`.
+fn ran_out_of_context(done_reason: Option<&str>, eval_count: usize, max_tokens: usize) -> bool {
+    done_reason == Some("length") && eval_count < max_tokens
+}
 
 #[derive(Debug, Clone)]
 pub struct OllamaProvider {
@@ -128,6 +140,17 @@ impl OllamaProvider {
             response = %chat.message.content,
             "llm response"
         );
+        if ran_out_of_context(
+            chat.done_reason.as_deref(),
+            chat.eval_count,
+            request.max_tokens,
+        ) {
+            return Err(SemcastError::Model(format!(
+                "the answer ran out of context after {} tokens (--ollama-num-ctx {}): \
+                 a cut-off answer is not used",
+                chat.eval_count, self.num_ctx
+            )));
+        }
         let yes_probability = chat
             .logprobs
             .as_deref()
@@ -238,6 +261,9 @@ struct ChatResponse {
     prompt_eval_count: usize,
     #[serde(default)]
     eval_count: usize,
+    /// Why generation stopped: `"length"` when it hit a limit.
+    #[serde(default)]
+    done_reason: Option<String>,
     /// One entry per generated token, when the request asked for them. A
     /// shape we don't know (a look-alike server's) reads as none: a missing
     /// probability must not cost the answer.
@@ -287,6 +313,20 @@ struct EmbedResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_answer_cut_by_the_context_is_not_used() {
+        assert!(ran_out_of_context(Some("length"), 3, 128));
+        // Reaching its own cap is an answer, not a cut.
+        assert!(!ran_out_of_context(Some("length"), 8, 8));
+        assert!(!ran_out_of_context(Some("stop"), 3, 128));
+        assert!(!ran_out_of_context(None, 3, 128));
+        let chat: ChatResponse = serde_json::from_str(
+            r#"{"message":{"content":"ye"},"done_reason":"length","eval_count":1}"#,
+        )
+        .unwrap();
+        assert_eq!(chat.done_reason.as_deref(), Some("length"));
+    }
 
     #[test]
     fn chat_request_refuses_truncation() {
