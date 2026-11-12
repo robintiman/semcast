@@ -112,8 +112,8 @@ pub(crate) enum Change {
     /// relation of that bare name remains — the index map is keyed by bare
     /// name, so such a relation still owns them.
     ForgetOrphanIndexes { table: String },
-    /// Delete the saved semantic columns on bare table name `table` — the
-    /// table was replaced by one that has none.
+    /// Delete the saved semantic columns of the fully resolved table
+    /// `table` — it was replaced by one that has none, or dropped.
     ForgetSemanticColumns { table: String },
 }
 
@@ -252,7 +252,7 @@ fn apply_changes(connection: &mut Connection, changes: &[Change]) -> Result<()> 
                 transaction
                     .execute(
                         "DELETE FROM catalog \
-                         WHERE kind IN ('semantic_index', 'semantic_column') \
+                         WHERE kind = 'semantic_index' \
                            AND substr(name, 1, length(?1)) = ?1 \
                            AND NOT EXISTS (SELECT 1 FROM catalog \
                                WHERE kind = 'relation' \
@@ -443,7 +443,7 @@ pub(crate) async fn execute_ddl(
             let name = resolve(ctx, &name);
             let failure =
                 format!("{name} is defined for this session but will be gone after a restart");
-            let bare = TableReference::from(name.as_str()).table().to_owned();
+            let resolved = name.clone();
             let entry = Entry {
                 kind: EntryKind::Relation,
                 name,
@@ -453,7 +453,7 @@ pub(crate) async fn execute_ddl(
             // old one had, in the session and so in the catalog.
             let mut changes = vec![Change::Put(entry)];
             if existed {
-                changes.push(Change::ForgetSemanticColumns { table: bare });
+                changes.push(Change::ForgetSemanticColumns { table: resolved });
             }
             (changes, failure)
         }
@@ -473,11 +473,17 @@ pub(crate) async fn execute_ddl(
                 "{name} is defined for this session, but an earlier saved definition \
                  will replace it after a restart"
             );
+            let columns = Change::ForgetSemanticColumns {
+                table: name.clone(),
+            };
             let forget = Change::Forget {
                 kind: EntryKind::Relation,
                 name,
             };
-            (vec![forget, Change::ForgetOrphanIndexes { table }], failure)
+            (
+                vec![forget, columns, Change::ForgetOrphanIndexes { table }],
+                failure,
+            )
         }
         Effect::SaveSchema { name } if !existed => {
             let name = qualified_schema(ctx, &name);
@@ -549,13 +555,16 @@ async fn forget_relation(
     };
     let name = resolve(ctx, name);
     let failure = format!("{name} is gone from this session but will come back after a restart");
+    let columns = Change::ForgetSemanticColumns {
+        table: name.clone(),
+    };
     let forget = Change::Forget {
         kind: EntryKind::Relation,
         name,
     };
     save(
         catalog,
-        vec![forget, Change::ForgetOrphanIndexes { table }],
+        vec![forget, columns, Change::ForgetOrphanIndexes { table }],
         &failure,
     )
     .await

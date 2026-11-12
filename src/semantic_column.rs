@@ -197,34 +197,14 @@ impl TableProvider for SemanticColumnsTable {
         assignments: Vec<(String, Expr)>,
         filters: Vec<Expr>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        // DataFusion assigns every column, an unchanged one its current value.
-        // Those are dropped for a semantic column; any other value is refused.
+        // DataFusion assigns every column, a semantic one included; it isn't
+        // stored, so it is dropped. `semcast::sql` has already refused a
+        // statement that sets one (`lib.rs::reject_semantic_dml`).
         let semantic: Vec<String> = self.columns().into_iter().map(|c| c.name).collect();
-        let mut stored = Vec::with_capacity(assignments.len());
-        for (name, value) in assignments {
-            if !semantic.contains(&name) {
-                stored.push((name, value));
-                continue;
-            }
-            // Unchanged reads as the column itself, or as what the planner
-            // made of it: the `MEANS` the column stands for, or the column a
-            // classify node computes it into.
-            let value = match value {
-                Expr::Alias(alias) => *alias.expr,
-                other => other,
-            };
-            let unchanged = match &value {
-                Expr::Column(column) => {
-                    column.name == name
-                        || column.name.starts_with("__sem_class_")
-                        || column.name.starts_with("__sem_conf_")
-                }
-                other => crate::optimizer::rewrite::is_means_call(other),
-            };
-            if !unchanged {
-                return plan_err!("{name} is a semantic column: it is computed, not stored");
-            }
-        }
+        let stored: Vec<(String, Expr)> = assignments
+            .into_iter()
+            .filter(|(name, _)| !semantic.contains(name))
+            .collect();
         self.inner.update(state, stored, filters).await
     }
 
@@ -387,41 +367,35 @@ fn expand(scan: TableScan, table: &SemanticColumnsTable) -> Result<LogicalPlan> 
     let base = table.inner.schema();
     let state = table.snapshot();
     let means = crate::sql::means_udf::means_udf();
-    let wanted: Vec<usize> = match &scan.projection {
-        Some(projection) => projection.clone(),
-        None => (0..state.schema.fields().len()).collect(),
-    };
-    // The scan was planned against the columns as they were then; an ALTER
-    // since may have changed them under the same index.
-    let planned = scan.projected_schema.fields();
-    let unchanged = planned.len() == wanted.len()
-        && wanted.iter().zip(planned.iter()).all(|(&i, field)| {
-            i < state.schema.fields().len() && state.schema.field(i).name() == field.name()
-        });
-    if !unchanged {
-        return plan_err!(
-            "the semantic columns of {} changed while this query was planned; run it again",
-            scan.table_name
-        );
-    }
-    let exprs = wanted
-        .into_iter()
-        .map(|i| {
-            let field = state.schema.field(i);
-            if i < base.fields().len() {
-                return Expr::Column(Column::new(Some(qualifier.clone()), field.name()));
+    // By name, not position: a view keeps the scan it was planned with, and
+    // an ALTER since may have moved or added semantic columns. Only a column
+    // that no longer exists can't be computed.
+    let exprs = scan
+        .projected_schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let name = field.name();
+            if base.field_with_name(name).is_ok() {
+                return Ok(Expr::Column(Column::new(Some(qualifier.clone()), name)));
             }
-            let column = &state.columns[i - base.fields().len()];
-            Expr::ScalarFunction(ScalarFunction::new_udf(
+            let Some(column) = state.columns.iter().find(|column| &column.name == name) else {
+                return plan_err!(
+                    "the semantic column {}.{name} no longer exists; re-create what was \
+                     planned with it",
+                    scan.table_name
+                );
+            };
+            Ok(Expr::ScalarFunction(ScalarFunction::new_udf(
                 Arc::new(means.clone()),
                 vec![
                     Expr::Column(Column::new(Some(qualifier.clone()), &column.text)),
                     lit(column.condition.clone()),
                 ],
             ))
-            .alias_qualified(Some(qualifier.clone()), &column.name)
+            .alias_qualified(Some(qualifier.clone()), &column.name))
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>>>()?;
     let projection = Projection::try_new(exprs, Arc::new(inner))?;
     // The projection must stand exactly where the scan stood.
     debug_assert_eq!(
@@ -483,7 +457,7 @@ pub async fn add_column(
         if catalog.has_relation(&resolved).await? {
             let entry = crate::catalog::Entry {
                 kind: crate::catalog::EntryKind::SemanticColumn,
-                name: catalog_key(table, &name),
+                name: catalog_key(ctx, table, &name),
                 definition: text.to_owned(),
             };
             let failure = format!(
@@ -546,7 +520,7 @@ pub async fn drop_column(
     if let Some(catalog) = catalog {
         let forget = crate::catalog::Change::Forget {
             kind: crate::catalog::EntryKind::SemanticColumn,
-            name: catalog_key(table, name),
+            name: catalog_key(ctx, table, name),
         };
         let failure = format!(
             "the semantic column {table}.{name} is dropped for this session but will come \
@@ -590,14 +564,15 @@ pub async fn refresh_column(
 /// change.
 static ALTERS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// The catalog key of a semantic column: `table(name)` by the table's bare
-/// name, as indexes are keyed, so `public.tickets` and `tickets` name one
-/// entry, and dropping the table forgets it.
-fn catalog_key(table: &str, name: &str) -> String {
-    let bare = datafusion::common::TableReference::from(table)
-        .table()
-        .to_owned();
-    crate::catalog::index_name(&bare, name)
+/// The catalog key of a semantic column: `table(name)` by the table's fully
+/// resolved name, so `public.tickets` and `tickets` name one entry, and a
+/// same-named table in another schema doesn't.
+fn catalog_key(
+    ctx: &datafusion::execution::context::SessionContext,
+    table: &str,
+    name: &str,
+) -> String {
+    crate::catalog::index_name(&resolve(ctx, table), name)
 }
 
 /// `table` as the catalog names relations: fully qualified.

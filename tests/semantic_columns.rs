@@ -421,3 +421,95 @@ async fn the_catalog_forgets_columns_the_session_no_longer_has() {
         "dropped by its bare name: {message}"
     );
 }
+
+/// A view keeps the scan it was planned with; columns added since must not
+/// break it. A column it read that is dropped is a clear error.
+#[tokio::test]
+async fn views_survive_changes_to_the_semantic_columns() {
+    let ctx = tickets(Arc::new(MockModel::answering_yes_to(["furious"]))).await;
+    run(&ctx, ADD).await;
+    run(&ctx, "CREATE VIEW v AS SELECT * FROM tickets").await;
+    run(&ctx, "CREATE VIEW w AS SELECT id FROM tickets WHERE angry").await;
+    run(
+        &ctx,
+        "ALTER TABLE tickets ADD SEMANTIC COLUMN refund AS (body MEANS 'asks for a refund')",
+    )
+    .await;
+    assert_eq!(ids(&run(&ctx, "SELECT id FROM v WHERE angry").await), [1]);
+    assert_eq!(ids(&run(&ctx, "SELECT id FROM w").await), [1]);
+    run(&ctx, "ALTER TABLE tickets DROP SEMANTIC COLUMN refund").await;
+    assert_eq!(ids(&run(&ctx, "SELECT id FROM w").await), [1]);
+    run(&ctx, "ALTER TABLE tickets DROP SEMANTIC COLUMN angry").await;
+    let message = error(&ctx, "SELECT id FROM w").await;
+    assert!(message.contains("no longer exists"), "{message}");
+}
+
+#[tokio::test]
+async fn update_cannot_set_or_read_a_semantic_column() {
+    let model = Arc::new(MockModel::answering_yes_to(["furious"]));
+    let ctx = tickets(Arc::clone(&model)).await;
+    run(&ctx, ADD).await;
+    run(
+        &ctx,
+        "ALTER TABLE tickets ADD SEMANTIC COLUMN refund AS (body MEANS 'asks for a refund')",
+    )
+    .await;
+    for (sql, expected) in [
+        (
+            "UPDATE tickets SET angry = refund WHERE id = 1",
+            "cannot set it",
+        ),
+        (
+            "UPDATE tickets SET angry = false WHERE id = 1",
+            "cannot set it",
+        ),
+        (
+            "UPDATE tickets SET body = CASE WHEN angry THEN 'x' ELSE body END WHERE id = 1",
+            "from a semantic column",
+        ),
+    ] {
+        let message = error(&ctx, sql).await;
+        assert!(message.contains(expected), "{sql}: {message}");
+    }
+    assert_eq!(model.completion_calls(), 0);
+}
+
+/// Same-named tables in two schemas keep their own semantic columns.
+#[tokio::test]
+async fn replacing_a_table_in_another_schema_keeps_this_ones_columns() {
+    let dir = tempfile::tempdir().unwrap();
+    let csv = dir.path().join("tickets.csv");
+    std::fs::write(&csv, "id,body\n1,I am furious\n2,all good\n").unwrap();
+    let store = dir.path().join("store.db");
+    let session = || {
+        let store = store.clone();
+        async move {
+            let ctx =
+                SemcastContextBuilder::new(Arc::new(MockModel::answering_yes_to(["furious"])))
+                    .with_catalog(semcast::catalog::Catalog::open(&store).unwrap())
+                    .build();
+            let restored = semcast::restore_catalog(&ctx).await.unwrap();
+            assert!(restored.failed.is_empty(), "{:?}", restored.failed);
+            ctx
+        }
+    };
+    let external = |name: &str, replace: bool| {
+        format!(
+            "CREATE {}EXTERNAL TABLE {name} STORED AS CSV LOCATION '{}' \
+             OPTIONS ('format.has_header' 'true')",
+            if replace { "OR REPLACE " } else { "" },
+            csv.display()
+        )
+    };
+    let ctx = session().await;
+    run(&ctx, &external("tickets", false)).await;
+    run(&ctx, ADD).await;
+    run(&ctx, "CREATE SCHEMA s").await;
+    run(&ctx, &external("s.tickets", false)).await;
+    run(&ctx, &external("s.tickets", true)).await;
+    let ctx = session().await;
+    assert_eq!(
+        ids(&run(&ctx, "SELECT id FROM tickets WHERE angry").await),
+        [1]
+    );
+}

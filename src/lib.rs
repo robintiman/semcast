@@ -282,6 +282,43 @@ fn reject_semantic_dml(plan: &datafusion::logical_expr::LogicalPlan) -> Result<(
                     .map(|table| table.columns().iter().map(|c| c.name.clone()).collect())
             })
             .unwrap_or_default();
+        // An UPDATE assigns every column; a semantic one may only keep its
+        // own value, and nothing may be computed from one — before planning,
+        // that would be a MEANS hidden in an assignment.
+        if dml.op == WriteOp::Update
+            && !semantic.is_empty()
+            && let LogicalPlan::Projection(assignments) = dml.input.as_ref()
+        {
+            for (field, value) in assignments.schema.fields().iter().zip(&assignments.expr) {
+                let value = match value {
+                    Expr::Alias(alias) => alias.expr.as_ref(),
+                    other => other,
+                };
+                if semantic.contains(field.name()) {
+                    let unchanged =
+                        matches!(value, Expr::Column(column) if &column.name == field.name());
+                    if !unchanged {
+                        refusal = Some(format!(
+                            "{} is a semantic column: it is computed, not stored, so \
+                             UPDATE cannot set it",
+                            field.name()
+                        ));
+                        return Ok(TreeNodeRecursion::Stop);
+                    }
+                    continue;
+                }
+                if value.exists(|e| {
+                    Ok(matches!(e, Expr::Column(column) if semantic.contains(&column.name)))
+                })? {
+                    refusal = Some(format!(
+                        "UPDATE cannot compute {} from a semantic column: it would ask \
+                         the model for every row. Read the column into a table first",
+                        field.name()
+                    ));
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+            }
+        }
         dml.input.apply_with_subqueries(|node| {
             if let LogicalPlan::Filter(filter) = node
                 && filter.predicate.exists(|e| {
