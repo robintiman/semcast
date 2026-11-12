@@ -574,7 +574,11 @@ async fn explain_refresh_shows_the_bill_without_paying_it() {
     assert_eq!(cell_u64(&before, "stored"), 0);
     assert_eq!(cell_u64(&before, "to_ask"), 2);
     assert!(cell_u64(&before, "est_input_tokens") > 0);
-    assert_eq!(cell_u64(&before, "est_output_tokens"), 4);
+    assert_eq!(
+        cell_u64(&before, "est_output_tokens"),
+        16,
+        "each answer at its 8-token cap"
+    );
     assert_eq!(cell_cost(&before), None, "the mock has no list price");
     assert_eq!(model.completion_calls(), 0, "explaining asks nothing");
 
@@ -612,4 +616,42 @@ async fn explain_refresh_prices_a_known_model() {
     let expected = (input * 1.0 + output * 5.0) / 1_000_000.0;
     let cost = cell_cost(&batches).expect("Haiku 4.5 has a list price");
     assert!((cost - expected).abs() < 1e-12, "{cost} vs {expected}");
+}
+
+/// A text repeated within one batch is asked once, whether it is read as a
+/// label or filtered on — and so the estimate's "to ask" is what is paid.
+#[tokio::test]
+async fn a_repeated_text_is_asked_once_per_batch() {
+    for sql in [
+        "SELECT id, angry FROM many",
+        "SELECT id FROM many WHERE angry",
+        "SELECT id FROM many WHERE body MEANS 'the customer is angry'",
+    ] {
+        let model = Arc::new(MockModel::answering_yes_to(["furious"]));
+        let ctx = SemcastContextBuilder::new(Arc::clone(&model) as _).build();
+        // 100 rows, two texts, one batch.
+        ctx.sql(
+            "CREATE TABLE many AS SELECT value AS id, \
+             CASE WHEN value % 2 = 0 THEN 'I am furious' ELSE 'all good' END AS body \
+             FROM generate_series(1, 100)",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+        run(
+            &ctx,
+            "ALTER TABLE many ADD SEMANTIC COLUMN angry AS (body MEANS 'the customer is angry')",
+        )
+        .await;
+        let explained = run(&ctx, "EXPLAIN REFRESH SEMANTIC COLUMN many(angry)").await;
+        assert_eq!(cell_u64(&explained, "to_ask"), 2);
+        run(&ctx, sql).await;
+        assert!(
+            model.completion_calls() <= 2 * 16,
+            "{sql}: {} calls for two texts (at most two per partition batch; without the dedupe it is one per row)",
+            model.completion_calls()
+        );
+    }
 }

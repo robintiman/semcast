@@ -69,6 +69,20 @@ pub fn parse_semcast_statement(query: &str) -> crate::Result<SemcastStatement> {
         return ddl::parse_semantic_drop(parser).map(SemcastStatement::Ddl);
     }
 
+    // EXPLAIN's options belong to query plans; a refresh has no plan to
+    // analyze, only a bill to show.
+    if peek_nth_is_word(&df_parser.parser, 0, "EXPLAIN")
+        && (peek_nth_is_word(&df_parser.parser, 1, "ANALYZE")
+            || peek_nth_is_word(&df_parser.parser, 1, "VERBOSE"))
+        && peek_nth_is_word(&df_parser.parser, 2, "REFRESH")
+    {
+        return Err(datafusion::error::DataFusionError::Plan(
+            "EXPLAIN ANALYZE and EXPLAIN VERBOSE don't apply to REFRESH; use EXPLAIN REFRESH \
+             to see what a refresh would cost"
+                .to_owned(),
+        )
+        .into());
+    }
     let explain = peek_nth_is_word(&df_parser.parser, 0, "EXPLAIN")
         && peek_nth_is_word(&df_parser.parser, 1, "REFRESH")
         && peek_nth_is_word(&df_parser.parser, 2, "SEMANTIC");

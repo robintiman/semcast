@@ -591,9 +591,13 @@ fn resolve(ctx: &datafusion::execution::context::SessionContext, table: &str) ->
 /// session model's list price (NULL when its price isn't known).
 ///
 /// Estimates: tokens are counted at four characters each, the refresh asks
-/// one full-text question per distinct text without one stored, and a
-/// verdict is about two tokens. A semantic index doesn't prune a refresh,
-/// which answers every row.
+/// one full-text question per distinct text without one stored (repeats are
+/// asked once), and each answer is billed up to the request's output cap,
+/// [`VERIFY_MAX_TOKENS`] — an upper bound, since a model that thinks first
+/// spends it. A semantic index doesn't prune a refresh, which answers every
+/// row.
+///
+/// [`VERIFY_MAX_TOKENS`]: crate::physical::verify::VERIFY_MAX_TOKENS
 pub async fn explain_refresh(
     ctx: &datafusion::execution::context::SessionContext,
     table: &str,
@@ -654,19 +658,20 @@ pub async fn explain_refresh(
     let answers = tokio::task::spawn_blocking(move || cache.get_many(&keys))
         .await
         .map_err(|error| datafusion::error::DataFusionError::External(Box::new(error)))?;
-    let prompt_chars =
-        crate::physical::verify::synthesize_means_prompt(&column.condition).len() as u64;
+    let prompt_chars = crate::physical::verify::synthesize_means_prompt(&column.condition)
+        .chars()
+        .count() as u64;
     let mut stored = 0_u64;
     let mut input_tokens = 0_u64;
     for (text, answer) in texts.iter().zip(&answers) {
         if matches!(answer, Some(crate::cache::CachedValue::Value(_))) {
             stored += 1;
         } else {
-            input_tokens += (prompt_chars + text.len() as u64).div_ceil(4);
+            input_tokens += (prompt_chars + text.chars().count() as u64).div_ceil(4);
         }
     }
     let to_ask = texts.len() as u64 - stored;
-    let output_tokens = to_ask * VERDICT_TOKENS;
+    let output_tokens = to_ask * crate::physical::verify::VERIFY_MAX_TOKENS as u64;
     let cost = crate::model::pricing::price_per_mtok(&model).map(|(input, output)| {
         (input_tokens as f64 * input + output_tokens as f64 * output) / 1_000_000.0
     });
@@ -697,6 +702,3 @@ pub async fn explain_refresh(
         RecordBatch::try_new(schema, columns).map_err(datafusion::error::DataFusionError::from)?;
     Ok(ctx.read_batch(batch)?)
 }
-
-/// A yes/no verdict, in tokens, for the estimate.
-const VERDICT_TOKENS: u64 = 2;

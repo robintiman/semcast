@@ -210,7 +210,7 @@ fn column_error(message: impl Into<String>) -> crate::SemcastError {
     crate::SemcastError::DataFusion(DataFusionError::Plan(format!(
         "invalid semantic column statement: {}; expected ALTER TABLE t ADD SEMANTIC \
          COLUMN name AS (column MEANS 'condition'), ALTER TABLE t DROP SEMANTIC COLUMN \
-         name, or REFRESH SEMANTIC COLUMN t(name)",
+         name, or [EXPLAIN] REFRESH SEMANTIC COLUMN t(name)",
         message.into()
     )))
 }

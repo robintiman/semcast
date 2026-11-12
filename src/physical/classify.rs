@@ -429,6 +429,12 @@ impl Classifier {
         let mut verdicts: Vec<Vec<Option<bool>>> = vec![vec![None; rows]; self.conditions.len()];
         let mut requests = Vec::new();
         let mut pending_rows: Vec<PendingRow> = Vec::new();
+        // A text repeated in the batch is asked once: the cache only learns
+        // the answer after the batch, so without this each copy would be
+        // its own call. Later copies take the first one's verdicts.
+        let mut first_ask: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        let mut copies: Vec<(usize, usize)> = Vec::new();
 
         for row in 0..rows {
             // An earlier CASE branch already claimed this row — it never
@@ -447,6 +453,10 @@ impl Classifier {
                 continue;
             }
             let text = texts.value(row);
+            if let Some(&asked) = first_ask.get(text) {
+                copies.push((row, asked));
+                continue;
+            }
 
             let mut pending = Vec::new();
             for (branch, condition) in self.conditions.iter().enumerate() {
@@ -461,6 +471,7 @@ impl Classifier {
             if pending.is_empty() {
                 continue;
             }
+            first_ask.insert(text, pending_rows.len());
             requests.push(self.request(text, &pending));
             pending_rows.push(PendingRow {
                 row,
@@ -481,6 +492,12 @@ impl Classifier {
                 continue;
             };
             self.apply(pending_row, completion, &mut verdicts);
+        }
+        for (row, asked) in copies {
+            let source = pending_rows[asked].row;
+            for verdict in verdicts.iter_mut() {
+                verdict[row] = verdict[source];
+            }
         }
 
         let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
@@ -508,7 +525,7 @@ impl Classifier {
             return CompletionRequest {
                 system: synthesize_means_prompt(&self.conditions[*branch]),
                 input: text.to_owned(),
-                max_tokens: 8,
+                max_tokens: crate::physical::verify::VERIFY_MAX_TOKENS,
                 schema: None,
                 logprobs: true,
             };
