@@ -232,7 +232,10 @@ async fn calibration_labels_decide_their_rows_in_the_same_query() {
     let query = "SELECT id FROM docs WHERE body MEANS 'sync' WITH RECALL 0.9";
     assert_eq!(ids(&ctx, query).await, [1], "the full-text label wins");
     let calls = model.completion_calls();
-    assert_eq!(calls, 2, "two labels, no chunked call");
+    assert_eq!(
+        calls, 3,
+        "two labels and calibration's chunked check of the match; verify asks nothing"
+    );
     assert_eq!(ids(&ctx, query).await, [1], "the same rows again");
     assert_eq!(model.completion_calls(), calls);
 }

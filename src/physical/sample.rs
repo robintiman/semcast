@@ -11,8 +11,9 @@ use crate::cache::{CachedValue, SemanticCache};
 use crate::index::doc_hash;
 use crate::model::{CompletionRequest, ModelProvider};
 use crate::physical::verify::{
-    MEANS_PROMPT_VERSION, cache_verdict, means_cache_key, merged_calls, parse_verdict,
-    synthesize_means_prompt,
+    MEANS_CHUNKED_PROMPT_VERSION, MEANS_PROMPT_VERSION, VERIFY_MAX_TOKENS, cache_verdict,
+    means_cache_key, merged_calls, parse_verdict, synthesize_means_prompt,
+    synthesize_means_prompt_chunked,
 };
 
 /// A sampled document and its label: `Some(matched)`, or `None` when the
@@ -93,56 +94,10 @@ impl Labeler<'_> {
     /// calibration retries them.
     pub(crate) async fn label(&self, sample: &[String]) -> Vec<Label> {
         let prompt = synthesize_means_prompt(self.condition);
-        let model_id = self.model.id();
-        let mut labels = Vec::new();
-        let mut misses = Vec::new();
-        let mut requests = Vec::new();
-        for text in sample {
-            match self.cache.get(&means_cache_key(
-                self.condition,
-                text,
-                &model_id,
-                MEANS_PROMPT_VERSION,
-            )) {
-                Some(CachedValue::Value(verdict)) => {
-                    labels.push((text.clone(), Some(verdict == "yes")));
-                }
-                _ => {
-                    misses.push(text);
-                    requests.push(CompletionRequest {
-                        system: prompt.clone(),
-                        input: text.clone(),
-                        max_tokens: 8,
-                        schema: None,
-                        logprobs: true,
-                    });
-                }
-            }
-        }
-        self.calls.add(requests.len());
-        let completions = self.model.complete(requests).await;
-        self.calls_merged.add(merged_calls(&completions));
-        debug_assert_eq!(completions.len(), misses.len());
-        for (text, completion) in misses.into_iter().zip(&completions) {
-            match completion
-                .as_ref()
-                .map(|c| (parse_verdict(&c.text), c.yes_probability))
-            {
-                Ok((Some(matched), yes_probability)) => {
-                    cache_verdict(
-                        self.cache,
-                        means_cache_key(self.condition, text, &model_id, MEANS_PROMPT_VERSION),
-                        matched,
-                        yes_probability,
-                    );
-                    labels.push((text.clone(), Some(matched)));
-                }
-                Ok((None, _)) | Err(_) => {
-                    self.errors.add(1);
-                    labels.push((text.clone(), None));
-                }
-            }
-        }
+        let inputs = sample.iter().map(|text| (text.clone(), text.clone()));
+        let labels = self.ask(inputs, &prompt, MEANS_PROMPT_VERSION).await;
+        self.errors
+            .add(labels.iter().filter(|(_, label)| label.is_none()).count());
         if let Some(evidence) = self.evidence {
             evidence.record(
                 labels
@@ -151,5 +106,71 @@ impl Labeler<'_> {
             );
         }
         labels
+    }
+
+    /// What verify will answer for each document when it reads its chunks:
+    /// byte-identical requests and keys to [`VerifyExec`]'s chunked path, so
+    /// the answers measure what verify does to rows outside the sample, and
+    /// a repeat calibration finds them cached. `docs` pairs a document's hash
+    /// with its chunks, best first. `None` is a failed call, which verify
+    /// would drop, so the certificate counts it as a miss. Not recorded as
+    /// store evidence: a chunked verdict is not the full-text answer.
+    ///
+    /// [`VerifyExec`]: crate::physical::VerifyExec
+    pub(crate) async fn chunked(&self, docs: &[(u64, Vec<String>)]) -> Vec<(u64, Option<bool>)> {
+        let prompt = synthesize_means_prompt_chunked(self.condition);
+        let inputs = docs
+            .iter()
+            .map(|(hash, chunks)| (*hash, chunks.join(crate::physical::verify::CHUNK_SEPARATOR)));
+        self.ask(inputs, &prompt, MEANS_CHUNKED_PROMPT_VERSION)
+            .await
+    }
+
+    /// Ask `prompt` of each input, from the cache when it has the answer.
+    /// Failures stay in the result as `None` and are not cached, so the next
+    /// calibration retries them.
+    async fn ask<K: Clone>(
+        &self,
+        inputs: impl Iterator<Item = (K, String)>,
+        prompt: &str,
+        prompt_version: &str,
+    ) -> Vec<(K, Option<bool>)> {
+        let model_id = self.model.id();
+        let mut answers = Vec::new();
+        let mut misses = Vec::new();
+        let mut requests = Vec::new();
+        for (key, input) in inputs {
+            let cache_key = means_cache_key(self.condition, &input, &model_id, prompt_version);
+            match self.cache.get(&cache_key) {
+                Some(CachedValue::Value(verdict)) => answers.push((key, Some(verdict == "yes"))),
+                _ => {
+                    requests.push(CompletionRequest {
+                        system: prompt.to_owned(),
+                        input,
+                        max_tokens: VERIFY_MAX_TOKENS,
+                        schema: None,
+                        logprobs: true,
+                    });
+                    misses.push((key, cache_key));
+                }
+            }
+        }
+        self.calls.add(requests.len());
+        let completions = self.model.complete(requests).await;
+        self.calls_merged.add(merged_calls(&completions));
+        debug_assert_eq!(completions.len(), misses.len());
+        for ((key, cache_key), completion) in misses.into_iter().zip(&completions) {
+            match completion
+                .as_ref()
+                .map(|c| (parse_verdict(&c.text), c.yes_probability))
+            {
+                Ok((Some(matched), yes_probability)) => {
+                    cache_verdict(self.cache, cache_key, matched, yes_probability);
+                    answers.push((key, Some(matched)));
+                }
+                Ok((None, _)) | Err(_) => answers.push((key, None)),
+            }
+        }
+        answers
     }
 }
