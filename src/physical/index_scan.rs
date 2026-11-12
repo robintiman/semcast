@@ -619,6 +619,11 @@ impl Scanner {
         // fitted to this condition. An index that cannot supply them (or
         // fails to) simply leaves the cosine proxy in place.
         let vectors = self.index.doc_vectors().await.unwrap_or_default();
+        // The rows this filter judges, before labels join the store: what
+        // the pruning curve measures shares of.
+        let undecided = self
+            .undecided_hashes(buffered)
+            .map_err(|e| crate::SemcastError::Store(e.to_string()))?;
 
         // One tranche at a time. Estimating draws exactly one, because a
         // point estimate reads whatever the sample says. Certifying keeps
@@ -742,6 +747,39 @@ impl Scanner {
         // ranking, because that ranking is about where in the document the
         // condition is discussed, which a document-level probability has
         // nothing to say about.
+        if let Some(key) = calibration.stats_key {
+            let misses = if full_text {
+                HashSet::new()
+            } else {
+                verify_misses(&chunked)
+            };
+            let (mut scored, mut always, mut lost) = (Vec::new(), 0, 0);
+            for (text, label) in &labels {
+                if *label != Some(true) {
+                    continue;
+                }
+                let hash = doc_hash(text);
+                match scores.get(&hash) {
+                    _ if misses.contains(&hash) => lost += 1,
+                    Some(score) => scored.push(*score),
+                    None if indexed.contains(&hash) => lost += 1,
+                    None => always += 1,
+                }
+            }
+            let population: Vec<Option<f32>> = undecided
+                .iter()
+                .map(|hash| match scores.get(hash) {
+                    Some(score) => Some(*score),
+                    None if indexed.contains(hash) => Some(f32::NEG_INFINITY),
+                    None => None,
+                })
+                .collect();
+            if let Some(curve) =
+                crate::optimizer::budget::curve_from(&scored, always, lost, &population)
+            {
+                calibration.cache.record_curve(key, curve);
+            }
+        }
         chunks.retain(|hash, _| {
             scores
                 .get(hash)
@@ -931,28 +969,15 @@ impl Scanner {
             labels.extend(new_labels);
             labelled = tranche;
 
-            let docs = |chunk_misses: bool| -> Vec<SampledDoc> {
-                labels
-                    .iter()
-                    .map(|(text, label)| {
-                        let hash = doc_hash(text);
-                        let score = per_doc_best.get(&hash).copied();
-                        SampledDoc {
-                            index: indexed
-                                .contains(&hash)
-                                .then(|| score.unwrap_or(f32::NEG_INFINITY)),
-                            scorer: sample_scores.get(&hash).copied(),
-                            label: *label,
-                            // Indexed but unscored is lost at any floor (the
-                            // scan keeps only scored documents); a chunked
-                            // miss is lost to verify reading chunks.
-                            verify_miss: (indexed.contains(&hash) && score.is_none())
-                                || (chunk_misses
-                                    && chunked.get(&hash).is_some_and(|v| *v != Some(true))),
-                            decided: decided_before.contains(&hash),
-                        }
-                    })
-                    .collect()
+            let docs = |chunk_misses: bool| {
+                sampled_docs(
+                    &labels,
+                    &per_doc_best,
+                    &indexed,
+                    &sample_scores,
+                    chunk_misses.then_some(&chunked),
+                    &decided_before,
+                )
             };
             let pick = |chunk_misses: bool| {
                 joint::choose(
@@ -1030,6 +1055,45 @@ impl Scanner {
             "joint floors chosen",
         );
 
+        // How much this funnel keeps at each recall level, for the budget
+        // to split a later statement's loss by.
+        if let Some(key) = calibration.stats_key {
+            let docs = sampled_docs(
+                &labels,
+                &per_doc_best,
+                &indexed,
+                &sample_scores,
+                (!full_text).then_some(&chunked),
+                &decided_before,
+            );
+            let rows = (population.len() + unindexed).max(1) as f64;
+            let curve = crate::optimizer::budget::CURVE_LEVELS
+                .iter()
+                .map(|&level| {
+                    let at = joint::choose(
+                        level,
+                        None,
+                        &docs,
+                        &population,
+                        unindexed,
+                        joint::SCORER_COST,
+                    );
+                    // What the funnel costs per row at the level, scorer
+                    // included: what `choose` minimizes, so a higher level
+                    // never looks cheaper.
+                    (
+                        level,
+                        (at.verify_calls + joint::SCORER_COST * at.scorer_calls) / rows,
+                    )
+                })
+                .collect();
+            let has_match = labels.iter().any(|(_, label)| *label == Some(true));
+            if has_match && population.len() + unindexed > 0 {
+                calibration
+                    .cache
+                    .record_curve(key, crate::optimizer::budget::monotone(curve));
+            }
+        }
         chunks.retain(|hash, _| {
             per_doc_best
                 .get(hash)
@@ -1070,6 +1134,32 @@ impl Scanner {
             full_text,
             scorer_pruned,
         }))
+    }
+
+    /// Distinct texts of the buffered input the store has not decided.
+    fn undecided_hashes(&self, buffered: &[RecordBatch]) -> Result<Vec<u64>> {
+        let mut seen = HashSet::new();
+        let mut undecided = Vec::new();
+        for batch in buffered {
+            let texts = self.evaluate_texts(batch)?;
+            let texts = as_strings(&texts);
+            for row in 0..texts.len() {
+                if !texts.is_valid(row) {
+                    continue;
+                }
+                let text = texts.value(row);
+                let hash = doc_hash(text);
+                let known = self
+                    .store
+                    .as_deref()
+                    .and_then(|s| s.verdict(text))
+                    .is_some();
+                if seen.insert(hash) && !known {
+                    undecided.push(hash);
+                }
+            }
+        }
+        Ok(undecided)
     }
 
     /// A uniform random sample of the distinct documents in the buffered
@@ -1124,6 +1214,39 @@ fn recall_of(calibration: &Calibration) -> f64 {
     calibration
         .certified_recall
         .unwrap_or(calibration.estimated_recall)
+}
+
+/// The joint chooser's view of the labeled sample. `chunked` is the chunked
+/// verdicts when verify reads chunks (a miss is lost at any floor), `None`
+/// when it reads the full text.
+fn sampled_docs(
+    labels: &[Label],
+    per_doc_best: &HashMap<u64, f32>,
+    indexed: &HashSet<u64>,
+    sample_scores: &HashMap<u64, f32>,
+    chunked: Option<&HashMap<u64, Option<bool>>>,
+    decided_before: &HashSet<u64>,
+) -> Vec<SampledDoc> {
+    labels
+        .iter()
+        .map(|(text, label)| {
+            let hash = doc_hash(text);
+            let score = per_doc_best.get(&hash).copied();
+            SampledDoc {
+                index: indexed
+                    .contains(&hash)
+                    .then(|| score.unwrap_or(f32::NEG_INFINITY)),
+                scorer: sample_scores.get(&hash).copied(),
+                label: *label,
+                // Indexed but unscored is lost at any floor (the scan keeps
+                // only scored documents); a chunked miss is lost to verify
+                // reading chunks.
+                verify_miss: (indexed.contains(&hash) && score.is_none())
+                    || chunked.is_some_and(|c| c.get(&hash).is_some_and(|v| *v != Some(true))),
+                decided: decided_before.contains(&hash),
+            }
+        })
+        .collect()
 }
 
 /// Sampled documents verify would reject: chunked verify said no or failed.

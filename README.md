@@ -323,7 +323,14 @@ The target is the statement's. With several `MEANS` filters that can lose
 matches (an index or a scorer under each), each gets an equal share of the
 allowed loss: `WITH RECALL 0.9` over two such filters asks 0.95 of each, and
 `WITH CONFIDENCE` is split the same way. A filter verified on full text loses
-nothing and takes no share. `EXPLAIN` shows each filter's share. A view
+nothing and takes no share. `EXPLAIN` shows each filter's share. Once every
+such filter has been calibrated before, the shares follow how much each one
+pruned at each recall level: the loss goes where giving up recall drops the
+most rows, and a filter whose pruning barely changes keeps its full recall.
+Under `WITH CONFIDENCE` the shares stay equal: the history is a point
+estimate, and a certified floor is stricter. Because history grows, a
+repeated query may split differently, and return different rows, than its
+first run did, always within the target. A view
 can't carry `WITH RECALL`; put it on the query that reads the view.
 
 ```sql
