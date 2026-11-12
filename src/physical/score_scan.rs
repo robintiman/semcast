@@ -90,6 +90,106 @@ impl ScorerHealth {
     }
 }
 
+/// Asks the scorer for P("yes") of documents, through the cache. Shared by
+/// the scorer stage and the index scan's joint funnel.
+pub(crate) struct Scorer<'a> {
+    pub scorer: &'a dyn ModelProvider,
+    pub health: &'a ScorerHealth,
+    pub cache: &'a dyn crate::cache::SemanticCache,
+    pub condition: &'a str,
+    pub calls: &'a Count,
+    /// Of `calls`, those merged onto an identical call in flight.
+    pub calls_merged: &'a Count,
+    pub cache_hits: &'a Count,
+}
+
+impl Scorer<'_> {
+    /// P("yes") for each of `texts` (distinct), by [`doc_hash`]: from the
+    /// cache where it has one, else asked. A document with no usable
+    /// probability is absent: it passes the scorer stage.
+    pub(crate) async fn score(&self, texts: &[&str]) -> HashMap<u64, f32> {
+        let scorer_id = self.scorer.id();
+        let prompt = synthesize_means_prompt(self.condition);
+        let mut scores = HashMap::new();
+        let mut pending = Vec::new();
+        let mut requests = Vec::new();
+        for text in texts {
+            let hash = doc_hash(text);
+            let key = means_cache_key(self.condition, text, &scorer_id, MEANS_PROMPT_VERSION);
+            match cached_score(self.cache, &key) {
+                Some(cached) => {
+                    self.cache_hits.add(1);
+                    if let Some(score) = cached {
+                        scores.insert(hash, score);
+                    }
+                }
+                None => {
+                    requests.push(CompletionRequest {
+                        system: prompt.clone(),
+                        input: (*text).to_owned(),
+                        max_tokens: 8,
+                        schema: None,
+                        logprobs: true,
+                    });
+                    pending.push((hash, key));
+                }
+            }
+        }
+        if !scores.is_empty() {
+            self.health.record(scores.len(), 0);
+        }
+        if self.health.no_logprobs.load(Ordering::Relaxed) {
+            // Every row passes through; asking would buy nothing.
+            return scores;
+        }
+        self.calls.add(requests.len());
+        let completions = self.scorer.complete(requests).await;
+        let answered = completions.iter().filter(|c| c.is_ok()).count();
+        let mut with_probability = 0;
+        self.calls_merged.add(merged_calls(&completions));
+        for ((hash, key), completion) in pending.into_iter().zip(&completions) {
+            let Ok(completion) = completion else { continue };
+            let verdict = parse_verdict(&completion.text);
+            let Some(probability) = completion.yes_probability else {
+                // Not cached: the next answer may carry one (see
+                // `cached_score`). A scorer that never gives one is switched
+                // off for the process below.
+                continue;
+            };
+            with_probability += 1;
+            if let Some(verdict) = verdict {
+                cache_verdict(self.cache, key.clone(), verdict, Some(probability));
+            }
+            // What the cache now pairs, so this query scores as later ones
+            // will; a store that keeps an older, different verdict has
+            // settled this document as unscored.
+            let score = match cached_score(self.cache, &key) {
+                Some(settled) => settled,
+                None => Some(probability),
+            };
+            if let Some(score) = score {
+                scores.insert(hash, score);
+            }
+        }
+        // A scorer that has never given a probability in this process, after
+        // enough answers, reports none. Remembered in memory only, so one
+        // that starts reporting them (another build, another server) is used
+        // again after a restart, and nothing durable claims otherwise.
+        let was_off = self.health.no_logprobs.load(Ordering::Relaxed);
+        self.health
+            .record(with_probability, answered - with_probability);
+        if !was_off && self.health.no_logprobs.load(Ordering::Relaxed) {
+            tracing::warn!(
+                target: "semcast::scorer",
+                scorer = %scorer_id,
+                "the scorer reports no probabilities (no logprobs); it is \
+                 switched off until restart and every row is verified",
+            );
+        }
+        scores
+    }
+}
+
 /// Prunes rows whose scorer P("yes") falls below a floor calibrated to the
 /// recall target, ahead of the session model's verify.
 #[derive(Debug)]
@@ -379,12 +479,8 @@ impl Scanner {
     /// The scorer's P("yes") for every distinct document, from the cache
     /// where it has one. A document with no usable probability is absent.
     async fn score(&self, texts: &[&StringArray], sampled: &HashSet<u64>) -> HashMap<u64, f32> {
-        let scorer_id = self.scorer.id();
-        let prompt = synthesize_means_prompt(&self.condition);
-        let mut scores = HashMap::new();
         let mut asked: HashSet<u64> = HashSet::new();
-        let mut pending = Vec::new();
-        let mut requests = Vec::new();
+        let mut distinct: Vec<&str> = Vec::new();
         for array in texts {
             for row in 0..array.len() {
                 if !array.is_valid(row) {
@@ -399,80 +495,20 @@ impl Scanner {
                 {
                     continue;
                 }
-                let key = means_cache_key(&self.condition, text, &scorer_id, MEANS_PROMPT_VERSION);
-                match cached_score(self.calibration.cache.as_ref(), &key) {
-                    Some(cached) => {
-                        self.scorer_cache_hits.add(1);
-                        if let Some(score) = cached {
-                            scores.insert(hash, score);
-                        }
-                    }
-                    None => {
-                        requests.push(CompletionRequest {
-                            system: prompt.clone(),
-                            input: text.to_owned(),
-                            max_tokens: 8,
-                            schema: None,
-                            logprobs: true,
-                        });
-                        pending.push((hash, key));
-                    }
-                }
+                distinct.push(text);
             }
         }
-        if !scores.is_empty() {
-            self.health.record(scores.len(), 0);
+        Scorer {
+            scorer: self.scorer.as_ref(),
+            health: &self.health,
+            cache: self.calibration.cache.as_ref(),
+            condition: &self.condition,
+            calls: &self.scorer_calls,
+            calls_merged: &self.scorer_calls_merged,
+            cache_hits: &self.scorer_cache_hits,
         }
-        if self.health.no_logprobs.load(Ordering::Relaxed) {
-            // Every row passes through; asking would buy nothing.
-            return scores;
-        }
-        self.scorer_calls.add(requests.len());
-        let completions = self.scorer.complete(requests).await;
-        let answered = completions.iter().filter(|c| c.is_ok()).count();
-        let mut with_probability = 0;
-        self.scorer_calls_merged.add(merged_calls(&completions));
-        let cache = self.calibration.cache.as_ref();
-        for ((hash, key), completion) in pending.into_iter().zip(&completions) {
-            let Ok(completion) = completion else { continue };
-            let verdict = parse_verdict(&completion.text);
-            let Some(probability) = completion.yes_probability else {
-                // Not cached: the next answer may carry one (see
-                // `cached_score`). A scorer that never gives one is switched
-                // off for the process below.
-                continue;
-            };
-            with_probability += 1;
-            if let Some(verdict) = verdict {
-                cache_verdict(cache, key.clone(), verdict, Some(probability));
-            }
-            // What the cache now pairs, so this query scores as later ones
-            // will; a store that keeps an older, different verdict has
-            // settled this document as unscored.
-            let score = match cached_score(cache, &key) {
-                Some(settled) => settled,
-                None => Some(probability),
-            };
-            if let Some(score) = score {
-                scores.insert(hash, score);
-            }
-        }
-        // A scorer that has never given a probability in this process, after
-        // enough answers, reports none. Remembered in memory only, so one
-        // that starts reporting them (another build, another server) is used
-        // again after a restart, and nothing durable claims otherwise.
-        let was_off = self.health.no_logprobs.load(Ordering::Relaxed);
-        self.health
-            .record(with_probability, answered - with_probability);
-        if !was_off && self.health.no_logprobs.load(Ordering::Relaxed) {
-            tracing::warn!(
-                target: "semcast::scorer",
-                scorer = %self.scorer.id(),
-                "the scorer reports no probabilities (no logprobs); it is \
-                 switched off until restart and every row is verified",
-            );
-        }
-        scores
+        .score(&distinct)
+        .await
     }
 
     /// The floor: label a random sample with the session model and set it

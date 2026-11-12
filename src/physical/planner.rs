@@ -144,18 +144,28 @@ impl ExtensionPlanner for SemcastExtensionPlanner {
                     stats_key: Some(stats_key),
                 });
                 let evidence = Arc::new(ChunkEvidence::default());
-                let scan = Arc::new(
-                    IndexScanExec::new(
-                        looked_up,
-                        Arc::clone(&text),
-                        filter.condition.clone(),
-                        index,
-                        params,
-                        calibration,
-                        Arc::clone(&evidence),
-                    )
-                    .with_store_evidence(Arc::clone(&store)),
-                );
+                let has_calibration = calibration.is_some();
+                let mut scan = IndexScanExec::new(
+                    looked_up,
+                    Arc::clone(&text),
+                    filter.condition.clone(),
+                    index,
+                    params,
+                    calibration,
+                    Arc::clone(&evidence),
+                )
+                .with_store_evidence(Arc::clone(&store));
+                // An index and a scorer under a recall target: one funnel,
+                // both floors chosen together (`optimizer::joint`).
+                if let Some((scorer, health)) = self
+                    .scorer
+                    .as_ref()
+                    .filter(|(scorer, _)| scorer.id() != self.model.id())
+                    .filter(|_| has_calibration)
+                {
+                    scan = scan.with_scorer(Arc::clone(scorer), Arc::clone(health));
+                }
+                let scan = Arc::new(scan);
                 return Ok(Some(Arc::new(
                     VerifyExec::new_with_evidence(
                         scan,

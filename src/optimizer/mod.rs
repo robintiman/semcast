@@ -13,6 +13,7 @@ pub mod cluster;
 pub mod distinct;
 pub mod extract;
 pub mod funnel;
+pub mod joint;
 pub mod proxy;
 pub mod rank;
 pub mod rewrite;

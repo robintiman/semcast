@@ -62,6 +62,9 @@ pub struct FunnelCounts {
     pub calibration_verify_misses: usize,
     /// Calibrations that switched verify to the full text.
     pub calibration_full_text: usize,
+    /// The index scan's joint scorer stage.
+    pub index_scorer_calls: usize,
+    pub index_scorer_pruned: usize,
     pub has_verify: bool,
     pub model_calls: usize,
     pub cache_hits: usize,
@@ -151,6 +154,8 @@ pub fn snapshot(plan: &Arc<dyn ExecutionPlan>) -> FunnelCounts {
                     counts.index_hits += counter_total(&metrics, "index_hits");
                     counts.index_store_decided += counter_total(&metrics, "store_known");
                     counts.index_store_pruned += counter_total(&metrics, "store_pruned");
+                    counts.index_scorer_calls += sent_calls(&metrics, "scorer_calls");
+                    counts.index_scorer_pruned += counter_total(&metrics, "scorer_rows_pruned");
                     counts.calibration_chunk_checks +=
                         counter_total(&metrics, "calibration_chunk_checks");
                     counts.calibration_verify_misses +=
@@ -279,6 +284,12 @@ pub fn render(counts: &FunnelCounts) -> String {
             counts.index_hits,
             counts.rows_pruned + counts.index_store_pruned,
         );
+        if counts.index_scorer_calls > 0 || counts.index_scorer_pruned > 0 {
+            scan.push_str(&format!(
+                ", then scorer: {} calls, {} pruned",
+                counts.index_scorer_calls, counts.index_scorer_pruned,
+            ));
+        }
         if counts.index_store_decided > 0 {
             scan.push_str(&format!(
                 ", {} decided by the store ({} of them pruned)",

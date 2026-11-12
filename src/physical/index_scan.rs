@@ -59,8 +59,10 @@ use crate::model::ModelProvider;
 use crate::optimizer::calibrate::{
     CALIBRATION_LABEL_BUDGET, Calibration, SampledScores, calibrate_threshold,
 };
+use crate::optimizer::joint::{self, SampledDoc};
 use crate::optimizer::proxy::LearnedProxy;
 use crate::physical::sample::{Label, Labeler, draw_sample};
+use crate::physical::score_scan::{Scorer, ScorerHealth};
 use crate::physical::store_lookup::StoreEvidence;
 
 /// Where each labeled document sits against the index: scored, never indexed
@@ -128,6 +130,8 @@ pub struct PrefilterResult {
     /// Verify reads every survivor's full text, not its chunks: calibration
     /// found chunked verify misses too many matches to meet the target.
     pub full_text: bool,
+    /// Documents the index kept but the joint funnel's scorer floor pruned.
+    pub scorer_pruned: HashSet<u64>,
 }
 
 /// Planning-time channel between [`IndexScanExec`] and [`VerifyExec`]: the
@@ -204,6 +208,9 @@ pub struct IndexScanExec {
     /// The store's verdicts: a known match is never pruned, a known
     /// non-match always is.
     store: Option<Arc<StoreEvidence>>,
+    /// A scorer for a two-stage funnel: index floor, then scorer floor,
+    /// chosen together (see [`IndexScanExec::with_scorer`]).
+    scorer: Option<(Arc<dyn ModelProvider>, Arc<ScorerHealth>)>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -233,9 +240,24 @@ impl IndexScanExec {
             calibration,
             evidence,
             store: None,
+            scorer: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
+    }
+
+    /// Add a scorer stage after the index floor, calibrated together with it
+    /// on one sample (see [`crate::optimizer::joint`]): the pair that
+    /// certifies the recall target at the least expected cost wins, which
+    /// may be the index alone. Only under `WITH RECALL`; without a
+    /// calibration the scorer is never asked.
+    pub fn with_scorer(
+        mut self,
+        scorer: Arc<dyn ModelProvider>,
+        health: Arc<ScorerHealth>,
+    ) -> Self {
+        self.scorer = Some((scorer, health));
+        self
     }
 
     /// Honour what an upstream [`StoreLookupExec`] learned: a document with
@@ -271,7 +293,11 @@ impl DisplayAs for IndexScanExec {
                 "floor={} top-{} chunks (threshold best-effort — no WITH RECALL)",
                 self.params.score_floor, self.params.chunks_per_doc,
             ),
+        }?;
+        if let Some((scorer, _)) = &self.scorer {
+            write!(f, " then scorer={} (floors chosen jointly)", scorer.id())?;
         }
+        Ok(())
     }
 }
 
@@ -313,6 +339,7 @@ impl ExecutionPlan for IndexScanExec {
             Arc::clone(&self.evidence),
         );
         scan.store = self.store.clone();
+        scan.scorer = self.scorer.clone();
         Ok(Arc::new(scan))
     }
 
@@ -330,6 +357,14 @@ impl ExecutionPlan for IndexScanExec {
             calibration: self.calibration.clone(),
             evidence: Arc::clone(&self.evidence),
             store: self.store.clone(),
+            scorer: self.scorer.clone(),
+            scorer_calls: MetricBuilder::new(&self.metrics).counter("scorer_calls", partition),
+            scorer_calls_merged: MetricBuilder::new(&self.metrics)
+                .counter("scorer_calls_merged", partition),
+            scorer_cache_hits: MetricBuilder::new(&self.metrics)
+                .counter("scorer_cache_hits", partition),
+            scorer_rows_pruned: MetricBuilder::new(&self.metrics)
+                .counter("scorer_rows_pruned", partition),
             index_hits: MetricBuilder::new(&self.metrics).counter("index_hits", partition),
             rows_pruned: MetricBuilder::new(&self.metrics).counter("rows_pruned", partition),
             passthrough_rows: MetricBuilder::new(&self.metrics)
@@ -403,6 +438,12 @@ struct Scanner {
     calibration: Option<CalibrationConfig>,
     evidence: Arc<ChunkEvidence>,
     store: Option<Arc<StoreEvidence>>,
+    scorer: Option<(Arc<dyn ModelProvider>, Arc<ScorerHealth>)>,
+    scorer_calls: Count,
+    scorer_calls_merged: Count,
+    scorer_cache_hits: Count,
+    /// Rows the index kept and the scorer's floor pruned.
+    scorer_rows_pruned: Count,
     index_hits: Count,
     rows_pruned: Count,
     passthrough_rows: Count,
@@ -452,6 +493,8 @@ impl Scanner {
                     self.store_pruned.add(1);
                 }
                 *keep_row = verdict;
+            } else if result.scorer_pruned.contains(&hash) {
+                self.scorer_rows_pruned.add(1);
             } else if result.chunks.contains_key(&hash) {
                 self.index_hits.add(1);
                 *keep_row = true;
@@ -497,6 +540,7 @@ impl Scanner {
             chunks: bucket_chunks(scan.hits, self.params.chunks_per_doc),
             indexed: scan.indexed,
             full_text: false,
+            scorer_pruned: HashSet::new(),
         }))
     }
 
@@ -523,7 +567,13 @@ impl Scanner {
         let result = self
             .evidence
             .cell
-            .get_or_try_init(|| self.calibrated_prefilter(&buffered))
+            .get_or_try_init(|| async {
+                if self.scorer.is_some() {
+                    self.joint_prefilter(&buffered).await
+                } else {
+                    self.calibrated_prefilter(&buffered).await
+                }
+            })
             .await
             .map_err(datafusion::error::DataFusionError::from)?;
         let result = Arc::clone(result);
@@ -701,6 +751,7 @@ impl Scanner {
             chunks,
             indexed,
             full_text,
+            scorer_pruned: HashSet::new(),
         }))
     }
 
@@ -760,6 +811,252 @@ impl Scanner {
         }
         // No fit: cosine over every label, since none of them trained anything.
         (calibrate_with(per_doc_best, labels), per_doc_best.clone())
+    }
+
+    /// The two-stage funnel's calibration: index floor and scorer floor
+    /// chosen together on one labeled sample (see [`crate::optimizer::joint`]).
+    /// Like [`Scanner::calibrated_prefilter`], each sampled document that may
+    /// match is also asked the chunked question verify will ask, and chunks
+    /// and full text are each tried at half the error budget. Thresholds the
+    /// raw cosine score: the learned proxy needs half the labels held out,
+    /// and the scorer is what separates a weak index here.
+    async fn joint_prefilter(
+        &self,
+        buffered: &[RecordBatch],
+    ) -> crate::Result<Arc<PrefilterResult>> {
+        let calibration = self
+            .calibration
+            .as_ref()
+            .expect("the joint funnel requires a calibration");
+        let (scorer, health) = self
+            .scorer
+            .as_ref()
+            .expect("the joint funnel requires a scorer");
+        let scorer = Scorer {
+            scorer: scorer.as_ref(),
+            health,
+            cache: calibration.cache.as_ref(),
+            condition: &self.condition,
+            calls: &self.scorer_calls,
+            calls_merged: &self.scorer_calls_merged,
+            cache_hits: &self.scorer_cache_hits,
+        };
+        let FilterScan { hits, indexed } = self
+            .index
+            .filter_scan(&self.condition, f32::NEG_INFINITY)
+            .await?;
+        let mut per_doc_best: HashMap<u64, f32> = HashMap::new();
+        for hit in &hits {
+            per_doc_best.entry(hit.doc_hash).or_insert(hit.score);
+        }
+        let mut chunks = bucket_chunks(hits, self.params.chunks_per_doc);
+
+        // The rows the funnel will judge, one per distinct text: those the
+        // store has not already decided. Their index scores price a pair.
+        let arrays: Vec<Arc<dyn Array>> = buffered
+            .iter()
+            .map(|batch| self.evaluate_texts(batch))
+            .collect::<datafusion::error::Result<_>>()
+            .map_err(|e| crate::SemcastError::Store(e.to_string()))?;
+        let strings: Vec<&StringArray> = arrays.iter().map(as_strings).collect();
+        let mut seen: HashSet<u64> = HashSet::new();
+        let mut undecided: Vec<(u64, &str)> = Vec::new();
+        for array in &strings {
+            for row in 0..array.len() {
+                if !array.is_valid(row) {
+                    continue;
+                }
+                let text = array.value(row);
+                let hash = doc_hash(text);
+                let known = self
+                    .store
+                    .as_deref()
+                    .and_then(|s| s.verdict(text))
+                    .is_some();
+                if seen.insert(hash) && !known {
+                    undecided.push((hash, text));
+                }
+            }
+        }
+        let population: Vec<f32> = undecided
+            .iter()
+            .filter(|(hash, _)| indexed.contains(hash))
+            .map(|(hash, _)| per_doc_best.get(hash).copied().unwrap_or(f32::NEG_INFINITY))
+            .collect();
+        let unindexed = undecided.len() - population.len();
+
+        let pool = draw_sample(&strings, calibration.label_budget());
+        let per_mode = calibration.confidence.map(|c| 1.0 - (1.0 - c) / 2.0);
+        let mut labels: Vec<Label> = Vec::new();
+        let mut chunked: HashMap<u64, Option<bool>> = HashMap::new();
+        let mut sample_scores: HashMap<u64, f32> = HashMap::new();
+        let mut labelled = 0;
+        let mut choice: Option<(joint::JointChoice, bool)> = None;
+        while labelled < pool.len() {
+            let tranche = (labelled + calibration.sample_size).min(pool.len());
+            let new_labels = self
+                .label_sample(calibration, &pool[labelled..tranche])
+                .await;
+            let maybe_matches: Vec<&str> = new_labels
+                .iter()
+                .filter(|(_, label)| *label != Some(false))
+                .map(|(text, _)| text.as_str())
+                .collect();
+            let to_check: Vec<(u64, Vec<String>)> = maybe_matches
+                .iter()
+                .filter_map(|text| {
+                    let hash = doc_hash(text);
+                    Some((hash, chunks.get(&hash)?.clone()))
+                })
+                .filter(|(hash, _)| !chunked.contains_key(hash))
+                .collect();
+            self.calibration_chunk_checks.add(to_check.len());
+            chunked.extend(self.ask_chunked(calibration, &to_check).await);
+            // Every sampled document is scored, matches or not: the share
+            // passing a scorer floor is what prices verify.
+            let to_score: Vec<&str> = new_labels.iter().map(|(text, _)| text.as_str()).collect();
+            sample_scores.extend(scorer.score(&to_score).await);
+            labels.extend(new_labels);
+            labelled = tranche;
+
+            let docs = |chunk_misses: bool| -> Vec<SampledDoc> {
+                labels
+                    .iter()
+                    .map(|(text, label)| {
+                        let hash = doc_hash(text);
+                        let score = per_doc_best.get(&hash).copied();
+                        SampledDoc {
+                            index: indexed
+                                .contains(&hash)
+                                .then(|| score.unwrap_or(f32::NEG_INFINITY)),
+                            scorer: sample_scores.get(&hash).copied(),
+                            label: *label,
+                            // Indexed but unscored is lost at any floor (the
+                            // scan keeps only scored documents); a chunked
+                            // miss is lost to verify reading chunks.
+                            verify_miss: (indexed.contains(&hash) && score.is_none())
+                                || (chunk_misses
+                                    && chunked.get(&hash).is_some_and(|v| *v != Some(true))),
+                        }
+                    })
+                    .collect()
+            };
+            let pick = |chunk_misses: bool| {
+                joint::choose(
+                    calibration.target_recall,
+                    per_mode,
+                    &docs(chunk_misses),
+                    &population,
+                    unindexed,
+                    joint::SCORER_COST,
+                )
+            };
+            let reading_chunks = pick(true);
+            let reading_text = pick(false);
+            let recall_of =
+                |c: &joint::JointChoice| c.certified_recall.unwrap_or(c.estimated_recall);
+            // As in the single-floor calibration: chunks when they meet the
+            // target; full text when it does better, unless chunks only lack
+            // labels and more can be drawn.
+            let chunks_short_of_labels = calibration.confidence.is_some()
+                && tranche < pool.len()
+                && reading_chunks.estimated_recall >= calibration.target_recall;
+            let text_wins = !reading_chunks.meets(calibration.target_recall)
+                && !chunks_short_of_labels
+                && (reading_text.meets(calibration.target_recall)
+                    || recall_of(&reading_text) > recall_of(&reading_chunks));
+            let picked = if text_wins {
+                reading_text
+            } else {
+                reading_chunks
+            };
+            let settled =
+                calibration.confidence.is_none() || picked.meets(calibration.target_recall);
+            choice = Some((picked, text_wins));
+            if settled {
+                break;
+            }
+        }
+        self.calibration_sampled_rows.add(labels.len());
+        self.calibration_verify_misses.add(
+            chunked
+                .values()
+                .filter(|verdict| **verdict != Some(true))
+                .count(),
+        );
+        let Some((choice, full_text)) = choice else {
+            // Nothing to label: no rows, or every one of them NULL.
+            return Ok(Arc::new(PrefilterResult {
+                chunks,
+                indexed,
+                full_text: false,
+                scorer_pruned: HashSet::new(),
+            }));
+        };
+        if full_text {
+            self.calibration_full_text.add(1);
+        }
+        if !choice.meets(calibration.target_recall) {
+            tracing::warn!(
+                target: "semcast::calibrate",
+                condition = %self.condition,
+                target_recall = calibration.target_recall,
+                estimated_recall = choice.estimated_recall,
+                certified_recall = ?choice.certified_recall,
+                "the sample cannot support the recall target; neither the index \
+                 nor the scorer prunes, and every row is verified",
+            );
+        }
+        tracing::debug!(
+            target: "semcast::calibrate",
+            condition = %self.condition,
+            index_floor = choice.index_floor,
+            scorer_floor = choice.scorer_floor,
+            expected_scorer_calls = choice.scorer_calls,
+            expected_verify_calls = choice.verify_calls,
+            "joint floors chosen",
+        );
+
+        chunks.retain(|hash, _| {
+            per_doc_best
+                .get(hash)
+                .is_some_and(|score| *score >= choice.index_floor)
+        });
+        // The scorer reads what the index keeps (and what it never saw), the
+        // floor drops what scores below it. A sampled document that may be a
+        // match is never pruned: its label is paid for, or its truth unknown.
+        let mut scorer_pruned = HashSet::new();
+        if choice.uses_scorer() {
+            let protected: HashSet<u64> = labels
+                .iter()
+                .filter(|(_, label)| *label != Some(false))
+                .map(|(text, _)| doc_hash(text))
+                .collect();
+            let reaching: Vec<(u64, &str)> = undecided
+                .iter()
+                .filter(|(hash, _)| !indexed.contains(hash) || chunks.contains_key(hash))
+                .filter(|(hash, _)| !protected.contains(hash))
+                .copied()
+                .collect();
+            let unscored: Vec<&str> = reaching
+                .iter()
+                .filter(|(hash, _)| !sample_scores.contains_key(hash))
+                .map(|(_, text)| *text)
+                .collect();
+            let mut scores = sample_scores;
+            scores.extend(scorer.score(&unscored).await);
+            scorer_pruned = reaching
+                .iter()
+                .filter(|(hash, _)| scores.get(hash).is_some_and(|p| *p < choice.scorer_floor))
+                .map(|(hash, _)| *hash)
+                .collect();
+        }
+        Ok(Arc::new(PrefilterResult {
+            chunks,
+            indexed,
+            full_text,
+            scorer_pruned,
+        }))
     }
 
     /// A uniform random sample of the distinct documents in the buffered
