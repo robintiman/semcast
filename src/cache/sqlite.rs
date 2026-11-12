@@ -492,7 +492,25 @@ pub(crate) fn open_store(path: &Path) -> Result<Connection> {
                      name       TEXT NOT NULL,
                      definition TEXT NOT NULL,
                      UNIQUE (kind, name)
-                 );",
+                 );
+                 -- EMBED answers, content-addressed like verdicts: the key is
+                 -- a digest of (embed model, chunk text).
+                 CREATE TABLE IF NOT EXISTS embeddings (
+                     key         BLOB PRIMARY KEY,
+                     embed_model TEXT NOT NULL,
+                     vector      BLOB NOT NULL
+                 ) WITHOUT ROWID;
+                 -- Which chunks each semantic index holds, and the embedding
+                 -- each one reads. Added in place: an older build ignores it.
+                 CREATE TABLE IF NOT EXISTS index_chunks (
+                     index_name  TEXT NOT NULL,
+                     doc_hash    INTEGER NOT NULL,
+                     chunk_index INTEGER NOT NULL,
+                     text        TEXT NOT NULL,
+                     embedding   BLOB NOT NULL,
+                     dim         INTEGER NOT NULL,
+                     PRIMARY KEY (index_name, doc_hash, chunk_index)
+                 ) WITHOUT ROWID;",
             )
             .map_err(store_err)?;
         setup

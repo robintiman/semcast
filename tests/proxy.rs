@@ -18,7 +18,7 @@ use semcast::{IndexOptions, create_semantic_index, semcast_context};
 /// themes; the mock's verdict follows `alpha`.
 const CORPUS: usize = 200;
 
-async fn corpus_context(model: Arc<MockModel>, dir: &tempfile::TempDir) -> SessionContext {
+async fn corpus_context(model: Arc<MockModel>) -> SessionContext {
     let ctx = semcast_context(model);
     let rows: Vec<String> = (0..CORPUS)
         .map(|i| {
@@ -40,7 +40,6 @@ async fn corpus_context(model: Arc<MockModel>, dir: &tempfile::TempDir) -> Sessi
         "docs",
         "body",
         IndexOptions {
-            path: Some(dir.path().join("docs.body.lance")),
             ..Default::default()
         },
     )
@@ -85,8 +84,7 @@ const QUERY: &str = "SELECT id FROM docs
 /// A cheaper funnel that loses rows is not cheaper, it is wrong.
 #[tokio::test]
 async fn the_learned_proxy_keeps_every_match() {
-    let dir = tempfile::tempdir().unwrap();
-    let ctx = corpus_context(themed_model(), &dir).await;
+    let ctx = corpus_context(themed_model()).await;
 
     let ids = matching_ids(&ctx, QUERY).await;
     let expected: Vec<i64> = (0..CORPUS as i64).filter(|i| i % 2 == 0).collect();
@@ -99,9 +97,8 @@ async fn the_learned_proxy_keeps_every_match() {
 /// in under that baseline is the learned proxy doing the work.
 #[tokio::test]
 async fn the_learned_proxy_prunes_what_similarity_cannot() {
-    let dir = tempfile::tempdir().unwrap();
     let model = themed_model();
-    let ctx = corpus_context(Arc::clone(&model), &dir).await;
+    let ctx = corpus_context(Arc::clone(&model)).await;
 
     matching_ids(&ctx, QUERY).await;
     let calls = model.completion_calls();
@@ -122,11 +119,10 @@ async fn the_learned_proxy_prunes_what_similarity_cannot() {
 /// fallback to similarity must keep the query correct rather than fail it.
 #[tokio::test]
 async fn a_one_class_sample_falls_back_and_stays_correct() {
-    let dir = tempfile::tempdir().unwrap();
     // Every document matches, so the fit has one class and is refused.
     let model =
         Arc::new(MockModel::answering_yes_to(["document"]).embedding_by_theme(["alpha", "beta"]));
-    let ctx = corpus_context(Arc::clone(&model), &dir).await;
+    let ctx = corpus_context(Arc::clone(&model)).await;
 
     let ids = matching_ids(&ctx, QUERY).await;
     assert_eq!(ids.len(), CORPUS, "every document matches, so all return");

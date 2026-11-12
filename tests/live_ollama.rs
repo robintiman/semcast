@@ -52,7 +52,7 @@ async fn means_filter_against_live_ollama() {
     );
 }
 
-/// Real embeddings end-to-end: build a Lance index with nomic-embed-text,
+/// Real embeddings end-to-end: build a semantic index with nomic-embed-text,
 /// plan the funnel, and verify the right row survives it.
 #[tokio::test]
 #[ignore = "requires a running Ollama server with gemma4:e4b and nomic-embed-text pulled"]
@@ -74,13 +74,11 @@ async fn semantic_index_funnel_against_live_ollama() {
     .await
     .unwrap();
 
-    let dir = tempfile::tempdir().unwrap();
     create_semantic_index(
         &ctx,
         "meetings",
         "transcript",
         IndexOptions {
-            path: Some(dir.path().join("meetings.transcript.lance")),
             ..Default::default()
         },
     )
@@ -133,13 +131,11 @@ async fn calibrated_funnel_against_live_ollama() {
     .await
     .unwrap();
 
-    let dir = tempfile::tempdir().unwrap();
     create_semantic_index(
         &ctx,
         "meetings",
         "transcript",
         IndexOptions {
-            path: Some(dir.path().join("meetings.transcript.lance")),
             ..Default::default()
         },
     )
@@ -196,13 +192,11 @@ async fn rank_against_live_ollama() {
     .await
     .unwrap();
 
-    let dir = tempfile::tempdir().unwrap();
     create_semantic_index(
         &ctx,
         "meetings",
         "transcript",
         IndexOptions {
-            path: Some(dir.path().join("meetings.transcript.lance")),
             ..Default::default()
         },
     )
@@ -336,13 +330,11 @@ async fn cluster_against_live_ollama() {
     .await
     .unwrap();
 
-    let dir = tempfile::tempdir().unwrap();
     create_semantic_index(
         &ctx,
         "notes",
         "body",
         IndexOptions {
-            path: Some(dir.path().join("notes.body.lance")),
             ..Default::default()
         },
     )
@@ -416,13 +408,11 @@ async fn semantic_distinct_against_live_ollama() {
     .await
     .unwrap();
 
-    let dir = tempfile::tempdir().unwrap();
     create_semantic_index(
         &ctx,
         "notes",
         "body",
         IndexOptions {
-            path: Some(dir.path().join("notes.body.lance")),
             ..Default::default()
         },
     )

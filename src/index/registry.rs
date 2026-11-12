@@ -4,7 +4,6 @@
 //! physical planner reach it without new plumbing.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use datafusion::common::{Column, DFSchema, DataFusionError, Result};
@@ -23,7 +22,9 @@ pub struct SemcastRuntime {
     /// is unset. The session model itself unless the builder brought a
     /// dedicated one (Voyage, or Ollama next to an Anthropic session model).
     embedder: Arc<dyn ModelProvider>,
-    index_root: PathBuf,
+    /// Where semantic indexes keep their chunks and vectors: memory unless
+    /// the builder brought the store file.
+    chunk_store: Arc<dyn crate::index::stored::ChunkStore>,
     /// Registered indexes keyed by `(table, column)`. Resolution is exact:
     /// a same-named column on a different table never borrows an index.
     indexes: Mutex<HashMap<(String, String), Arc<dyn SemanticIndex>>>,
@@ -40,7 +41,7 @@ impl SemcastRuntime {
         Self {
             embedder: Arc::clone(&model),
             model,
-            index_root: std::env::temp_dir().join("semcast-indexes"),
+            chunk_store: Arc::new(crate::index::stored::MemoryChunkStore::default()),
             indexes: Mutex::new(HashMap::new()),
             types: Arc::new(TypeRegistry::default()),
             catalog: None,
@@ -70,15 +71,15 @@ impl SemcastRuntime {
         &self.types
     }
 
-    /// Store Lance datasets under `root` instead of the temp-dir default.
-    pub fn with_index_root(mut self, root: impl Into<PathBuf>) -> Self {
-        self.index_root = root.into();
+    /// Keep semantic-index chunks and vectors in `store` instead of memory.
+    pub fn with_chunk_store(mut self, store: Arc<dyn crate::index::stored::ChunkStore>) -> Self {
+        self.chunk_store = store;
         self
     }
 
-    /// Where Lance datasets go when `IndexOptions.path` is not set.
-    pub fn index_root(&self) -> &Path {
-        &self.index_root
+    /// Where semantic indexes keep their chunks and vectors.
+    pub fn chunk_store(&self) -> &Arc<dyn crate::index::stored::ChunkStore> {
+        &self.chunk_store
     }
 
     /// Save definitions to `catalog` as they are made.
@@ -100,12 +101,38 @@ impl SemcastRuntime {
     }
 
     /// Forget every index on `table` — the table was dropped, and an index
-    /// must not outlive it into a same-named table created later.
-    pub fn unregister_indexes(&self, table: &str) {
+    /// must not outlive it into a same-named table created later. Its chunks
+    /// go too, half-built copies included (the vectors stay, as answers other
+    /// indexes over the same text may read), and that delete is finished
+    /// before this returns: a delete still queued could otherwise land on an
+    /// index the next statement builds under the same name.
+    pub async fn unregister_indexes(&self, table: &str) {
+        let mut dropped = Vec::new();
         self.indexes
             .lock()
             .expect("index registry poisoned")
-            .retain(|(indexed, _), _| indexed != table);
+            .retain(|(indexed, column), _| {
+                let keep = indexed != table;
+                if !keep {
+                    dropped.push(crate::catalog::index_name(table, column));
+                }
+                keep
+            });
+        if dropped.is_empty() {
+            return;
+        }
+        let store = Arc::clone(&self.chunk_store);
+        let deleted = tokio::task::spawn_blocking(move || {
+            for name in dropped {
+                if let Err(error) = store.drop_index(&name) {
+                    tracing::warn!(%name, %error, "could not delete a dropped index's chunks");
+                }
+            }
+        })
+        .await;
+        if let Err(error) = deleted {
+            tracing::warn!(%error, "deleting a dropped index's chunks failed");
+        }
     }
 
     pub fn index_for(&self, table: &str, column: &str) -> Option<Arc<dyn SemanticIndex>> {

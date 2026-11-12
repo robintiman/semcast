@@ -44,8 +44,10 @@ impl Disk {
     /// over.
     async fn session(&self, model: Arc<dyn ModelProvider>) -> SessionContext {
         let ctx = SemcastContextBuilder::new(model)
-            .with_index_root(self.dir.path().join("indexes"))
             .with_catalog(Catalog::open(self.store()).unwrap())
+            .with_chunk_store(Arc::new(
+                semcast::index::stored::SqliteChunkStore::open(self.store()).unwrap(),
+            ))
             .build();
         let restored = semcast::restore_catalog(&ctx).await.unwrap();
         assert!(restored.failed.is_empty(), "{:?}", restored.failed);

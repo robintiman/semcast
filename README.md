@@ -90,7 +90,6 @@ Flags of `semcast serve`:
 | `--embed-model` | `nomic-embed-text` | Ollama embedding model |
 | `--voyage-model` | `voyage-4-large` | Voyage embedding model |
 | `--ollama-url` | `http://localhost:11434` | |
-| `--index-dir` | temp dir | where semantic indexes live |
 | `--store` | memory only | SQLite file; see [Persistence](#persistence) |
 | `--jobs-dir` | temp dir | batch job state and results |
 | `--max-in-flight` | `8` | model requests in flight across all queries; a separate embedder gets its own cap; identical requests are sent once |
@@ -103,9 +102,9 @@ Set `--store semcast.db` to keep state across restarts:
 * **Verdicts.** One paid for once is free after the restart.
 * **Definitions.** Databases, schemas, external tables, views, semantic types
   and semantic indexes come back.
-* **Indexes** are reattached where they were built, without re-embedding, so
-  set `--index-dir` to a directory that outlives the temp dir. Same for
-  `--jobs-dir` and job results.
+* **Indexes** come back without re-embedding: their vectors are kept in the
+  same file. Set `--jobs-dir` to a directory that outlives the temp dir to
+  keep job results too.
 * **Not kept:** in-memory tables (`CREATE TABLE ... AS`) and the views and
   indexes over them.
 
@@ -192,7 +191,8 @@ WHERE id NOT IN (SELECT id FROM tickets WHERE body MEANS 'resolved');
 CREATE SEMANTIC INDEX ON <table>(<column>);
 ```
 
-Chunks each value, embeds the chunks into a Lance dataset, and gives `MEANS`
+Chunks each value, embeds the chunks, keeps the vectors in the store (or in
+memory without `--store`), and gives `MEANS`
 a cheap stage: one embedding call per query prunes non-candidates by vector
 similarity, and the verify model reads each survivor's top-3 chunks instead
 of the whole document. Optional for `MEANS` but highly recommended; required
@@ -565,7 +565,7 @@ SELECT * FROM job_result('job_1753711331000_0000');
 ## Roadmap
 
 - [x] `MEANS` — planner-integrated semantic predicate with batched verify
-- [x] `CREATE SEMANTIC INDEX` on Lance — vector pre-filter stage
+- [x] `CREATE SEMANTIC INDEX` — vector pre-filter stage, vectors kept in the store
 - [x] `WITH RECALL` — sampled threshold calibration
 - [x] Semantic types — `CREATE SEMANTIC TYPE`, `CAST`/`EXTRACT`, constrained decoding, field pushdown
 - [x] pgwire server (simple protocol) with funnel progress as NOTICE messages
@@ -629,7 +629,6 @@ Project Link: [https://github.com/robintiman/semcast](https://github.com/robinti
 
 * [LOTUS](https://github.com/lotus-data/lotus) — pioneered the calibrated-cascade technique
 * [Apache DataFusion](https://datafusion.apache.org/) — the query engine semcast extends
-* [Lance](https://lancedb.github.io/lance/) — backs the semantic index
 
 <!-- MARKDOWN LINKS & IMAGES -->
 [bug-url]: https://github.com/robintiman/semcast/issues/new?labels=bug

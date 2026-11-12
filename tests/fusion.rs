@@ -265,13 +265,11 @@ async fn different_columns_are_not_fused() {
 async fn an_indexed_column_keeps_its_funnel() {
     let model = KeywordModel::new();
     let ctx = docs(Arc::clone(&model)).await;
-    let dir = tempfile::tempdir().unwrap();
     create_semantic_index(
         &ctx,
         "docs",
         "body",
         IndexOptions {
-            path: Some(dir.path().join("docs.body.lance")),
             ..Default::default()
         },
     )
