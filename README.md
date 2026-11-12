@@ -338,6 +338,12 @@ gives its P("yes"), the main model labels a sample, and only rows above the
 calibrated floor reach the main model. A row the scorer can't score is
 verified anyway. Without `WITH RECALL` the scorer is never asked.
 
+A column with both an index and a scorer gets one funnel: the index floor,
+then the scorer's, chosen together on one sample. The pair that meets the
+target at the least expected cost wins: a strong index may need no scorer,
+and a weak one can let the scorer do the pruning. `EXPLAIN` shows `then
+scorer=… (floors chosen jointly)`.
+
 #### `WITH CONFIDENCE`
 
 ```sql

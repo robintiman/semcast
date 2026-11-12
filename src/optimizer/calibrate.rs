@@ -279,7 +279,7 @@ fn certified_floor(
 /// `[0, 1]` and stays sane at `k == n` — which is exactly where a small
 /// calibration sample lives, and where the normal interval would claim a
 /// bound of 1.0 from three observations.
-fn wilson_lower_bound(successes: usize, trials: usize, alpha: f64) -> f64 {
+pub(crate) fn wilson_lower_bound(successes: usize, trials: usize, alpha: f64) -> f64 {
     if trials == 0 {
         return 0.0;
     }
