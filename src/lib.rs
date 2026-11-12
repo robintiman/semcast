@@ -636,8 +636,9 @@ fn reject_handwritten_recall(plan: &datafusion::logical_expr::LogicalPlan) -> Re
     })?;
     if found {
         return Err(datafusion::error::DataFusionError::Plan(
-            "a recall target belongs to the whole statement: write \
-             means(text, 'condition') and end the statement WITH RECALL r"
+            "a means() with a recall argument (written by hand, or stored in a \
+             view this statement reads) is refused: a recall target belongs to \
+             the whole statement, so end the statement WITH RECALL r instead"
                 .to_owned(),
         )
         .into());
