@@ -100,8 +100,8 @@ Flags of `semcast serve`:
 Set `--store semcast.db` to keep state across restarts:
 
 * **Verdicts.** One paid for once is free after the restart.
-* **Definitions.** Databases, schemas, external tables, views, semantic types
-  and semantic indexes come back.
+* **Definitions.** Databases, schemas, external tables, views, semantic types,
+  semantic indexes and semantic columns come back.
 * **Indexes** come back without re-embedding: their vectors are kept in the
   same file. Set `--jobs-dir` to a directory that outlives the temp dir to
   keep job results too.
@@ -252,6 +252,32 @@ NULL when the text is NULL, the call fails, or the provider reports no
 probabilities (Ollama does; Anthropic doesn't). `ORDER BY … DESC` puts NULLs
 first; add `NULLS LAST`. Not to be confused with `WITH CONFIDENCE`, which
 qualifies a recall target.
+
+#### Semantic columns
+
+```sql
+ALTER TABLE <table> ADD SEMANTIC COLUMN <name> AS (<text_column> MEANS '<condition>');
+ALTER TABLE <table> DROP SEMANTIC COLUMN [IF EXISTS] <name>;
+REFRESH SEMANTIC COLUMN <table>(<name>);
+```
+
+A named `MEANS`, read like any column. Nothing is stored in the table: reading
+the column asks the question for every row that has no stored answer yet, and
+the answers are kept, so the second read is free. It is the same question as
+the `MEANS` it names — `WHERE angry` plans exactly like
+`WHERE body MEANS 'the customer is angry'`, index and all, and either pays for
+the other. `REFRESH` pays ahead of time, for every row.
+
+```sql
+ALTER TABLE tickets ADD SEMANTIC COLUMN angry AS (body MEANS 'the customer is angry');
+SELECT id, angry FROM tickets;
+SELECT count(*) FROM tickets WHERE angry;
+```
+
+Saved with `--store` on a saved table, and dropped with its table. Writes go
+to the table underneath: `INSERT` names its columns (`INSERT INTO tickets (id,
+body) ...`), since a semantic column has no value to give; `UPDATE` can't set
+one; and `DELETE`/`UPDATE` can't filter on one, as they can't on `MEANS`.
 
 #### `WITH RECALL`
 
@@ -577,6 +603,8 @@ SELECT * FROM job_result('job_1753711331000_0000');
       orders them
 - [x] Classify — `MEANS` in a `SELECT` list or a `CASE` branch, all branches
       fused into one model call per row
+- [x] Semantic columns — `ALTER TABLE … ADD SEMANTIC COLUMN … AS (… MEANS …)`,
+      a named question whose answers are stored; `REFRESH SEMANTIC COLUMN`
 - [x] `CONFIDENCE(… MEANS …)` — the model's P("yes") as a column, sharing the
       `MEANS` cache
 - [x] Cluster — `GROUP BY MEANING OF … INTO k`, one model call per group,

@@ -60,6 +60,9 @@ pub enum EntryKind {
     SemanticType,
     /// A semantic index, keyed `table(column)`; its definition is JSON.
     SemanticIndex,
+    /// A semantic column, keyed `table(name)`; its definition is the
+    /// `ALTER TABLE ... ADD SEMANTIC COLUMN` text.
+    SemanticColumn,
 }
 
 impl EntryKind {
@@ -70,6 +73,7 @@ impl EntryKind {
             Self::Relation => "relation",
             Self::SemanticType => "semantic_type",
             Self::SemanticIndex => "semantic_index",
+            Self::SemanticColumn => "semantic_column",
         }
     }
 
@@ -80,6 +84,7 @@ impl EntryKind {
             Self::Relation,
             Self::SemanticType,
             Self::SemanticIndex,
+            Self::SemanticColumn,
         ]
         .into_iter()
         .find(|known| known.as_str() == kind)
@@ -107,6 +112,9 @@ pub(crate) enum Change {
     /// relation of that bare name remains — the index map is keyed by bare
     /// name, so such a relation still owns them.
     ForgetOrphanIndexes { table: String },
+    /// Delete the saved semantic columns of the fully resolved table
+    /// `table` — it was replaced by one that has none, or dropped.
+    ForgetSemanticColumns { table: String },
 }
 
 /// The catalog half of a store file opened with
@@ -226,6 +234,16 @@ fn apply_changes(connection: &mut Connection, changes: &[Change]) -> Result<()> 
                     .execute(
                         "DELETE FROM catalog WHERE kind = ?1 AND name = ?2",
                         params![kind.as_str(), name],
+                    )
+                    .map_err(store_err)?;
+            }
+            Change::ForgetSemanticColumns { table } => {
+                // substr, not LIKE: a name may hold `%` or `_`.
+                transaction
+                    .execute(
+                        "DELETE FROM catalog WHERE kind = 'semantic_column' \
+                         AND substr(name, 1, length(?1)) = ?1",
+                        params![format!("{table}(")],
                     )
                     .map_err(store_err)?;
             }
@@ -425,12 +443,19 @@ pub(crate) async fn execute_ddl(
             let name = resolve(ctx, &name);
             let failure =
                 format!("{name} is defined for this session but will be gone after a restart");
+            let resolved = name.clone();
             let entry = Entry {
                 kind: EntryKind::Relation,
                 name,
                 definition,
             };
-            (vec![Change::Put(entry)], failure)
+            // A replaced table comes back without the semantic columns the
+            // old one had, in the session and so in the catalog.
+            let mut changes = vec![Change::Put(entry)];
+            if existed {
+                changes.push(Change::ForgetSemanticColumns { table: resolved });
+            }
+            (changes, failure)
         }
         Effect::UnsavedRelation { name, replaces } if !existed || replaces => {
             // Unlocked while it ran: another statement may have redefined
@@ -448,11 +473,17 @@ pub(crate) async fn execute_ddl(
                 "{name} is defined for this session, but an earlier saved definition \
                  will replace it after a restart"
             );
+            let columns = Change::ForgetSemanticColumns {
+                table: name.clone(),
+            };
             let forget = Change::Forget {
                 kind: EntryKind::Relation,
                 name,
             };
-            (vec![forget, Change::ForgetOrphanIndexes { table }], failure)
+            (
+                vec![forget, columns, Change::ForgetOrphanIndexes { table }],
+                failure,
+            )
         }
         Effect::SaveSchema { name } if !existed => {
             let name = qualified_schema(ctx, &name);
@@ -524,13 +555,16 @@ async fn forget_relation(
     };
     let name = resolve(ctx, name);
     let failure = format!("{name} is gone from this session but will come back after a restart");
+    let columns = Change::ForgetSemanticColumns {
+        table: name.clone(),
+    };
     let forget = Change::Forget {
         kind: EntryKind::Relation,
         name,
     };
     save(
         catalog,
-        vec![forget, Change::ForgetOrphanIndexes { table }],
+        vec![forget, columns, Change::ForgetOrphanIndexes { table }],
         &failure,
     )
     .await
@@ -543,6 +577,18 @@ async fn is_memory_table(ctx: &SessionContext, name: &TableReference) -> bool {
         .is_ok_and(|provider| {
             provider
                 .downcast_ref::<datafusion::datasource::MemTable>()
+                .map(|_| ())
+                .or_else(|| {
+                    // A table with semantic columns is what it wraps.
+                    provider
+                        .downcast_ref::<crate::semantic_column::SemanticColumnsTable>()
+                        .and_then(|table| {
+                            table
+                                .inner()
+                                .downcast_ref::<datafusion::datasource::MemTable>()
+                        })
+                        .map(|_| ())
+                })
                 .is_some()
         })
 }
@@ -558,6 +604,18 @@ fn reads_memory_table(plan: &LogicalPlan) -> Result<bool> {
         {
             if provider
                 .downcast_ref::<datafusion::datasource::MemTable>()
+                .map(|_| ())
+                .or_else(|| {
+                    // A table with semantic columns is what it wraps.
+                    provider
+                        .downcast_ref::<crate::semantic_column::SemanticColumnsTable>()
+                        .and_then(|table| {
+                            table
+                                .inner()
+                                .downcast_ref::<datafusion::datasource::MemTable>()
+                        })
+                        .map(|_| ())
+                })
                 .is_some()
             {
                 found = true;

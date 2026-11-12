@@ -28,6 +28,7 @@ pub mod logical;
 pub mod model;
 pub mod optimizer;
 pub mod physical;
+pub mod semantic_column;
 pub mod semir;
 pub mod server;
 pub mod sql;
@@ -161,6 +162,45 @@ pub(crate) async fn run_sql(ctx: &SessionContext, text: &str, record: bool) -> R
                     let no_rows = LogicalPlanBuilder::empty(false).build()?;
                     Ok(DataFrame::new(ctx.state(), no_rows))
                 }
+                sql::ddl::SemanticDdl::AddColumn {
+                    table,
+                    table_if_exists,
+                    name,
+                    text: column,
+                    condition,
+                } => {
+                    if table_if_exists && !ctx.table_exist(table.as_str())? {
+                        let no_rows = LogicalPlanBuilder::empty(false).build()?;
+                        return Ok(DataFrame::new(ctx.state(), no_rows));
+                    }
+                    let column = semantic_column::SemanticColumn {
+                        name,
+                        text: column,
+                        condition: semir::normalize_instruction(&condition),
+                    };
+                    semantic_column::add_column(ctx, &table, column, text, record).await?;
+                    let no_rows = LogicalPlanBuilder::empty(false).build()?;
+                    Ok(DataFrame::new(ctx.state(), no_rows))
+                }
+                sql::ddl::SemanticDdl::DropColumn {
+                    table,
+                    table_if_exists,
+                    name,
+                    if_exists,
+                } => {
+                    if table_if_exists && !ctx.table_exist(table.as_str())? {
+                        let no_rows = LogicalPlanBuilder::empty(false).build()?;
+                        return Ok(DataFrame::new(ctx.state(), no_rows));
+                    }
+                    semantic_column::drop_column(ctx, &table, &name, if_exists, record).await?;
+                    let no_rows = LogicalPlanBuilder::empty(false).build()?;
+                    Ok(DataFrame::new(ctx.state(), no_rows))
+                }
+                sql::ddl::SemanticDdl::RefreshColumn { table, name } => {
+                    semantic_column::refresh_column(ctx, &table, &name).await?;
+                    let no_rows = LogicalPlanBuilder::empty(false).build()?;
+                    Ok(DataFrame::new(ctx.state(), no_rows))
+                }
                 other => Err(DataFusionError::Plan(format!(
                     "semantic DDL not implemented yet: {other:?}"
                 ))
@@ -232,7 +272,66 @@ fn reject_semantic_dml(plan: &datafusion::logical_expr::LogicalPlan) -> Result<(
             return Ok(TreeNodeRecursion::Continue);
         }
         let op = dml.op.to_string();
+        // A filter on a semantic column is a MEANS too, under another name;
+        // the planner hasn't expanded it yet, so look for its name.
+        let semantic: Vec<String> = datafusion::datasource::source_as_provider(&dml.target)
+            .ok()
+            .and_then(|provider| {
+                provider
+                    .downcast_ref::<semantic_column::SemanticColumnsTable>()
+                    .map(|table| table.columns().iter().map(|c| c.name.clone()).collect())
+            })
+            .unwrap_or_default();
+        // An UPDATE assigns every column; a semantic one may only keep its
+        // own value, and nothing may be computed from one — before planning,
+        // that would be a MEANS hidden in an assignment.
+        if dml.op == WriteOp::Update
+            && !semantic.is_empty()
+            && let LogicalPlan::Projection(assignments) = dml.input.as_ref()
+        {
+            for (field, value) in assignments.schema.fields().iter().zip(&assignments.expr) {
+                let value = match value {
+                    Expr::Alias(alias) => alias.expr.as_ref(),
+                    other => other,
+                };
+                if semantic.contains(field.name()) {
+                    let unchanged =
+                        matches!(value, Expr::Column(column) if &column.name == field.name());
+                    if !unchanged {
+                        refusal = Some(format!(
+                            "{} is a semantic column: it is computed, not stored, so \
+                             UPDATE cannot set it",
+                            field.name()
+                        ));
+                        return Ok(TreeNodeRecursion::Stop);
+                    }
+                    continue;
+                }
+                if value.exists(|e| {
+                    Ok(matches!(e, Expr::Column(column) if semantic.contains(&column.name)))
+                })? {
+                    refusal = Some(format!(
+                        "UPDATE cannot compute {} from a semantic column: it would ask \
+                         the model for every row. Read the column into a table first",
+                        field.name()
+                    ));
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+            }
+        }
         dml.input.apply_with_subqueries(|node| {
+            if let LogicalPlan::Filter(filter) = node
+                && filter.predicate.exists(|e| {
+                    Ok(matches!(e, Expr::Column(column) if semantic.contains(&column.name)))
+                })?
+            {
+                refusal = Some(format!(
+                    "{op} cannot filter on a semantic column: it would affect every row \
+                     without asking the model. Keep the other rows instead: CREATE TABLE \
+                     <new> AS SELECT * FROM <table> WHERE NOT <column>"
+                ));
+                return Ok(TreeNodeRecursion::Stop);
+            }
             for expr in node.expressions() {
                 if optimizer::rewrite::contains_means(&expr)? {
                     refusal = Some(format!(
@@ -447,6 +546,7 @@ impl SemcastContextBuilder {
             state = state.with_runtime_env(runtime_env);
         }
         let state = state
+            .with_analyzer_rule(Arc::new(semantic_column::SemanticColumnsRule))
             .with_optimizer_rule(Arc::new(MeansRewriteRule::new(Arc::clone(&runtime))))
             .with_optimizer_rule(Arc::new(
                 crate::optimizer::extract::ExtractRewriteRule::new(Arc::clone(&types)),

@@ -56,6 +56,7 @@ SQL text
 | `MEANS` (filter) | `dialect.rs`, `means_udf.rs` | `rewrite.rs` | `sem_filter.rs` | `verify.rs` + `index_scan.rs` |
 | `MEANS` (label / `CASE`) | same | `rewrite.rs` → `classify.rs` | `sem_classify.rs` | `classify.rs` |
 | `CONFIDENCE(… MEANS …)` | `confidence_udf.rs` | same (Filter/Sort lift in `rewrite.rs`) | `sem_classify.rs` (`YesProbability`) | `classify.rs` (`score_batch`) |
+| Semantic column | `ddl.rs`, `statement.rs` (`ALTER TABLE … SEMANTIC`) | `semantic_column.rs` (analyzer rule: scan → `MEANS` projection) | — | — |
 | `RELEVANCE TO` | `dialect.rs`, `rank.rs`, `rank_udf.rs` | `rank.rs` | `sem_rank.rs` | `rank.rs` |
 | `GROUP BY MEANING OF` | `cluster.rs`, `cluster_udf.rs` | `cluster.rs` | `sem_cluster.rs` | `cluster.rs` |
 | `SEMANTIC DISTINCT ON` | `distinct.rs`, `distinct_udf.rs` | `distinct.rs` | `sem_distinct.rs` | `distinct.rs` |
@@ -93,6 +94,17 @@ registry and the optional durable catalog (`src/catalog.rs`). Both the public AP
 and the physical planner reach it via
 `state.config().get_extension::<SemcastRuntime>()`; that's the plumbing to reuse
 rather than threading new parameters through.
+
+### Semantic columns
+
+`src/semantic_column.rs`: `ALTER TABLE t ADD SEMANTIC COLUMN` re-registers `t`
+as a `SemanticColumnsTable`, whose schema adds a boolean per column; scanning
+it directly is refused. `SemanticColumnsRule`, an analyzer rule (so it runs
+before every optimizer rule), replaces its scan with a projection computing
+each column as its `means()` marker, and pushes a `WHERE` over that
+projection below it with the column replaced by the marker, so `WHERE angry`
+is an ordinary `MEANS` filter. A `MemTable` check must look through the
+wrapper (`catalog::is_memory_table`).
 
 ### SemIR
 
