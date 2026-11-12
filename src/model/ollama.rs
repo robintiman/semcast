@@ -3,6 +3,14 @@
 //! The free-local-dev path: completions through `/api/chat`, embeddings
 //! through `/api/embed` (which the semantic index needs at roadmap step 2).
 //!
+//! Every request sets the context length (`num_ctx`). Left to Ollama, it
+//! falls back to a default (16k tokens in 0.40) and keeps only the end of a
+//! longer input, so a long document's verdict would be about its last pages
+//! with nothing said. An input that can't fit is an error instead, before
+//! the call when it is clearly too long and after it when the model's own
+//! token count shows the prompt was cut: rows fail, they are never answered
+//! from part of the text.
+//!
 //! [Ollama]: https://ollama.com
 
 use async_trait::async_trait;
@@ -14,12 +22,41 @@ use crate::{Result, SemcastError};
 pub const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
 pub const DEFAULT_CHAT_MODEL: &str = "gemma4:e4b";
 pub const DEFAULT_EMBED_MODEL: &str = "nomic-embed-text";
+/// Context length requested by default, in tokens: room for a document of
+/// about 120k characters (nine CUAD contracts in ten). Raise it with
+/// `--ollama-num-ctx` for longer ones, up to the model's own limit; memory
+/// grows with it.
+pub const DEFAULT_NUM_CTX: usize = 32_768;
+
+/// Characters per token assumed when checking an input fits before the
+/// call: generous, so only an input clearly too long is refused unasked.
+const CHARS_PER_TOKEN: usize = 4;
+
+/// Refuse an input that clearly can't fit `num_ctx` with room to answer.
+fn check_fits(request: &CompletionRequest, num_ctx: usize) -> Result<()> {
+    let estimated = (request.system.len() + request.input.len()) / CHARS_PER_TOKEN;
+    if estimated + request.max_tokens > num_ctx {
+        return Err(SemcastError::Model(format!(
+            "input of about {estimated} tokens doesn't fit the model's context \
+             of {num_ctx} (--ollama-num-ctx); refused rather than truncated"
+        )));
+    }
+    Ok(())
+}
+
+/// Whether Ollama cut the prompt: it evaluated as many tokens as the context
+/// leaves room for, which is what truncation looks like from outside.
+fn truncated(prompt_eval_count: usize, max_tokens: usize, num_ctx: usize) -> bool {
+    prompt_eval_count + max_tokens >= num_ctx
+}
 
 #[derive(Debug, Clone)]
 pub struct OllamaProvider {
     base_url: String,
     model: String,
     embed_model: String,
+    /// Context length requested on every call, in tokens.
+    num_ctx: usize,
     client: reqwest::Client,
 }
 
@@ -30,6 +67,7 @@ impl OllamaProvider {
             base_url: DEFAULT_OLLAMA_URL.to_owned(),
             model: model.into(),
             embed_model: DEFAULT_EMBED_MODEL.to_owned(),
+            num_ctx: DEFAULT_NUM_CTX,
             client: reqwest::Client::new(),
         }
     }
@@ -46,7 +84,14 @@ impl OllamaProvider {
         self
     }
 
+    /// Request this context length, in tokens (see the module docs).
+    pub fn with_num_ctx(mut self, num_ctx: usize) -> Self {
+        self.num_ctx = num_ctx;
+        self
+    }
+
     async fn complete_one(&self, request: CompletionRequest) -> Result<Completion> {
+        check_fits(&request, self.num_ctx)?;
         let body = ChatRequest {
             model: &self.model,
             messages: vec![
@@ -71,6 +116,7 @@ impl OllamaProvider {
             options: ChatOptions {
                 num_predict: request.max_tokens,
                 temperature: TEMPERATURE,
+                num_ctx: self.num_ctx,
             },
             logprobs: request.logprobs.then_some(true),
             // Enough alternatives to see both answers in their usual
@@ -102,6 +148,14 @@ impl OllamaProvider {
             response = %chat.message.content,
             "llm response"
         );
+        if truncated(chat.prompt_eval_count, request.max_tokens, self.num_ctx) {
+            return Err(SemcastError::Model(format!(
+                "the model read {} tokens, all its context of {} \
+                 (--ollama-num-ctx) allows: the input was cut, so the answer \
+                 is not used",
+                chat.prompt_eval_count, self.num_ctx
+            )));
+        }
         let yes_probability = chat
             .logprobs
             .as_deref()
@@ -197,6 +251,7 @@ struct ChatMessage<'a> {
 struct ChatOptions {
     num_predict: usize,
     temperature: f32,
+    num_ctx: usize,
 }
 
 #[derive(Deserialize)]
@@ -256,6 +311,29 @@ struct EmbedResponse {
 mod tests {
     use super::*;
 
+    fn request(chars: usize) -> CompletionRequest {
+        CompletionRequest {
+            system: String::new(),
+            input: "x".repeat(chars),
+            max_tokens: 8,
+            schema: None,
+            logprobs: false,
+        }
+    }
+
+    #[test]
+    fn an_input_too_long_for_the_context_is_refused_not_truncated() {
+        assert!(check_fits(&request(4 * 1000), 2048).is_ok());
+        let error = check_fits(&request(4 * 3000), 2048).unwrap_err();
+        assert!(
+            error.to_string().contains("refused rather than truncated"),
+            "{error}"
+        );
+        // What Ollama reports when it cut the prompt to fit.
+        assert!(truncated(16_380, 8, 16_384));
+        assert!(!truncated(12_039, 8, 16_384));
+    }
+
     #[test]
     fn parses_chat_response() {
         let json = r#"{
@@ -290,6 +368,7 @@ mod tests {
             options: ChatOptions {
                 num_predict: 8,
                 temperature: TEMPERATURE,
+                num_ctx: DEFAULT_NUM_CTX,
             },
             logprobs: None,
             top_logprobs: None,

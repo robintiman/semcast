@@ -558,3 +558,43 @@ async fn scorer_against_live_ollama() {
     println!("live ollama scorer kept {ids:?}");
     assert_eq!(ids, [1, 4]);
 }
+
+/// A document longer than the context is refused, not answered from its
+/// last pages; with room for it, the start of the document is read.
+///
+/// ```sh
+/// cargo test --test live_ollama -- --ignored long_document
+/// ```
+#[tokio::test]
+#[ignore = "requires a running Ollama server with a pulled model"]
+async fn long_document_is_refused_or_read_whole() {
+    use semcast::model::{CompletionRequest, ModelProvider, OllamaProvider};
+    let model = std::env::var("SEMCAST_OLLAMA_MODEL").unwrap_or_else(|_| "gemma4:e4b".to_owned());
+    // The answer is on the first page; ~75k tokens of filler follow it.
+    let input = format!(
+        "The secret word is PELICAN.\n{}",
+        "The parties agree to the terms herein. ".repeat(7700)
+    );
+    let request = || CompletionRequest {
+        system: "Answer with one word: the secret word in the document.".to_owned(),
+        input: input.clone(),
+        max_tokens: 8,
+        schema: None,
+        logprobs: false,
+    };
+
+    let small = OllamaProvider::new(&model).with_num_ctx(16_384);
+    let refused = small.complete(vec![request()]).await.remove(0);
+    assert!(
+        refused.is_err(),
+        "answered from a truncated input: {refused:?}"
+    );
+
+    let large = OllamaProvider::new(&model).with_num_ctx(131_072);
+    let answer = large.complete(vec![request()]).await.remove(0).unwrap();
+    assert!(
+        answer.text.to_uppercase().contains("PELICAN"),
+        "{}",
+        answer.text
+    );
+}

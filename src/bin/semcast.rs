@@ -54,6 +54,11 @@ struct ServeArgs {
     embed_model: String,
     #[arg(long, default_value = semcast::model::DEFAULT_OLLAMA_URL)]
     ollama_url: String,
+    /// Context length Ollama is asked for, in tokens. An input that doesn't
+    /// fit fails its row rather than being truncated; raise this for long
+    /// documents (memory grows with it).
+    #[arg(long, default_value_t = semcast::model::DEFAULT_OLLAMA_NUM_CTX)]
+    ollama_num_ctx: usize,
     /// Which provider embeds text for semantic indexes. `ollama` (the
     /// default) runs locally; `voyage` needs VOYAGE_API_KEY exported.
     #[arg(long, value_enum, default_value_t = EmbedProvider::Ollama)]
@@ -117,6 +122,7 @@ async fn main() -> std::io::Result<()> {
         )
         .with_base_url(&args.ollama_url)
         .with_embed_model(&args.embed_model)
+        .with_num_ctx(args.ollama_num_ctx)
     };
 
     // A missing API key fails here, before the listener binds — not lazily
@@ -154,7 +160,9 @@ async fn main() -> std::io::Result<()> {
     }
     if let Some(scorer) = &args.scorer_model {
         builder = builder.with_scorer(Arc::new(
-            OllamaProvider::new(scorer).with_base_url(&args.ollama_url),
+            OllamaProvider::new(scorer)
+                .with_base_url(&args.ollama_url)
+                .with_num_ctx(args.ollama_num_ctx),
         ));
     }
     if args.index_dir.is_some() {
