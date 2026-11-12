@@ -77,3 +77,14 @@ uv run --project eval eval/storehit.py cfpb --data data/cfpb_complaints.csv
 A session file in `queries/sessions/` marks each statement with `-- setup` or
 `-- step: <label>`; `{data}` is replaced by `--data`. Per-step counts land in
 `results/storehit/<session>.json`.
+
+Counts are per operator, as the funnel NOTICE reports them, so read the share
+with care:
+
+- A CTE referenced twice is planned twice: the second copy's answers count as
+  stored though no earlier step paid for them. Movie Q5–Q7 self-join one, so
+  each counts its 256 reviews twice; without that the Movie share is 28.0%,
+  not the 37.1% the script prints.
+- A text repeated within a batch is asked once but stored per row, and a
+  multi-branch `CASE` counts stored answers per branch but calls per row.
+- With `--scorer`, scorer calls and hits count as questions too.

@@ -75,6 +75,12 @@ def main() -> None:
     args = parser.parse_args()
     args.connect = None
     args.work = Path(tempfile.mkdtemp(prefix="storehit-"))
+    if any(a.startswith("--store") for a in args.server_arg):
+        parser.error("the session owns --store: it starts from an empty one")
+    if args.session != "movie" and not args.data:
+        parser.error("this session needs --data")
+    if not args.server.exists():
+        parser.error(f"{args.server} is missing; run cargo build --release")
     args.server_arg.append(f"--store={args.work / 'store.db'}")
 
     if args.session == "movie":
@@ -93,13 +99,18 @@ def main() -> None:
             notices = Notices()
             connection.notices = notices
             started = time.monotonic()
-            cursor.execute(statement)
-            if cursor.description:
-                cursor.fetchall()
-            row = {"step": label, "seconds": round(time.monotonic() - started, 1)}
+            row = {"step": label}
+            try:
+                cursor.execute(statement)
+                if cursor.description:
+                    cursor.fetchall()
+            except Exception as error:  # a failed step is a result, not a crash
+                row["error"] = str(error).strip()
+            row["seconds"] = round(time.monotonic() - started, 1)
             row.update(counts(notices.lines))
             rows.append(row)
-            print(f"{row['stored']:>6} stored {row['asked']:>6} asked {row['seconds']:>7.1f} s  {label}", flush=True)
+            failed = f"  FAILED: {row['error']}" if "error" in row else ""
+            print(f"{row['stored']:>6} stored {row['asked']:>6} asked {row['seconds']:>7.1f} s  {label}{failed}", flush=True)
         connection.close()
     finally:
         server.stop()

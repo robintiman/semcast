@@ -1,7 +1,7 @@
 -- An analyst on a credit-card team, two weeks of work over CFPB complaints.
 -- Written before any run and not tuned after: the store-hit gate measures it.
 -- Each statement follows a `-- step:` line naming what an analyst is doing.
--- Week 1 sees complaints received before 2026-06-08 (841 rows), week 2 all
+-- Week 1 sees complaints received before 2026-06-08 (829 rows), week 2 all
 -- 1123: the rows in between are the week's new data.
 
 -- setup
