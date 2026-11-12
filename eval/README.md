@@ -85,6 +85,12 @@ with care:
   stored though no earlier step paid for them. Movie Q5–Q7 self-join one, so
   each counts its 256 reviews twice; without that the Movie share is 28.0%,
   not the 37.1% the script prints.
-- A text repeated within a batch is asked once but stored per row, and a
-  multi-branch `CASE` counts stored answers per branch but calls per row.
+- Units are rows, not distinct texts. Verify and classify ask a text once
+  per batch, EXTRACT once per row, and the store counts every row. Half of
+  the reviews of the movie Q5–Q9 ask about are exact duplicates; counted by
+  distinct text, Movie is about 21%.
+- A multi-branch `CASE` or multi-field EXTRACT counts stored answers per
+  branch or field but calls per row.
+- A failed step reports nothing, though the calls it sent were spent and
+  later steps find their answers stored. The summary line flags failed steps.
 - With `--scorer`, scorer calls and hits count as questions too.

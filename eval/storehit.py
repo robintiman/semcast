@@ -118,10 +118,12 @@ def main() -> None:
     stored = sum(r["stored"] for r in rows)
     asked = sum(r["asked"] for r in rows)
     share = stored / (stored + asked) if stored + asked else 0.0
-    print(f"store answered {stored} of {stored + asked} questions: {share:.1%}")
+    failed = sum("error" in r for r in rows)
+    note = f" ({failed} steps FAILED: their calls are not counted)" if failed else ""
+    print(f"store answered {stored} of {stored + asked} questions: {share:.1%}{note}")
     out = EVAL / "results" / "storehit" / f"{args.session}.json"
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps({"stored": stored, "asked": asked, "share": share, "steps": rows}, indent=2) + "\n")
+    out.write_text(json.dumps({"stored": stored, "asked": asked, "share": share, "failed_steps": failed, "steps": rows}, indent=2) + "\n")
     print(f"wrote {out.relative_to(REPO)}; server log in {args.work / 'server.log'}")
 
 
