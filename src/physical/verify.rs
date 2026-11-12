@@ -42,9 +42,11 @@ pub const MEANS_CHUNKED_PROMPT_VERSION: &str = "means-v2-chunked";
 /// The output cap of a yes/no verify request — a word, with room to spare.
 pub const VERIFY_MAX_TOKENS: usize = 8;
 
-/// The first wave of a verify under `LIMIT`: rows asked before checking
-/// whether enough matched. Each later wave doubles, so a limited query asks at
-/// most about twice the rows it needed, plus this.
+/// The smallest first wave of a verify under `LIMIT`: rows asked before
+/// checking whether enough matched. Each later wave doubles, so a partition
+/// asks at most about twice the rows it needed, plus the first wave. The
+/// fetch is per partition: each one runs its own waves, so a table scanned in
+/// many partitions pays at least this much per partition.
 pub const FIRST_LIMIT_WAVE: usize = 32;
 
 /// Separates chunks in a chunked verify input; part of the cache-keyed
@@ -347,13 +349,13 @@ struct Verifier {
 
 impl Verifier {
     /// Verify `batch` in waves until `wanted` rows matched, returning at
-    /// most that many. The first wave is a few times the in-flight cap and
-    /// each next one doubles, so a sparse match costs few round trips and a
-    /// dense one few wasted calls.
+    /// most that many. The first wave is twice `wanted`, at least
+    /// [`FIRST_LIMIT_WAVE`], and each next one doubles, so a sparse match
+    /// costs few round trips and a dense one few wasted calls.
     async fn verify_until(&self, batch: RecordBatch, wanted: usize) -> Result<RecordBatch> {
         let mut kept = Vec::new();
         let (mut found, mut start) = (0, 0);
-        let mut wave = (2 * wanted).max(FIRST_LIMIT_WAVE);
+        let mut wave = wanted.saturating_mul(2).max(FIRST_LIMIT_WAVE);
         while start < batch.num_rows() && found < wanted {
             let len = wave.min(batch.num_rows() - start);
             let out = self.verify_batch(batch.slice(start, len)).await?;

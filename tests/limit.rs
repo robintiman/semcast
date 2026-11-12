@@ -7,7 +7,8 @@ use datafusion::execution::context::SessionContext;
 use semcast::model::MockModel;
 use semcast::semcast_context;
 
-/// notes(id, body): 200 distinct texts; ids divisible by `every` mention
+/// notes(id, body): 200 distinct texts, all in one partition (the exact call
+/// counts below assume it: the fetch, and so each wave, is per partition); ids divisible by `every` mention
 /// "offline sync", which the mock answers yes to.
 async fn notes(model: Arc<MockModel>, every: i64) -> SessionContext {
     let ctx = semcast_context(model);
