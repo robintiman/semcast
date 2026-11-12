@@ -206,8 +206,7 @@ async fn a_view_cannot_carry_a_recall_target() {
          WHERE body MEANS 'mentions an order' WITH RECALL 0.8",
     )
     .await
-    .err()
-    .expect("refused");
+    .expect_err("refused");
     assert!(
         error.to_string().contains("a view cannot carry it"),
         "{error}"
