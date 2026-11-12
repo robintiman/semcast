@@ -3,3 +3,8 @@
 /data/
 /DESIGN.md
 .env
+/eval/.sembench/
+/eval/.work/
+/eval/.venv/
+/eval/results/
+__pycache__/

@@ -70,6 +70,7 @@ impl OllamaProvider {
             format: request.schema.as_ref(),
             options: ChatOptions {
                 num_predict: request.max_tokens,
+                temperature: TEMPERATURE,
             },
             logprobs: request.logprobs.then_some(true),
             // Enough alternatives to see both answers in their usual
@@ -161,6 +162,10 @@ impl ModelProvider for OllamaProvider {
 /// Alternatives asked for at each token when `logprobs` is set.
 const TOP_LOGPROBS: usize = 10;
 
+/// Greedy decoding: the same text gets the same verdict on every call. A
+/// verdict is cached and reused, so it must not be one sample among several.
+const TEMPERATURE: f32 = 0.0;
+
 /// The first token that carries text: some models open with a control
 /// token, which says nothing about the answer.
 fn first_answer_token(tokens: &[TokenLogprobs]) -> Option<&TokenLogprobs> {
@@ -191,6 +196,7 @@ struct ChatMessage<'a> {
 #[derive(Serialize)]
 struct ChatOptions {
     num_predict: usize,
+    temperature: f32,
 }
 
 #[derive(Deserialize)]
@@ -281,10 +287,19 @@ mod tests {
             stream: false,
             think: false,
             format,
-            options: ChatOptions { num_predict: 8 },
+            options: ChatOptions {
+                num_predict: 8,
+                temperature: TEMPERATURE,
+            },
             logprobs: None,
             top_logprobs: None,
         }
+    }
+
+    #[test]
+    fn chat_request_pins_temperature_to_zero() {
+        let body = serde_json::to_value(chat_request(None)).unwrap();
+        assert_eq!(body["options"]["temperature"], 0.0);
     }
 
     #[test]
