@@ -3,6 +3,21 @@
 //! The free-local-dev path: completions through `/api/chat`, embeddings
 //! through `/api/embed` (which the semantic index needs at roadmap step 2).
 //!
+//! Every chat request sets the context length (`num_ctx`) and turns
+//! truncation off. Left to Ollama, the context falls back to a default that
+//! depends on the version and machine (16k tokens on 0.40, for example) and a longer
+//! prompt is cut to fit, keeping its end, so a long document's verdict would
+//! be about its last pages with nothing said. With `truncate: false` Ollama
+//! refuses such a prompt instead (an HTTP 400 that counts with its own
+//! tokenizer, before any generation), and the row fails: rows fail, they are
+//! never answered from part of the text. With `shift: false` an answer that
+//! runs out of context stops instead of sliding the prompt out, and an answer
+//! that stopped there, short of its own token cap, fails too.
+//!
+//! Needs an Ollama that knows `truncate` and `shift` (0.40 does); an older
+//! one ignores them and cuts silently. Embeddings (`/api/embed`) still
+//! truncate an over-long chunk silently: a known gap.
+//!
 //! [Ollama]: https://ollama.com
 
 use async_trait::async_trait;
@@ -14,12 +29,30 @@ use crate::{Result, SemcastError};
 pub const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
 pub const DEFAULT_CHAT_MODEL: &str = "gemma4:e4b";
 pub const DEFAULT_EMBED_MODEL: &str = "nomic-embed-text";
+/// Context length requested by default, in tokens: room for a document of
+/// about 120k characters (nine CUAD contracts in ten). Raise it with
+/// `--ollama-num-ctx` for longer ones, up to the model's own limit; memory
+/// grows with it.
+pub const DEFAULT_NUM_CTX: usize = 32_768;
+
+/// Whether generation stopped because the context filled, not because the
+/// answer reached its own cap: a `"length"` stop short of `max_tokens`.
+/// A server that reports no count is given the benefit of the doubt.
+fn ran_out_of_context(
+    done_reason: Option<&str>,
+    eval_count: Option<usize>,
+    max_tokens: usize,
+) -> bool {
+    done_reason == Some("length") && eval_count.is_some_and(|count| count < max_tokens)
+}
 
 #[derive(Debug, Clone)]
 pub struct OllamaProvider {
     base_url: String,
     model: String,
     embed_model: String,
+    /// Context length requested on every call, in tokens.
+    num_ctx: usize,
     client: reqwest::Client,
 }
 
@@ -30,6 +63,7 @@ impl OllamaProvider {
             base_url: DEFAULT_OLLAMA_URL.to_owned(),
             model: model.into(),
             embed_model: DEFAULT_EMBED_MODEL.to_owned(),
+            num_ctx: DEFAULT_NUM_CTX,
             client: reqwest::Client::new(),
         }
     }
@@ -43,6 +77,12 @@ impl OllamaProvider {
 
     pub fn with_embed_model(mut self, embed_model: impl Into<String>) -> Self {
         self.embed_model = embed_model.into();
+        self
+    }
+
+    /// Request this context length, in tokens (see the module docs).
+    pub fn with_num_ctx(mut self, num_ctx: usize) -> Self {
+        self.num_ctx = num_ctx;
         self
     }
 
@@ -71,11 +111,14 @@ impl OllamaProvider {
             options: ChatOptions {
                 num_predict: request.max_tokens,
                 temperature: TEMPERATURE,
+                num_ctx: self.num_ctx,
             },
             logprobs: request.logprobs.then_some(true),
             // Enough alternatives to see both answers in their usual
             // spellings ("yes", "Yes", " yes", "no", ...).
             top_logprobs: request.logprobs.then_some(TOP_LOGPROBS),
+            truncate: false,
+            shift: false,
         };
         tracing::debug!(
             target: "semcast::model",
@@ -98,10 +141,22 @@ impl OllamaProvider {
             target: "semcast::model",
             model = %self.model,
             input_tokens = chat.prompt_eval_count,
-            output_tokens = chat.eval_count,
+            output_tokens = chat.eval_count.unwrap_or_default(),
             response = %chat.message.content,
             "llm response"
         );
+        if ran_out_of_context(
+            chat.done_reason.as_deref(),
+            chat.eval_count,
+            request.max_tokens,
+        ) {
+            return Err(SemcastError::Model(format!(
+                "the answer ran out of context after {} tokens (--ollama-num-ctx {}): \
+                 a cut-off answer is not used",
+                chat.eval_count.unwrap_or_default(),
+                self.num_ctx
+            )));
+        }
         let yes_probability = chat
             .logprobs
             .as_deref()
@@ -117,7 +172,7 @@ impl OllamaProvider {
         Ok(Completion {
             text: chat.message.content,
             input_tokens: chat.prompt_eval_count,
-            output_tokens: chat.eval_count,
+            output_tokens: chat.eval_count.unwrap_or_default(),
             yes_probability,
             merged: false,
         })
@@ -185,6 +240,11 @@ struct ChatRequest<'a> {
     logprobs: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     top_logprobs: Option<usize>,
+    /// Always false: refuse a prompt longer than the context rather than cut
+    /// it (see the module docs).
+    truncate: bool,
+    /// Always false: never slide the prompt out to make room for the answer.
+    shift: bool,
 }
 
 #[derive(Serialize)]
@@ -197,6 +257,7 @@ struct ChatMessage<'a> {
 struct ChatOptions {
     num_predict: usize,
     temperature: f32,
+    num_ctx: usize,
 }
 
 #[derive(Deserialize)]
@@ -205,7 +266,10 @@ struct ChatResponse {
     #[serde(default)]
     prompt_eval_count: usize,
     #[serde(default)]
-    eval_count: usize,
+    eval_count: Option<usize>,
+    /// Why generation stopped: `"length"` when it hit a limit.
+    #[serde(default)]
+    done_reason: Option<String>,
     /// One entry per generated token, when the request asked for them. A
     /// shape we don't know (a look-alike server's) reads as none: a missing
     /// probability must not cost the answer.
@@ -257,6 +321,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn an_answer_cut_by_the_context_is_not_used() {
+        assert!(ran_out_of_context(Some("length"), Some(3), 128));
+        // Reaching its own cap is an answer, not a cut.
+        assert!(!ran_out_of_context(Some("length"), Some(8), 8));
+        assert!(!ran_out_of_context(Some("stop"), Some(3), 128));
+        assert!(!ran_out_of_context(None, Some(3), 128));
+        // No count: no evidence of a cut.
+        assert!(!ran_out_of_context(Some("length"), None, 8));
+        let chat: ChatResponse = serde_json::from_str(
+            r#"{"message":{"content":"ye"},"done_reason":"length","eval_count":1}"#,
+        )
+        .unwrap();
+        assert_eq!(chat.done_reason.as_deref(), Some("length"));
+    }
+
+    #[test]
+    fn chat_request_refuses_truncation() {
+        let body = serde_json::to_value(chat_request(None)).unwrap();
+        assert_eq!(body["truncate"], false);
+        assert_eq!(body["shift"], false);
+        assert_eq!(body["options"]["num_ctx"], DEFAULT_NUM_CTX);
+    }
+
+    #[test]
     fn parses_chat_response() {
         let json = r#"{
             "model": "gemma4:e4b",
@@ -269,7 +357,7 @@ mod tests {
         let parsed: ChatResponse = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.message.content, "yes");
         assert_eq!(parsed.prompt_eval_count, 214);
-        assert_eq!(parsed.eval_count, 1);
+        assert_eq!(parsed.eval_count, Some(1));
     }
 
     #[test]
@@ -290,9 +378,12 @@ mod tests {
             options: ChatOptions {
                 num_predict: 8,
                 temperature: TEMPERATURE,
+                num_ctx: DEFAULT_NUM_CTX,
             },
             logprobs: None,
             top_logprobs: None,
+            truncate: false,
+            shift: false,
         }
     }
 

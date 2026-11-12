@@ -90,6 +90,7 @@ Flags of `semcast serve`:
 | `--embed-model` | `nomic-embed-text` | Ollama embedding model |
 | `--voyage-model` | `voyage-4-large` | Voyage embedding model |
 | `--ollama-url` | `http://localhost:11434` | |
+| `--ollama-num-ctx` | `32768` | context Ollama is asked for, in tokens; a longer input fails its row instead of being silently truncated. Raise it for long documents (memory grows with it) |
 | `--store` | memory only | SQLite file; see [Persistence](#persistence) |
 | `--jobs-dir` | temp dir | batch job state and results |
 | `--max-in-flight` | `8` | model requests in flight across all queries; a separate embedder gets its own cap; identical requests are sent once |
