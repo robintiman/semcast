@@ -62,3 +62,18 @@ Only Movie is wired up: it is SemBench's text-only scenario. Queries are in
 - Only the `sf_2000` data SemBench ships in its repository is used. SemBench
   asks for regenerated data before publishing numbers.
 - A prompt in a query file must not contain a semicolon.
+
+## Store hits
+
+`storehit.py` replays a session against one server and one fresh `--store`
+file, and reports the share of semantic questions the store answered rather
+than the model.
+
+```sh
+uv run --project eval eval/storehit.py movie     # SemBench Movie, Q1–Q10 in order
+uv run --project eval eval/storehit.py cfpb --data data/cfpb_complaints.csv
+```
+
+A session file in `queries/sessions/` marks each statement with `-- setup` or
+`-- step: <label>`; `{data}` is replaced by `--data`. Per-step counts land in
+`results/storehit/<session>.json`.
