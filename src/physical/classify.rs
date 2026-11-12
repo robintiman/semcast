@@ -493,6 +493,24 @@ impl Classifier {
             };
             self.apply(pending_row, completion, &mut verdicts);
         }
+        // Each branch a row was asked counts as one answer to that
+        // condition, whether asked alone or fused with others.
+        for (branch, condition) in self.conditions.iter().enumerate() {
+            crate::physical::verify::record_means_stats(
+                self.cache.as_ref(),
+                condition,
+                &self.model_id,
+                pending_rows
+                    .iter()
+                    .zip(&completions)
+                    .filter(|(pending_row, completion)| {
+                        completion.is_ok() && pending_row.pending.contains(&branch)
+                    })
+                    .filter_map(|(pending_row, _)| {
+                        Some((verdicts[branch][pending_row.row]?, pending_row.text.len()))
+                    }),
+            );
+        }
         for (row, asked) in copies {
             let source = pending_rows[asked].row;
             // A copy of a failed row failed too: counted, as verify counts.

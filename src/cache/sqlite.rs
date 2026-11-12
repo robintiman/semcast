@@ -23,13 +23,13 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use super::{CacheKey, CachedValue, SemanticCache, stable_digest};
+use super::{AskStats, CacheKey, CachedValue, SemanticCache, stable_digest};
 use crate::{Result, SemcastError};
 
 /// Bumped when the table layout changes; a file from another layout is
@@ -51,6 +51,8 @@ enum Message {
     Rows(Vec<Row>),
     /// Reply once everything sent before this message is committed.
     Flush(Sender<()>),
+    /// Add to a question's statistics.
+    Stats(u128, AskStats),
 }
 
 /// One verdict on its way to disk.
@@ -75,6 +77,11 @@ pub struct SqliteCache {
     /// `None` only while dropping, so the writer sees its channel close.
     messages: Option<Sender<Message>>,
     writer: Option<JoinHandle<()>>,
+    /// Statistics recorded but not yet committed, added to what disk holds
+    /// when read. The writer subtracts them once committed, so a read racing
+    /// that moment may count a batch twice: statistics order filters, never
+    /// decide rows, so that costs at most a call.
+    pending_stats: Arc<Mutex<HashMap<u128, AskStats>>>,
 }
 
 impl SqliteCache {
@@ -94,15 +101,18 @@ impl SqliteCache {
         let reader = Connection::open(path).map_err(store_err)?;
         reader.busy_timeout(BUSY_TIMEOUT).map_err(store_err)?;
         let (messages, received) = mpsc::channel();
+        let pending_stats: Arc<Mutex<HashMap<u128, AskStats>>> = Arc::default();
+        let pending = Arc::clone(&pending_stats);
         let writer = std::thread::Builder::new()
             .name("semcast-store-writer".to_owned())
-            .spawn(move || write_loop(writer, received))
+            .spawn(move || write_loop(writer, received, pending))
             .map_err(|error| SemcastError::Store(error.to_string()))?;
         Ok(Self {
             reader: Mutex::new(reader),
             stored: Mutex::new(HashMap::new()),
             messages: Some(messages),
             writer: Some(writer),
+            pending_stats,
         })
     }
 
@@ -190,14 +200,20 @@ impl Drop for SqliteCache {
 /// waiting (up to about [`MAX_BATCH`] rows; a group is never split), and
 /// answer flush requests once what came before them is committed. Runs until
 /// the cache is dropped.
-fn write_loop(mut connection: Connection, messages: Receiver<Message>) {
+fn write_loop(
+    mut connection: Connection,
+    messages: Receiver<Message>,
+    pending_stats: Arc<Mutex<HashMap<u128, AskStats>>>,
+) {
     while let Ok(first) = messages.recv() {
         let mut batch: Vec<Row> = Vec::new();
+        let mut stats: Vec<(u128, AskStats)> = Vec::new();
         let mut flushes: Vec<Sender<()>> = Vec::new();
         let mut next = Some(first);
         while let Some(message) = next.take() {
             match message {
                 Message::Rows(rows) => batch.extend(rows),
+                Message::Stats(question, delta) => stats.push((question, delta)),
                 Message::Flush(done) => {
                     // Commit what precedes the flush before answering it.
                     flushes.push(done);
@@ -211,6 +227,20 @@ fn write_loop(mut connection: Connection, messages: Receiver<Message>) {
         }
         if !batch.is_empty() {
             commit(&mut connection, &batch);
+        }
+        if !stats.is_empty() {
+            if let Err(error) = write_stats(&mut connection, &stats) {
+                tracing::warn!(target: "semcast::store", %error, "store could not save statistics");
+            }
+            // Committed or lost, they no longer count as pending.
+            let mut pending = pending_stats.lock().expect("stats lock poisoned");
+            for (question, delta) in &stats {
+                if let Some(entry) = pending.get_mut(question) {
+                    entry.asked = entry.asked.saturating_sub(delta.asked);
+                    entry.matched = entry.matched.saturating_sub(delta.matched);
+                    entry.input_chars = entry.input_chars.saturating_sub(delta.input_chars);
+                }
+            }
         }
         for done in flushes {
             let _ = done.send(());
@@ -248,6 +278,29 @@ fn commit(connection: &mut Connection, batch: &[Row]) {
             );
         }
     }
+}
+
+fn write_stats(connection: &mut Connection, stats: &[(u128, AskStats)]) -> rusqlite::Result<()> {
+    let transaction = connection.transaction()?;
+    {
+        let mut upsert = transaction.prepare_cached(
+            "INSERT INTO ask_stats (question, asked, matched, input_chars)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (question) DO UPDATE SET
+                 asked = asked + excluded.asked,
+                 matched = matched + excluded.matched,
+                 input_chars = input_chars + excluded.input_chars",
+        )?;
+        for (question, delta) in stats {
+            upsert.execute(params![
+                question.to_le_bytes().to_vec(),
+                delta.asked as i64,
+                delta.matched as i64,
+                delta.input_chars as i64,
+            ])?;
+        }
+    }
+    transaction.commit()
 }
 
 /// Commit `batch`, returning the rows whose key already held a different
@@ -443,6 +496,51 @@ impl SemanticCache for SqliteCache {
     fn put_many(&self, entries: Vec<(CacheKey, CachedValue)>) {
         self.store(entries);
     }
+
+    fn record_stats(&self, question: u128, delta: AskStats) {
+        self.pending_stats
+            .lock()
+            .expect("stats lock poisoned")
+            .entry(question)
+            .or_default()
+            .add(delta);
+        if let Some(messages) = &self.messages {
+            let _ = messages.send(Message::Stats(question, delta));
+        }
+    }
+
+    fn stats(&self, question: u128) -> Option<AskStats> {
+        let stored: Option<AskStats> = {
+            let reader = self.reader.lock().expect("store lock poisoned");
+            reader
+                .query_row(
+                    "SELECT asked, matched, input_chars FROM ask_stats WHERE question = ?1",
+                    params![question.to_le_bytes().to_vec()],
+                    |row| {
+                        Ok(AskStats {
+                            asked: row.get::<_, i64>(0)? as u64,
+                            matched: row.get::<_, i64>(1)? as u64,
+                            input_chars: row.get::<_, i64>(2)? as u64,
+                        })
+                    },
+                )
+                .ok()
+        };
+        let pending = self
+            .pending_stats
+            .lock()
+            .expect("stats lock poisoned")
+            .get(&question)
+            .copied();
+        match (stored, pending) {
+            (None, None) => None,
+            (stored, pending) => {
+                let mut total = stored.unwrap_or_default();
+                total.add(pending.unwrap_or_default());
+                Some(total)
+            }
+        }
+    }
 }
 
 /// Open a connection to the store file at `path`, creating its tables on
@@ -502,6 +600,14 @@ pub(crate) fn open_store(path: &Path) -> Result<Connection> {
                  ) WITHOUT ROWID;
                  -- Which chunks each semantic index holds, and the embedding
                  -- each one reads. Added in place: an older build ignores it.
+                 -- What the model answered per question, for ordering
+                 -- filters. Added in place: an older build ignores it.
+                 CREATE TABLE IF NOT EXISTS ask_stats (
+                     question    BLOB PRIMARY KEY,
+                     asked       INTEGER NOT NULL,
+                     matched     INTEGER NOT NULL,
+                     input_chars INTEGER NOT NULL
+                 ) WITHOUT ROWID;
                  CREATE TABLE IF NOT EXISTS index_chunks (
                      index_name  TEXT NOT NULL,
                      doc_hash    INTEGER NOT NULL,

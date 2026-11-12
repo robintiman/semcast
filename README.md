@@ -145,7 +145,10 @@ notice says how many rows the store answered.
 
 Several `MEANS` in one `WHERE` are ordered by what they cost, not by the order
 you wrote them: one whose column has a semantic index prunes for free, so it
-runs before one that pays for every row.
+runs before one that pays for every row. Among the rest, the store remembers
+how often each condition matched and how long its texts were, so the one that
+drops the most rows per call runs first. With no history, written order
+stands.
 
 Several over the *same* column are asked in **one call per row** instead of one
 call per predicate per surviving row — the same fusion a `CASE` gets. An

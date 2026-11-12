@@ -440,6 +440,18 @@ impl Verifier {
         self.model_calls_merged
             .add(crate::physical::verify::merged_calls(&verdicts));
         debug_assert_eq!(verdicts.len(), pending.len());
+        record_means_stats(
+            self.cache.as_ref(),
+            &self.condition,
+            &self.model_id,
+            pending
+                .iter()
+                .zip(&verdicts)
+                .filter_map(|((_, input, _), verdict)| {
+                    let matched = parse_verdict(&verdict.as_ref().ok()?.text)?;
+                    Some((matched, input.len()))
+                }),
+        );
         for ((row, input, chunked), verdict) in pending.iter().zip(&verdicts) {
             match verdict
                 .as_ref()
@@ -481,6 +493,38 @@ impl Verifier {
             MEANS_PROMPT_VERSION
         };
         means_cache_key(&self.condition, input, &self.model_id, prompt_version)
+    }
+}
+
+/// The question a `MEANS` condition asks of `model`, as its statistics are
+/// kept: one per condition and model, whichever prompt asked it (full text,
+/// chunks, or fused with others), since all of them answer it.
+pub(crate) fn means_question(condition: &str, model_id: &ModelId) -> u128 {
+    crate::semir::question_id(
+        condition,
+        crate::semir::AskType::Bool,
+        model_id,
+        MEANS_PROMPT_VERSION,
+    )
+    .0
+}
+
+/// Add fresh answers — `(matched, input characters)` each — to the
+/// condition's statistics. Cache hits are not answers and are not passed.
+pub(crate) fn record_means_stats(
+    cache: &dyn SemanticCache,
+    condition: &str,
+    model_id: &ModelId,
+    answers: impl IntoIterator<Item = (bool, usize)>,
+) {
+    let mut delta = crate::cache::AskStats::default();
+    for (matched, chars) in answers {
+        delta.asked += 1;
+        delta.matched += u64::from(matched);
+        delta.input_chars += chars as u64;
+    }
+    if delta.asked > 0 {
+        cache.record_stats(means_question(condition, model_id), delta);
     }
 }
 
