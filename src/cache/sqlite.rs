@@ -80,10 +80,10 @@ pub struct SqliteCache {
     messages: Option<Sender<Message>>,
     writer: Option<JoinHandle<()>>,
     /// Statistics recorded but not yet committed, added to what disk holds
-    /// when read. The writer subtracts them once committed (or failed: a
-    /// statistics write is not retried), so a read racing that moment may
-    /// count a batch twice or miss it: statistics order filters, never
-    /// decide rows, so that costs at most some calls.
+    /// when read. The writer commits a batch and subtracts it under this
+    /// lock, and a read holds it across its disk read, so each batch counts
+    /// once. A failed statistics write is dropped, not retried: statistics
+    /// order filters, never decide rows.
     pending_stats: Arc<Mutex<HashMap<u128, AskStats>>>,
     /// Curves recorded by this instance: the latest wins, and is read from
     /// here before disk, so a curve is visible before it is committed.
@@ -243,11 +243,13 @@ fn write_loop(
             tracing::warn!(target: "semcast::store", %error, "store could not save pruning curves");
         }
         if !stats.is_empty() {
+            // Held across the commit and the subtraction, so a reader (which
+            // takes it too) sees each batch exactly once: pending, or on disk.
+            let mut pending = pending_stats.lock().expect("stats lock poisoned");
             if let Err(error) = write_stats(&mut connection, &stats) {
                 tracing::warn!(target: "semcast::store", %error, "store could not save statistics");
             }
             // Committed or lost, they no longer count as pending.
-            let mut pending = pending_stats.lock().expect("stats lock poisoned");
             for (question, delta) in &stats {
                 if let Some(entry) = pending.get_mut(question) {
                     entry.asked = entry.asked.saturating_sub(delta.asked);
@@ -567,6 +569,9 @@ impl SemanticCache for SqliteCache {
     }
 
     fn stats(&self, question: u128) -> Option<AskStats> {
+        // Taken before the disk read and held through it: the writer commits
+        // and clears a batch under the same lock, so it is counted once.
+        let pending_stats = self.pending_stats.lock().expect("stats lock poisoned");
         let stored: Option<AskStats> = {
             let reader = self.reader.lock().expect("store lock poisoned");
             reader
@@ -583,12 +588,7 @@ impl SemanticCache for SqliteCache {
                 )
                 .ok()
         };
-        let pending = self
-            .pending_stats
-            .lock()
-            .expect("stats lock poisoned")
-            .get(&question)
-            .copied();
+        let pending = pending_stats.get(&question).copied();
         match (stored, pending) {
             (None, None) => None,
             (stored, pending) => {
