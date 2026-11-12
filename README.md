@@ -281,7 +281,7 @@ asked, the estimated tokens, and the estimated cost at the model's list price
 (NULL for a model semcast has no price for; $0 for Ollama; a fallback chain at
 its first model's price). Estimates: four characters a token, each answer at
 its output cap (an upper bound), list prices as of `prices_as_of`, no batch or
-cache discounts. A text that repeats is asked once.
+cache discounts. A text that repeats within a batch is asked once.
 
 Saved with `--store` on a saved table, and dropped with its table. Writes go
 to the table underneath: `INSERT` names its columns (`INSERT INTO tickets (id,

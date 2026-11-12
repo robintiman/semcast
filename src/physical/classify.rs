@@ -495,6 +495,14 @@ impl Classifier {
         }
         for (row, asked) in copies {
             let source = pending_rows[asked].row;
+            // A copy of a failed row failed too: counted, as verify counts.
+            if pending_rows[asked]
+                .pending
+                .iter()
+                .all(|&branch| verdicts[branch][source].is_none())
+            {
+                self.rows_failed.add(1);
+            }
             for verdict in verdicts.iter_mut() {
                 verdict[row] = verdict[source];
             }
