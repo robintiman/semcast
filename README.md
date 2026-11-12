@@ -303,6 +303,12 @@ holds, and the scan thresholds its probability instead of raw similarity — no
 extra embedding or model call. Too few labels, or all one class, and it falls
 back to similarity.
 
+The target covers the whole funnel, not just the floor. On an indexed column
+verify reads each row's best chunks, so calibration also asks that chunked
+question of every sampled match (one call each): a match it misses, or fails
+on, counts as lost. If chunks lose too many matches to meet the target,
+verify reads the full text for that query, and the progress notice says so.
+
 ```sql
 SELECT meeting_id FROM meetings
 WHERE transcript MEANS 'discussed offline sync'

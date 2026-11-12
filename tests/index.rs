@@ -450,11 +450,12 @@ async fn calibration_raises_the_floor_and_prunes_the_near_miss() {
 
     let embeds_before = model.embed_calls();
     assert_eq!(matching_ids(&ctx, CALIBRATED_QUERY).await, vec![1]);
-    // 2 label calls (docs 1 and 2, full text), and nothing else: doc 1's
-    // label already answers verify, which no longer asks the chunked
-    // question too. Doc 2 scores ~0.87 — above the default floor, below the
+    // 2 label calls (docs 1 and 2, full text) and calibration's chunked
+    // check of doc 1, the sampled match, which measures what verify would
+    // answer from chunks. Verify itself asks nothing: doc 1's label decides
+    // it. Doc 2 scores ~0.87 — above the default floor, below the
     // calibrated one — and its label says no, so it never reaches verify.
-    assert_eq!(model.completion_calls(), 2);
+    assert_eq!(model.completion_calls(), 3);
     assert_eq!(
         model.embed_calls() - embeds_before,
         1,
@@ -491,9 +492,10 @@ async fn unindexed_rows_still_pass_through_under_recall() {
         .unwrap();
 
     assert_eq!(matching_ids(&ctx, CALIBRATED_QUERY).await, vec![1, 4]);
-    // 3 labels (docs 1, 2, 4), and nothing else: each label decides its
-    // document for verify too. Doc 2 is pruned.
-    assert_eq!(model.completion_calls(), 3);
+    // 3 labels (docs 1, 2, 4) and the chunked check of doc 1 (doc 4 has no
+    // chunks to check); each label decides its document for verify too.
+    // Doc 2 is pruned.
+    assert_eq!(model.completion_calls(), 4);
 }
 
 #[tokio::test]
@@ -1222,9 +1224,9 @@ async fn the_calibrated_floor_prunes_rows_outside_the_sample() {
         "the calibrated scan must prune unsampled near-misses: {by_floor} by \
          the scan, {by_label} by their labels"
     );
-    // Only the sample is labelled and only unsampled matches are verified:
-    // nowhere near one call per row.
-    assert!(model.completion_calls() < 64 + MATCHES as usize);
+    // Only the sample is labelled, its matches checked on chunks, and only
+    // unsampled matches verified: nowhere near one call per row.
+    assert!(model.completion_calls() < 64 + 2 * MATCHES as usize);
     assert_eq!(
         matching_ids(&ctx, CALIBRATED_QUERY).await,
         (1..=MATCHES).collect::<Vec<_>>()

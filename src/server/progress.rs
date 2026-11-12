@@ -56,6 +56,10 @@ pub struct FunnelCounts {
     /// Sampled documents the model failed to label. The certificate assumes
     /// each is a lost match if the floor would prune it.
     pub calibration_label_errors: usize,
+    /// Sampled matches chunked verify would have rejected or failed on.
+    pub calibration_verify_misses: usize,
+    /// Calibrations that switched verify to the full text.
+    pub calibration_full_text: usize,
     pub has_verify: bool,
     pub model_calls: usize,
     pub cache_hits: usize,
@@ -145,6 +149,10 @@ pub fn snapshot(plan: &Arc<dyn ExecutionPlan>) -> FunnelCounts {
                     counts.index_hits += counter_total(&metrics, "index_hits");
                     counts.index_store_decided += counter_total(&metrics, "store_known");
                     counts.index_store_pruned += counter_total(&metrics, "store_pruned");
+                    counts.calibration_verify_misses +=
+                        counter_total(&metrics, "calibration_verify_misses");
+                    counts.calibration_full_text +=
+                        counter_total(&metrics, "calibration_full_text");
                     counts.rows_pruned += counter_total(&metrics, "rows_pruned");
                     counts.calibration_sampled_rows +=
                         counter_total(&metrics, "calibration_sampled_rows");
@@ -298,6 +306,12 @@ pub fn render(counts: &FunnelCounts) -> String {
                 calibration.push_str(&format!(
                     ", {} label errors (assumed lost where pruned)",
                     counts.calibration_label_errors,
+                ));
+            }
+            if counts.calibration_full_text > 0 {
+                calibration.push_str(&format!(
+                    ", verify reads full text (chunks missed {} sampled matches)",
+                    counts.calibration_verify_misses,
                 ));
             }
             parts.push(calibration);
