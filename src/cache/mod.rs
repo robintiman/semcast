@@ -65,7 +65,15 @@ pub enum CachedValue {
 /// sample), and an unguarded label. Not by a verify behind an index or
 /// scorer (mostly matches), a guarded label, a scorer, or `CONFIDENCE()`.
 /// A filter stacked behind another still sees only that one's survivors, so
-/// its rate is conditional on it.
+/// its rate is conditional on it. An indexed filter records only through a
+/// `WITH RECALL` calibration.
+///
+/// The text column is named as the plan prints it: `tickets.body` once a
+/// filter is pushed down to its table, but an alias (`u.bio`) or expression
+/// where it stays above one, so two sources under one alias can share
+/// history, and one column can have two. Nothing is keyed by data version,
+/// so a table recreated under its old name keeps its history. Each costs
+/// calls, never rows.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AskStats {
     pub asked: u64,
