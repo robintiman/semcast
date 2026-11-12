@@ -32,6 +32,15 @@ async fn context(scorer: bool) -> SessionContext {
     create_semantic_index(&ctx, "tickets", "body", IndexOptions::default())
         .await
         .unwrap();
+    ctx.sql("CREATE TABLE notes AS SELECT * FROM (VALUES (1, 'order 7')) AS t(id, body)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    create_semantic_index(&ctx, "notes", "body", IndexOptions::default())
+        .await
+        .unwrap();
     ctx
 }
 
@@ -138,4 +147,52 @@ async fn the_split_query_still_runs() {
     .unwrap();
     let out = pretty_format_batches(&batches).unwrap().to_string();
     assert!(out.contains("| 1  |"), "{out}");
+}
+
+#[tokio::test]
+async fn a_filter_in_a_subquery_takes_its_share() {
+    let ctx = context(false).await;
+    let plan = explain(
+        &ctx,
+        "SELECT id FROM tickets WHERE body MEANS 'asks for a refund' \
+         AND id IN (SELECT id FROM notes WHERE body MEANS 'mentions an order') \
+         WITH RECALL 0.9",
+    )
+    .await;
+    assert!(!plan.contains("best-effort"), "{plan}");
+    assert_eq!(plan.matches("across 2 filters").count(), 2, "{plan}");
+}
+
+#[tokio::test]
+async fn a_semantic_column_filter_takes_its_share() {
+    let ctx = context(false).await;
+    semcast::sql(
+        &ctx,
+        "ALTER TABLE tickets ADD SEMANTIC COLUMN angry AS (body MEANS 'is angry')",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+    let plan = explain(
+        &ctx,
+        "SELECT id FROM tickets WHERE body MEANS 'asks for a refund' AND angry WITH RECALL 0.9",
+    )
+    .await;
+    assert!(!plan.contains("best-effort"), "{plan}");
+    assert_eq!(plan.matches("across 2 filters").count(), 2, "{plan}");
+}
+
+#[tokio::test]
+async fn the_physical_plan_prints_the_share_unrounded() {
+    let ctx = context(false).await;
+    let plan = explain(
+        &ctx,
+        "SELECT id FROM tickets WHERE body MEANS 'asks for a refund' \
+         AND body MEANS 'is angry' WITH RECALL 0.999 WITH CONFIDENCE 0.99",
+    )
+    .await;
+    assert!(plan.contains("recall≥0.9995"), "{plan}");
+    assert!(!plan.contains("recall≥1.00"), "{plan}");
 }

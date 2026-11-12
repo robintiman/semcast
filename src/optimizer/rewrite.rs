@@ -511,7 +511,7 @@ pub fn apply_recall(
         let predicate = conjunction(conjuncts).expect("a predicate has a conjunct");
         (predicate, changed)
     };
-    let transformed = plan.transform_up(|plan| match plan {
+    let transformed = plan.transform_up_with_subqueries(|plan| match plan {
         LogicalPlan::Filter(filter) => {
             let (predicate, changed) = attach(filter.predicate);
             let filter = LogicalPlan::Filter(Filter::try_new(predicate, filter.input)?);

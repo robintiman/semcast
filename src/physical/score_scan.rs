@@ -151,14 +151,18 @@ impl DisplayAs for ScoreScanExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "ScoreScanExec: MEANS('{}') scorer={} floor=calibrated(recall≥{:.2}, sample≤{})",
+            "ScoreScanExec: MEANS('{}') scorer={} floor=calibrated(recall≥{}, sample≤{})",
             self.condition,
             self.scorer.id(),
-            self.calibration.target_recall,
+            crate::optimizer::budget::fraction(self.calibration.target_recall),
             self.calibration.sample_size,
         )?;
         if let Some(confidence) = self.calibration.confidence {
-            write!(f, " certified at {confidence:.2}")?;
+            write!(
+                f,
+                " certified at {}",
+                crate::optimizer::budget::fraction(confidence)
+            )?;
         }
         match self
             .input

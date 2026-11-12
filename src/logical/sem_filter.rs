@@ -72,17 +72,6 @@ impl SemFilterNode {
     }
 }
 
-/// A target as EXPLAIN prints it: two decimals, more only when a share
-/// needs them (0.9967 must not read as 1.00).
-fn fraction(value: f64) -> String {
-    let text = format!("{value:.4}");
-    let text = text.trim_end_matches('0');
-    match text.split_once('.') {
-        Some((_, decimals)) if decimals.len() >= 2 => text.to_owned(),
-        _ => format!("{value:.2}"),
-    }
-}
-
 impl PartialEq for SemFilterNode {
     fn eq(&self, other: &Self) -> bool {
         self.input == other.input
@@ -139,10 +128,14 @@ impl UserDefinedLogicalNodeCore for SemFilterNode {
             (Some(r), Some(c)) => write!(
                 f,
                 "   recall ≥ {} certified at {}",
-                fraction(r),
-                fraction(c)
+                crate::optimizer::budget::fraction(r),
+                crate::optimizer::budget::fraction(c)
             )?,
-            (Some(r), None) => write!(f, "   recall ≥ {} estimated", fraction(r))?,
+            (Some(r), None) => write!(
+                f,
+                "   recall ≥ {} estimated",
+                crate::optimizer::budget::fraction(r)
+            )?,
             (None, _) => write!(f, "   recall best-effort")?,
         }
         if self.shares > 1
@@ -151,7 +144,7 @@ impl UserDefinedLogicalNodeCore for SemFilterNode {
             write!(
                 f,
                 " (its share of the statement's {} across {} filters)",
-                fraction(statement),
+                crate::optimizer::budget::fraction(statement),
                 self.shares
             )?;
         }
@@ -180,18 +173,5 @@ impl UserDefinedLogicalNodeCore for SemFilterNode {
             statement_confidence: self.statement_confidence,
             shares: self.shares,
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::fraction;
-
-    #[test]
-    fn a_share_keeps_the_digits_it_needs() {
-        assert_eq!(fraction(0.9), "0.90");
-        assert_eq!(fraction(0.95), "0.95");
-        assert_eq!(fraction(1.0 - 0.01 / 3.0), "0.9967");
-        assert_eq!(fraction(0.975), "0.975");
     }
 }
