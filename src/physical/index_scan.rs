@@ -258,8 +258,10 @@ impl DisplayAs for IndexScanExec {
         match &self.calibration {
             Some(calibration) => write!(
                 f,
-                "floor=calibrated(recall≥{:.2}, sample≤{}) top-{} chunks",
-                calibration.target_recall, calibration.sample_size, self.params.chunks_per_doc,
+                "floor=calibrated(recall≥{}, sample≤{}) top-{} chunks",
+                crate::optimizer::budget::fraction(calibration.target_recall),
+                calibration.sample_size,
+                self.params.chunks_per_doc,
             ),
             None => write!(
                 f,

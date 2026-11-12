@@ -234,7 +234,27 @@ pub(crate) async fn run_sql(ctx: &SessionContext, text: &str, record: bool) -> R
     // created yet; bind it before the planner tries to resolve it.
     sql::cluster::bind_meaning_labels(&mut statement);
     let mut plan = ctx.state().statement_to_plan(statement).await?;
+    reject_handwritten_recall(&plan)?;
     match (clauses.recall, clauses.confidence) {
+        // A view's plan runs inside whatever statement reads it, and the
+        // recall promise is that statement's to make (optimizer::budget): a
+        // target stored in the view would leak into statements that never
+        // asked for one.
+        (Some(_), _)
+            if matches!(
+                plan,
+                datafusion::logical_expr::LogicalPlan::Ddl(
+                    datafusion::logical_expr::DdlStatement::CreateView(_)
+                )
+            ) =>
+        {
+            return Err(datafusion::error::DataFusionError::Plan(
+                "WITH RECALL is a promise about one statement's results, so a view \
+                 cannot carry it: put WITH RECALL on the query that reads the view"
+                    .to_owned(),
+            )
+            .into());
+        }
         (Some(recall), confidence) => {
             plan = optimizer::rewrite::apply_recall(plan, recall, confidence)?;
         }
@@ -527,6 +547,13 @@ impl SemcastContextBuilder {
         let scorer: Option<Arc<dyn ModelProvider>> = self
             .scorer
             .map(|scorer| Arc::new(crate::model::Scheduler::new(scorer, self.max_in_flight)) as _);
+        // The physical planner uses a scorer only when it is not the session
+        // model, which would save nothing; the budget rule must agree.
+        runtime = runtime.with_scorer(
+            scorer
+                .as_ref()
+                .is_some_and(|scorer| scorer.id() != model.id()),
+        );
         if let Some(store) = self.chunk_store {
             runtime = runtime.with_chunk_store(store);
         }
@@ -560,6 +587,10 @@ impl SemcastContextBuilder {
             .with_optimizer_rule(Arc::new(RelevanceRewriteRule))
             .with_optimizer_rule(Arc::new(ClusterRewriteRule))
             .with_optimizer_rule(Arc::new(DistinctRewriteRule))
+            // Last: it reads where every MEANS filter ended up.
+            .with_optimizer_rule(Arc::new(crate::optimizer::budget::RecallBudgetRule::new(
+                Arc::clone(&runtime),
+            )))
             .with_query_planner(Arc::new(
                 SemcastQueryPlanner::new(model, self.cache).with_scorer(scorer),
             ))
@@ -579,4 +610,38 @@ impl SemcastContextBuilder {
         // registered above carries over via `new_from_existing`).
         ctx.enable_url_table()
     }
+}
+
+/// A recall target is the statement's (`WITH RECALL`, split across its lossy
+/// filters by `optimizer::budget`), so a `means()` written with a third or
+/// fourth argument is refused here: in a view it would leak into statements
+/// that read it, and beside other filters it would claim to be the
+/// statement's target. `apply_recall` adds those arguments after this check.
+fn reject_handwritten_recall(plan: &datafusion::logical_expr::LogicalPlan) -> Result<()> {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    let mut found = false;
+    plan.apply_with_subqueries(|node| {
+        node.apply_expressions(|expr| {
+            expr.apply(|e| {
+                if let datafusion::logical_expr::Expr::ScalarFunction(call) = e
+                    && call.func.name() == sql::means_udf::MEANS_UDF_NAME
+                    && call.args.len() > 2
+                {
+                    found = true;
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+        })
+    })?;
+    if found {
+        return Err(datafusion::error::DataFusionError::Plan(
+            "a means() with a recall argument (written by hand, or stored in a \
+             view this statement reads) is refused: a recall target belongs to \
+             the whole statement, so end the statement WITH RECALL r instead"
+                .to_owned(),
+        )
+        .into());
+    }
+    Ok(())
 }

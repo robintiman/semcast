@@ -6,6 +6,7 @@
 //! derive the cheap-then-verify funnel ([`funnel`]), and keep lossy shortcuts
 //! honest under a recall target ([`calibrate`], scoring through [`proxy`]).
 
+pub mod budget;
 pub mod calibrate;
 pub mod classify;
 pub mod cluster;

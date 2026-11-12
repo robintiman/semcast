@@ -37,6 +37,10 @@ pub struct SemcastRuntime {
     /// Where definitions are saved so they survive a restart; `None` keeps
     /// them for the process only.
     catalog: Option<crate::catalog::Catalog>,
+    /// Whether a scorer pre-filters an unindexed `MEANS` under `WITH
+    /// RECALL`, which makes that filter lossy and gives it a share of the
+    /// statement's recall budget.
+    scorer: bool,
 }
 
 impl SemcastRuntime {
@@ -49,6 +53,7 @@ impl SemcastRuntime {
             indexes: Mutex::new(HashMap::new()),
             types: Arc::new(TypeRegistry::default()),
             catalog: None,
+            scorer: false,
         }
     }
 
@@ -87,6 +92,18 @@ impl SemcastRuntime {
     }
 
     /// Share the session's verdict store.
+    /// Record that a scorer (a model other than the session's) pre-filters
+    /// unindexed `MEANS` under `WITH RECALL`.
+    pub fn with_scorer(mut self, scorer: bool) -> Self {
+        self.scorer = scorer;
+        self
+    }
+
+    /// Whether `WITH RECALL` on an unindexed `MEANS` goes through a scorer.
+    pub fn has_scorer(&self) -> bool {
+        self.scorer
+    }
+
     pub fn with_cache(mut self, cache: Arc<dyn crate::cache::SemanticCache>) -> Self {
         self.cache = cache;
         self
