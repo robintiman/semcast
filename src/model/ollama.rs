@@ -5,7 +5,7 @@
 //!
 //! Every chat request sets the context length (`num_ctx`) and turns
 //! truncation off. Left to Ollama, the context falls back to a default that
-//! depends on the version and machine (16k tokens on 0.40 here) and a longer
+//! depends on the version and machine (16k tokens on 0.40, for example) and a longer
 //! prompt is cut to fit, keeping its end, so a long document's verdict would
 //! be about its last pages with nothing said. With `truncate: false` Ollama
 //! refuses such a prompt instead (an HTTP 400 that counts with its own
@@ -37,8 +37,13 @@ pub const DEFAULT_NUM_CTX: usize = 32_768;
 
 /// Whether generation stopped because the context filled, not because the
 /// answer reached its own cap: a `"length"` stop short of `max_tokens`.
-fn ran_out_of_context(done_reason: Option<&str>, eval_count: usize, max_tokens: usize) -> bool {
-    done_reason == Some("length") && eval_count < max_tokens
+/// A server that reports no count is given the benefit of the doubt.
+fn ran_out_of_context(
+    done_reason: Option<&str>,
+    eval_count: Option<usize>,
+    max_tokens: usize,
+) -> bool {
+    done_reason == Some("length") && eval_count.is_some_and(|count| count < max_tokens)
 }
 
 #[derive(Debug, Clone)]
@@ -136,7 +141,7 @@ impl OllamaProvider {
             target: "semcast::model",
             model = %self.model,
             input_tokens = chat.prompt_eval_count,
-            output_tokens = chat.eval_count,
+            output_tokens = chat.eval_count.unwrap_or_default(),
             response = %chat.message.content,
             "llm response"
         );
@@ -148,7 +153,8 @@ impl OllamaProvider {
             return Err(SemcastError::Model(format!(
                 "the answer ran out of context after {} tokens (--ollama-num-ctx {}): \
                  a cut-off answer is not used",
-                chat.eval_count, self.num_ctx
+                chat.eval_count.unwrap_or_default(),
+                self.num_ctx
             )));
         }
         let yes_probability = chat
@@ -166,7 +172,7 @@ impl OllamaProvider {
         Ok(Completion {
             text: chat.message.content,
             input_tokens: chat.prompt_eval_count,
-            output_tokens: chat.eval_count,
+            output_tokens: chat.eval_count.unwrap_or_default(),
             yes_probability,
             merged: false,
         })
@@ -260,7 +266,7 @@ struct ChatResponse {
     #[serde(default)]
     prompt_eval_count: usize,
     #[serde(default)]
-    eval_count: usize,
+    eval_count: Option<usize>,
     /// Why generation stopped: `"length"` when it hit a limit.
     #[serde(default)]
     done_reason: Option<String>,
@@ -316,11 +322,13 @@ mod tests {
 
     #[test]
     fn an_answer_cut_by_the_context_is_not_used() {
-        assert!(ran_out_of_context(Some("length"), 3, 128));
+        assert!(ran_out_of_context(Some("length"), Some(3), 128));
         // Reaching its own cap is an answer, not a cut.
-        assert!(!ran_out_of_context(Some("length"), 8, 8));
-        assert!(!ran_out_of_context(Some("stop"), 3, 128));
-        assert!(!ran_out_of_context(None, 3, 128));
+        assert!(!ran_out_of_context(Some("length"), Some(8), 8));
+        assert!(!ran_out_of_context(Some("stop"), Some(3), 128));
+        assert!(!ran_out_of_context(None, Some(3), 128));
+        // No count: no evidence of a cut.
+        assert!(!ran_out_of_context(Some("length"), None, 8));
         let chat: ChatResponse = serde_json::from_str(
             r#"{"message":{"content":"ye"},"done_reason":"length","eval_count":1}"#,
         )
@@ -349,7 +357,7 @@ mod tests {
         let parsed: ChatResponse = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.message.content, "yes");
         assert_eq!(parsed.prompt_eval_count, 214);
-        assert_eq!(parsed.eval_count, 1);
+        assert_eq!(parsed.eval_count, Some(1));
     }
 
     #[test]
