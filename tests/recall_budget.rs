@@ -196,3 +196,64 @@ async fn the_physical_plan_prints_the_share_unrounded() {
     assert!(plan.contains("recall≥0.9995"), "{plan}");
     assert!(!plan.contains("recall≥1.00"), "{plan}");
 }
+
+#[tokio::test]
+async fn a_view_cannot_carry_a_recall_target() {
+    let ctx = context(true).await;
+    let error = semcast::sql(
+        &ctx,
+        "CREATE VIEW orders AS SELECT * FROM tickets \
+         WHERE body MEANS 'mentions an order' WITH RECALL 0.8",
+    )
+    .await
+    .err()
+    .expect("refused");
+    assert!(
+        error.to_string().contains("a view cannot carry it"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn a_view_read_without_a_target_stays_best_effort() {
+    let ctx = context(true).await;
+    semcast::sql(
+        &ctx,
+        "CREATE VIEW orders AS SELECT * FROM tickets WHERE body MEANS 'mentions an order'",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+    let plan = explain(
+        &ctx,
+        "SELECT id FROM orders WHERE subject MEANS 'about money'",
+    )
+    .await;
+    assert!(!plan.contains("its share"), "{plan}");
+    assert!(
+        !plan.contains("ScoreScanExec"),
+        "no target, no scorer: {plan}"
+    );
+}
+
+#[tokio::test]
+async fn a_view_read_under_a_target_takes_its_share() {
+    let ctx = context(false).await;
+    semcast::sql(
+        &ctx,
+        "CREATE VIEW orders AS SELECT * FROM tickets WHERE body MEANS 'mentions an order'",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+    let plan = explain(
+        &ctx,
+        "SELECT id FROM orders WHERE body MEANS 'asks for a refund' WITH RECALL 0.9",
+    )
+    .await;
+    assert_eq!(plan.matches("across 2 filters").count(), 2, "{plan}");
+}

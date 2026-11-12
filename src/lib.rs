@@ -235,6 +235,25 @@ pub(crate) async fn run_sql(ctx: &SessionContext, text: &str, record: bool) -> R
     sql::cluster::bind_meaning_labels(&mut statement);
     let mut plan = ctx.state().statement_to_plan(statement).await?;
     match (clauses.recall, clauses.confidence) {
+        // A view's plan runs inside whatever statement reads it, and the
+        // recall promise is that statement's to make (optimizer::budget): a
+        // target stored in the view would leak into statements that never
+        // asked for one.
+        (Some(_), _)
+            if matches!(
+                plan,
+                datafusion::logical_expr::LogicalPlan::Ddl(
+                    datafusion::logical_expr::DdlStatement::CreateView(_)
+                )
+            ) =>
+        {
+            return Err(datafusion::error::DataFusionError::Plan(
+                "WITH RECALL is a promise about one statement's results, so a view \
+                 cannot carry it: put WITH RECALL on the query that reads the view"
+                    .to_owned(),
+            )
+            .into());
+        }
         (Some(recall), confidence) => {
             plan = optimizer::rewrite::apply_recall(plan, recall, confidence)?;
         }

@@ -319,7 +319,8 @@ The target is the statement's. With several `MEANS` filters that can lose
 matches (an index or a scorer under each), each gets an equal share of the
 allowed loss: `WITH RECALL 0.9` over two such filters asks 0.95 of each, and
 `WITH CONFIDENCE` is split the same way. A filter verified on full text loses
-nothing and takes no share. `EXPLAIN` shows each filter's share.
+nothing and takes no share. `EXPLAIN` shows each filter's share. A view
+can't carry `WITH RECALL`; put it on the query that reads the view.
 
 ```sql
 SELECT meeting_id FROM meetings
