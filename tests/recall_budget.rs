@@ -256,3 +256,19 @@ async fn a_view_read_under_a_target_takes_its_share() {
     .await;
     assert_eq!(plan.matches("across 2 filters").count(), 2, "{plan}");
 }
+
+#[tokio::test]
+async fn a_handwritten_recall_argument_is_refused() {
+    let ctx = context(true).await;
+    for sql in [
+        "CREATE VIEW orders AS SELECT * FROM tickets WHERE means(body, 'mentions an order', 0.8)",
+        "SELECT id FROM tickets WHERE means(body, 'mentions an order', 0.8) \
+         AND subject MEANS 'about money'",
+    ] {
+        let error = semcast::sql(&ctx, sql).await.expect_err("refused");
+        assert!(
+            error.to_string().contains("belongs to the whole statement"),
+            "{error}"
+        );
+    }
+}

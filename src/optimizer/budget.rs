@@ -26,6 +26,12 @@
 //! one `WITH RECALL` never reached: a semantic column's `MEANS` is expanded
 //! after the target is attached, and an index prunes it at a best-effort
 //! floor unless the share gives it a calibrated one.
+//!
+//! Every target in a plan must be the statement's own: `semcast::sql`
+//! refuses `WITH RECALL` on a view and a `means()` written with a recall
+//! argument. Embedding code can still store a plan that carries a target
+//! (`DataFrame::into_view` of a `WITH RECALL` query); a statement reading it
+//! inherits that target as its own.
 
 use std::sync::Arc;
 

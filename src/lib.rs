@@ -234,6 +234,7 @@ pub(crate) async fn run_sql(ctx: &SessionContext, text: &str, record: bool) -> R
     // created yet; bind it before the planner tries to resolve it.
     sql::cluster::bind_meaning_labels(&mut statement);
     let mut plan = ctx.state().statement_to_plan(statement).await?;
+    reject_handwritten_recall(&plan)?;
     match (clauses.recall, clauses.confidence) {
         // A view's plan runs inside whatever statement reads it, and the
         // recall promise is that statement's to make (optimizer::budget): a
@@ -609,4 +610,37 @@ impl SemcastContextBuilder {
         // registered above carries over via `new_from_existing`).
         ctx.enable_url_table()
     }
+}
+
+/// A recall target is the statement's (`WITH RECALL`, split across its lossy
+/// filters by `optimizer::budget`), so a `means()` written with a third or
+/// fourth argument is refused here: in a view it would leak into statements
+/// that read it, and beside other filters it would claim to be the
+/// statement's target. `apply_recall` adds those arguments after this check.
+fn reject_handwritten_recall(plan: &datafusion::logical_expr::LogicalPlan) -> Result<()> {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    let mut found = false;
+    plan.apply_with_subqueries(|node| {
+        node.apply_expressions(|expr| {
+            expr.apply(|e| {
+                if let datafusion::logical_expr::Expr::ScalarFunction(call) = e
+                    && call.func.name() == sql::means_udf::MEANS_UDF_NAME
+                    && call.args.len() > 2
+                {
+                    found = true;
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+        })
+    })?;
+    if found {
+        return Err(datafusion::error::DataFusionError::Plan(
+            "a recall target belongs to the whole statement: write \
+             means(text, 'condition') and end the statement WITH RECALL r"
+                .to_owned(),
+        )
+        .into());
+    }
+    Ok(())
 }
