@@ -28,6 +28,8 @@ pub enum SemanticDdl {
     /// `ALTER TABLE table ADD SEMANTIC COLUMN name AS (column MEANS 'condition')`
     AddColumn {
         table: String,
+        /// `ALTER TABLE IF EXISTS`: a missing table is no error.
+        table_if_exists: bool,
         name: String,
         /// The text column the question reads.
         text: String,
@@ -36,6 +38,7 @@ pub enum SemanticDdl {
     /// `ALTER TABLE table DROP SEMANTIC COLUMN [IF EXISTS] name`
     DropColumn {
         table: String,
+        table_if_exists: bool,
         name: String,
         if_exists: bool,
     },
@@ -96,6 +99,10 @@ pub fn parse_semantic_drop(parser: &mut Parser) -> crate::Result<SemanticDdl> {
 /// `ALTER TABLE` is already consumed; the dispatcher checked that `ADD
 /// SEMANTIC` or `DROP SEMANTIC` follows the table name.
 pub fn parse_alter_semantic(parser: &mut Parser) -> crate::Result<SemanticDdl> {
+    let table_if_exists = parser.parse_keywords(&[
+        datafusion::sql::sqlparser::keywords::Keyword::IF,
+        datafusion::sql::sqlparser::keywords::Keyword::EXISTS,
+    ]);
     let table = parse_table_name(parser).map_err(column_error)?;
     let add = match parser.next_token().token {
         Token::Word(word) if word.value.eq_ignore_ascii_case("add") => true,
@@ -129,6 +136,7 @@ pub fn parse_alter_semantic(parser: &mut Parser) -> crate::Result<SemanticDdl> {
             .map_err(|e| column_error(e.to_string()))?;
         SemanticDdl::AddColumn {
             table,
+            table_if_exists,
             name: normalized(name),
             text: normalized(text),
             condition,
@@ -143,6 +151,7 @@ pub fn parse_alter_semantic(parser: &mut Parser) -> crate::Result<SemanticDdl> {
             .map_err(|e| column_error(e.to_string()))?;
         SemanticDdl::DropColumn {
             table,
+            table_if_exists,
             name: normalized(name),
             if_exists,
         }

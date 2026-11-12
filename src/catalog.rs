@@ -112,6 +112,9 @@ pub(crate) enum Change {
     /// relation of that bare name remains — the index map is keyed by bare
     /// name, so such a relation still owns them.
     ForgetOrphanIndexes { table: String },
+    /// Delete the saved semantic columns on bare table name `table` — the
+    /// table was replaced by one that has none.
+    ForgetSemanticColumns { table: String },
 }
 
 /// The catalog half of a store file opened with
@@ -231,6 +234,16 @@ fn apply_changes(connection: &mut Connection, changes: &[Change]) -> Result<()> 
                     .execute(
                         "DELETE FROM catalog WHERE kind = ?1 AND name = ?2",
                         params![kind.as_str(), name],
+                    )
+                    .map_err(store_err)?;
+            }
+            Change::ForgetSemanticColumns { table } => {
+                // substr, not LIKE: a name may hold `%` or `_`.
+                transaction
+                    .execute(
+                        "DELETE FROM catalog WHERE kind = 'semantic_column' \
+                         AND substr(name, 1, length(?1)) = ?1",
+                        params![format!("{table}(")],
                     )
                     .map_err(store_err)?;
             }
@@ -430,12 +443,19 @@ pub(crate) async fn execute_ddl(
             let name = resolve(ctx, &name);
             let failure =
                 format!("{name} is defined for this session but will be gone after a restart");
+            let bare = TableReference::from(name.as_str()).table().to_owned();
             let entry = Entry {
                 kind: EntryKind::Relation,
                 name,
                 definition,
             };
-            (vec![Change::Put(entry)], failure)
+            // A replaced table comes back without the semantic columns the
+            // old one had, in the session and so in the catalog.
+            let mut changes = vec![Change::Put(entry)];
+            if existed {
+                changes.push(Change::ForgetSemanticColumns { table: bare });
+            }
+            (changes, failure)
         }
         Effect::UnsavedRelation { name, replaces } if !existed || replaces => {
             // Unlocked while it ran: another statement may have redefined

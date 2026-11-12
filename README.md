@@ -274,7 +274,10 @@ SELECT id, angry FROM tickets;
 SELECT count(*) FROM tickets WHERE angry;
 ```
 
-Saved with `--store` on a saved table, and dropped with its table.
+Saved with `--store` on a saved table, and dropped with its table. Writes go
+to the table underneath: `INSERT` names its columns (`INSERT INTO tickets (id,
+body) ...`), since a semantic column has no value to give; `UPDATE` can't set
+one; and `DELETE`/`UPDATE` can't filter on one, as they can't on `MEANS`.
 
 #### `WITH RECALL`
 

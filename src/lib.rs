@@ -164,10 +164,15 @@ pub(crate) async fn run_sql(ctx: &SessionContext, text: &str, record: bool) -> R
                 }
                 sql::ddl::SemanticDdl::AddColumn {
                     table,
+                    table_if_exists,
                     name,
                     text: column,
                     condition,
                 } => {
+                    if table_if_exists && !ctx.table_exist(table.as_str())? {
+                        let no_rows = LogicalPlanBuilder::empty(false).build()?;
+                        return Ok(DataFrame::new(ctx.state(), no_rows));
+                    }
                     let column = semantic_column::SemanticColumn {
                         name,
                         text: column,
@@ -179,9 +184,14 @@ pub(crate) async fn run_sql(ctx: &SessionContext, text: &str, record: bool) -> R
                 }
                 sql::ddl::SemanticDdl::DropColumn {
                     table,
+                    table_if_exists,
                     name,
                     if_exists,
                 } => {
+                    if table_if_exists && !ctx.table_exist(table.as_str())? {
+                        let no_rows = LogicalPlanBuilder::empty(false).build()?;
+                        return Ok(DataFrame::new(ctx.state(), no_rows));
+                    }
                     semantic_column::drop_column(ctx, &table, &name, if_exists, record).await?;
                     let no_rows = LogicalPlanBuilder::empty(false).build()?;
                     Ok(DataFrame::new(ctx.state(), no_rows))
@@ -262,7 +272,29 @@ fn reject_semantic_dml(plan: &datafusion::logical_expr::LogicalPlan) -> Result<(
             return Ok(TreeNodeRecursion::Continue);
         }
         let op = dml.op.to_string();
+        // A filter on a semantic column is a MEANS too, under another name;
+        // the planner hasn't expanded it yet, so look for its name.
+        let semantic: Vec<String> = datafusion::datasource::source_as_provider(&dml.target)
+            .ok()
+            .and_then(|provider| {
+                provider
+                    .downcast_ref::<semantic_column::SemanticColumnsTable>()
+                    .map(|table| table.columns().iter().map(|c| c.name.clone()).collect())
+            })
+            .unwrap_or_default();
         dml.input.apply_with_subqueries(|node| {
+            if let LogicalPlan::Filter(filter) = node
+                && filter.predicate.exists(|e| {
+                    Ok(matches!(e, Expr::Column(column) if semantic.contains(&column.name)))
+                })?
+            {
+                refusal = Some(format!(
+                    "{op} cannot filter on a semantic column: it would affect every row \
+                     without asking the model. Keep the other rows instead: CREATE TABLE \
+                     <new> AS SELECT * FROM <table> WHERE NOT <column>"
+                ));
+                return Ok(TreeNodeRecursion::Stop);
+            }
             for expr in node.expressions() {
                 if optimizer::rewrite::contains_means(&expr)? {
                     refusal = Some(format!(

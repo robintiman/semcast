@@ -281,3 +281,143 @@ async fn filtering_on_a_semantic_column_plans_a_means_filter() {
     );
     assert!(!plan.contains("SemClassify"), "{plan}");
 }
+
+#[tokio::test]
+async fn writes_reach_the_table_underneath() {
+    let model = Arc::new(MockModel::answering_yes_to(["furious"]));
+    let ctx = tickets(Arc::clone(&model)).await;
+    run(&ctx, ADD).await;
+    run(
+        &ctx,
+        "INSERT INTO tickets (id, body) VALUES (4, 'furious again')",
+    )
+    .await;
+    run(&ctx, "DELETE FROM tickets WHERE id = 2").await;
+    let calls = model.completion_calls();
+    run(&ctx, "UPDATE tickets SET body = 'calm now' WHERE id = 1").await;
+    assert_eq!(model.completion_calls(), calls, "writing asks nothing");
+    let batches = run(&ctx, "SELECT id, angry FROM tickets ORDER BY id").await;
+    assert_eq!(ids(&batches), [1, 3, 4]);
+    assert_eq!(flags(&batches, 1), [Some(false), None, Some(true)]);
+
+    for (sql, expected) in [
+        (
+            "DELETE FROM tickets WHERE angry",
+            "cannot filter on a semantic column",
+        ),
+        (
+            "UPDATE tickets SET body = 'x' WHERE NOT angry",
+            "cannot filter on a semantic column",
+        ),
+        (
+            "UPDATE tickets SET angry = true WHERE id = 1",
+            "computed, not stored",
+        ),
+    ] {
+        let message = error(&ctx, sql).await;
+        assert!(message.contains(expected), "{sql}: {message}");
+    }
+    assert_eq!(ids(&run(&ctx, "SELECT id FROM tickets").await), [1, 3, 4]);
+}
+
+#[tokio::test]
+async fn an_aliased_filter_keeps_the_means_funnel() {
+    let ctx = tickets(Arc::new(MockModel::answering_yes_to(["furious"]))).await;
+    run(&ctx, ADD).await;
+    let sql = "SELECT t.id FROM tickets t WHERE t.angry";
+    let plan = semcast::sql(&ctx, sql)
+        .await
+        .unwrap()
+        .into_optimized_plan()
+        .unwrap()
+        .display_indent()
+        .to_string();
+    assert!(plan.contains("SemFilter"), "{plan}");
+    assert!(!plan.contains("SemClassify"), "{plan}");
+    assert_eq!(ids(&run(&ctx, sql).await), [1]);
+}
+
+#[tokio::test]
+async fn a_correlated_subquery_can_read_a_semantic_column() {
+    let ctx = tickets(Arc::new(MockModel::answering_yes_to(["furious"]))).await;
+    run(&ctx, ADD).await;
+    let batches = run(
+        &ctx,
+        "SELECT id FROM tickets WHERE EXISTS \
+         (SELECT 1 FROM (VALUES (true)) v(x) WHERE v.x = tickets.angry)",
+    )
+    .await;
+    assert_eq!(ids(&batches), [1]);
+}
+
+#[tokio::test]
+async fn alter_table_if_exists() {
+    let ctx = tickets(Arc::new(MockModel::answering_yes_to(["furious"]))).await;
+    run(
+        &ctx,
+        "ALTER TABLE IF EXISTS nowhere ADD SEMANTIC COLUMN x AS (body MEANS 'x')",
+    )
+    .await;
+    run(
+        &ctx,
+        "ALTER TABLE IF EXISTS tickets ADD SEMANTIC COLUMN angry AS (body MEANS 'the customer is angry')",
+    )
+    .await;
+    assert_eq!(
+        ids(&run(&ctx, "SELECT id FROM tickets WHERE angry").await),
+        [1]
+    );
+    run(&ctx, "ALTER TABLE IF EXISTS nowhere DROP SEMANTIC COLUMN x").await;
+}
+
+/// The catalog keeps only what the session has: a replaced table comes back
+/// without its old columns, and a column named through a qualified table
+/// name is the same entry as through the bare one.
+#[tokio::test]
+async fn the_catalog_forgets_columns_the_session_no_longer_has() {
+    let dir = tempfile::tempdir().unwrap();
+    let csv = dir.path().join("tickets.csv");
+    std::fs::write(&csv, "id,body\n1,I am furious\n2,all good\n").unwrap();
+    let store = dir.path().join("store.db");
+    let session = || {
+        let store = store.clone();
+        async move {
+            let ctx =
+                SemcastContextBuilder::new(Arc::new(MockModel::answering_yes_to(["furious"])))
+                    .with_catalog(semcast::catalog::Catalog::open(&store).unwrap())
+                    .build();
+            let restored = semcast::restore_catalog(&ctx).await.unwrap();
+            assert!(restored.failed.is_empty(), "{:?}", restored.failed);
+            ctx
+        }
+    };
+    let create = |replace: bool| {
+        format!(
+            "CREATE {}EXTERNAL TABLE tickets STORED AS CSV LOCATION '{}' \
+             OPTIONS ('format.has_header' 'true')",
+            if replace { "OR REPLACE " } else { "" },
+            csv.display()
+        )
+    };
+
+    let ctx = session().await;
+    run(&ctx, &create(false)).await;
+    run(&ctx, ADD).await;
+    run(&ctx, &create(true)).await;
+    let ctx = session().await;
+    let message = error(&ctx, "SELECT angry FROM tickets").await;
+    assert!(message.contains("angry"), "replaced away: {message}");
+
+    run(
+        &ctx,
+        "ALTER TABLE public.tickets ADD SEMANTIC COLUMN angry AS (body MEANS 'x')",
+    )
+    .await;
+    run(&ctx, "ALTER TABLE tickets DROP SEMANTIC COLUMN angry").await;
+    let ctx = session().await;
+    let message = error(&ctx, "SELECT angry FROM tickets").await;
+    assert!(
+        message.contains("angry"),
+        "dropped by its bare name: {message}"
+    );
+}

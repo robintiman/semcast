@@ -97,8 +97,12 @@ pub fn parse_semcast_statement(query: &str) -> crate::Result<SemcastStatement> {
 /// SEMANTIC`. Lookahead only, so any other `ALTER TABLE` stays SQL.
 fn alters_a_semantic_column(parser: &datafusion::sql::sqlparser::parser::Parser) -> bool {
     use datafusion::sql::sqlparser::tokenizer::Token;
-    // Tokens 0 and 1 are ALTER TABLE; the name starts at 2.
+    // Tokens 0 and 1 are ALTER TABLE; the name starts at 2, or at 4 after
+    // IF EXISTS.
     let mut at = 2;
+    if peek_nth_is_word(parser, 2, "IF") && peek_nth_is_word(parser, 3, "EXISTS") {
+        at = 4;
+    }
     loop {
         if !matches!(parser.peek_nth_token_ref(at).token, Token::Word(_)) {
             return false;

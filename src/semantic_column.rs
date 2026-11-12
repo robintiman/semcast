@@ -43,9 +43,17 @@ pub struct SemanticColumn {
 /// A table plus its semantic columns. Its schema is the table's, then one
 /// nullable boolean per semantic column; scanning it directly is refused,
 /// since only [`SemanticColumnsRule`] knows how to compute the columns.
+///
+/// The columns change in place, so a table keeps one registration: adding or
+/// dropping a column never leaves a moment with no table under the name.
 #[derive(Debug)]
 pub struct SemanticColumnsTable {
     inner: Arc<dyn TableProvider>,
+    state: std::sync::RwLock<Columns>,
+}
+
+#[derive(Debug, Clone)]
+struct Columns {
     columns: Vec<SemanticColumn>,
     schema: SchemaRef,
 }
@@ -54,6 +62,40 @@ impl SemanticColumnsTable {
     /// `inner` with `columns` added. A name already in the table, or a text
     /// column that isn't one, is a plan error.
     pub fn new(inner: Arc<dyn TableProvider>, columns: Vec<SemanticColumn>) -> Result<Self> {
+        let state = Columns::new(&inner, columns)?;
+        Ok(Self {
+            inner,
+            state: std::sync::RwLock::new(state),
+        })
+    }
+
+    /// The table without its semantic columns.
+    pub fn inner(&self) -> &Arc<dyn TableProvider> {
+        &self.inner
+    }
+
+    pub fn columns(&self) -> Vec<SemanticColumn> {
+        self.snapshot().columns
+    }
+
+    fn snapshot(&self) -> Columns {
+        self.state
+            .read()
+            .expect("semantic columns lock poisoned")
+            .clone()
+    }
+
+    /// Make `columns` the table's semantic columns, validated as in
+    /// [`Self::new`].
+    fn set_columns(&self, columns: Vec<SemanticColumn>) -> Result<()> {
+        let state = Columns::new(&self.inner, columns)?;
+        *self.state.write().expect("semantic columns lock poisoned") = state;
+        Ok(())
+    }
+}
+
+impl Columns {
+    fn new(inner: &Arc<dyn TableProvider>, columns: Vec<SemanticColumn>) -> Result<Self> {
         let base = inner.schema();
         let mut fields: Vec<Arc<Field>> = base.fields().iter().cloned().collect();
         for column in &columns {
@@ -78,27 +120,14 @@ impl SemanticColumnsTable {
             fields.push(Arc::new(Field::new(&column.name, DataType::Boolean, true)));
         }
         let schema = Arc::new(Schema::new_with_metadata(fields, base.metadata().clone()));
-        Ok(Self {
-            inner,
-            columns,
-            schema,
-        })
-    }
-
-    /// The table without its semantic columns.
-    pub fn inner(&self) -> &Arc<dyn TableProvider> {
-        &self.inner
-    }
-
-    pub fn columns(&self) -> &[SemanticColumn] {
-        &self.columns
+        Ok(Self { columns, schema })
     }
 }
 
 #[async_trait]
 impl TableProvider for SemanticColumnsTable {
     fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
+        self.snapshot().schema
     }
 
     fn table_type(&self) -> TableType {
@@ -117,6 +146,91 @@ impl TableProvider for SemanticColumnsTable {
              them; this query bypassed it"
         )
     }
+    fn get_table_definition(&self) -> Option<&str> {
+        self.inner.get_table_definition()
+    }
+
+    fn get_column_default(&self, column: &str) -> Option<&Expr> {
+        self.inner.get_column_default(column)
+    }
+
+    /// Rows go to the table underneath; a semantic column isn't stored, so a
+    /// value given for one is dropped (it is computed when read).
+    async fn insert_into(
+        &self,
+        state: &dyn Session,
+        input: Arc<dyn ExecutionPlan>,
+        insert_op: datafusion::logical_expr::dml::InsertOp,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        use datafusion::physical_expr::expressions::col;
+        use datafusion::physical_plan::projection::{ProjectionExec, ProjectionExpr};
+        let base = self.inner.schema();
+        let input_schema = input.schema();
+        let exprs = base
+            .fields()
+            .iter()
+            .map(|field| {
+                Ok(ProjectionExpr::new(
+                    col(field.name(), &input_schema)?,
+                    field.name().clone(),
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let stored = Arc::new(ProjectionExec::try_new(exprs, input)?);
+        self.inner.insert_into(state, stored, insert_op).await
+    }
+
+    /// A filter on a semantic column never gets here: `semcast::sql`
+    /// refuses it (see `lib.rs::reject_semantic_dml`), as it refuses any
+    /// `MEANS` in a `DELETE`.
+    async fn delete_from(
+        &self,
+        state: &dyn Session,
+        filters: Vec<Expr>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.inner.delete_from(state, filters).await
+    }
+
+    async fn update(
+        &self,
+        state: &dyn Session,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        // DataFusion assigns every column, an unchanged one its current value.
+        // Those are dropped for a semantic column; any other value is refused.
+        let semantic: Vec<String> = self.columns().into_iter().map(|c| c.name).collect();
+        let mut stored = Vec::with_capacity(assignments.len());
+        for (name, value) in assignments {
+            if !semantic.contains(&name) {
+                stored.push((name, value));
+                continue;
+            }
+            // Unchanged reads as the column itself, or as what the planner
+            // made of it: the `MEANS` the column stands for, or the column a
+            // classify node computes it into.
+            let value = match value {
+                Expr::Alias(alias) => *alias.expr,
+                other => other,
+            };
+            let unchanged = match &value {
+                Expr::Column(column) => {
+                    column.name == name
+                        || column.name.starts_with("__sem_class_")
+                        || column.name.starts_with("__sem_conf_")
+                }
+                other => crate::optimizer::rewrite::is_means_call(other),
+            };
+            if !unchanged {
+                return plan_err!("{name} is a semantic column: it is computed, not stored");
+            }
+        }
+        self.inner.update(state, stored, filters).await
+    }
+
+    async fn truncate(&self, state: &dyn Session) -> Result<Arc<dyn ExecutionPlan>> {
+        self.inner.truncate(state).await
+    }
 }
 
 /// Rewrites a scan of a [`SemanticColumnsTable`] into a projection over its
@@ -134,7 +248,8 @@ impl AnalyzerRule for SemanticColumnsRule {
     fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
         plan.transform_up_with_subqueries(|plan| {
             if let LogicalPlan::Filter(filter) = &plan
-                && is_expansion(&filter.input)
+                && expansion_under(&filter.input).is_some()
+                && !has_subquery(&filter.predicate)?
             {
                 let LogicalPlan::Filter(filter) = plan else {
                     unreachable!("matched above")
@@ -157,6 +272,30 @@ impl AnalyzerRule for SemanticColumnsRule {
         })
         .map(|transformed| transformed.data)
     }
+}
+
+/// The expansion a filter's input is, directly or under a table alias
+/// (`FROM tickets t`).
+fn expansion_under(plan: &LogicalPlan) -> Option<&Projection> {
+    let plan = match plan {
+        LogicalPlan::SubqueryAlias(alias) => alias.input.as_ref(),
+        other => other,
+    };
+    match plan {
+        LogicalPlan::Projection(projection) if is_expansion(plan) => Some(projection),
+        _ => None,
+    }
+}
+
+/// A predicate with a subquery is left where it is: its correlated columns
+/// live inside the subquery's plan, which the substitution doesn't reach.
+fn has_subquery(predicate: &Expr) -> Result<bool> {
+    predicate.exists(|expr| {
+        Ok(matches!(
+            expr,
+            Expr::Exists(_) | Expr::InSubquery(_) | Expr::ScalarSubquery(_)
+        ))
+    })
 }
 
 /// Whether `plan` is a projection [`expand`] built: every expression a
@@ -186,27 +325,31 @@ fn is_means_alias(expr: &Expr) -> bool {
 fn push_below_expansion(
     filter: datafusion::logical_expr::Filter,
 ) -> Result<Transformed<LogicalPlan>> {
-    let LogicalPlan::Projection(projection) = filter.input.as_ref() else {
-        unreachable!("checked by is_expansion");
+    let alias = match filter.input.as_ref() {
+        LogicalPlan::SubqueryAlias(alias) => Some(alias.alias.clone()),
+        _ => None,
     };
-    // Each output column of the projection, by name, and what it computes.
-    let definitions: Vec<(Column, Expr)> = projection
+    let projection = expansion_under(&filter.input).expect("checked by the caller");
+    // Each output column, by name, and what it computes over the scan. Under
+    // an alias the predicate names columns by the alias, so match by name:
+    // a single table's columns are unique by name.
+    let definitions: Vec<(String, Expr)> = projection
         .schema
-        .columns()
-        .into_iter()
+        .fields()
+        .iter()
         .zip(projection.expr.iter())
-        .map(|(column, expr)| {
+        .map(|(field, expr)| {
             let definition = match expr {
                 Expr::Alias(alias) => alias.expr.as_ref().clone(),
                 other => other.clone(),
             };
-            (column, definition)
+            (field.name().clone(), definition)
         })
         .collect();
     let predicate = filter.predicate.clone().transform_up(|expr| match &expr {
         Expr::Column(column) => Ok(definitions
             .iter()
-            .find(|(name, _)| name == column)
+            .find(|(name, _)| name == &column.name)
             .map(|(_, definition)| Transformed::yes(definition.clone()))
             .unwrap_or(Transformed::no(expr))),
         _ => Ok(Transformed::no(expr)),
@@ -215,9 +358,16 @@ fn push_below_expansion(
         predicate.data,
         Arc::clone(&projection.input),
     )?);
-    Ok(Transformed::yes(LogicalPlan::Projection(
-        Projection::try_new(projection.expr.clone(), Arc::new(below))?,
-    )))
+    let projected = LogicalPlan::Projection(Projection::try_new(
+        projection.expr.clone(),
+        Arc::new(below),
+    )?);
+    Ok(Transformed::yes(match alias {
+        Some(alias) => LogicalPlan::SubqueryAlias(
+            datafusion::logical_expr::SubqueryAlias::try_new(Arc::new(projected), alias)?,
+        ),
+        None => projected,
+    }))
 }
 
 /// The scan of `table`'s underlying table, then a projection giving back
@@ -235,19 +385,33 @@ fn expand(scan: TableScan, table: &SemanticColumnsTable) -> Result<LogicalPlan> 
         None,
     )?);
     let base = table.inner.schema();
+    let state = table.snapshot();
     let means = crate::sql::means_udf::means_udf();
     let wanted: Vec<usize> = match &scan.projection {
         Some(projection) => projection.clone(),
-        None => (0..table.schema.fields().len()).collect(),
+        None => (0..state.schema.fields().len()).collect(),
     };
+    // The scan was planned against the columns as they were then; an ALTER
+    // since may have changed them under the same index.
+    let planned = scan.projected_schema.fields();
+    let unchanged = planned.len() == wanted.len()
+        && wanted.iter().zip(planned.iter()).all(|(&i, field)| {
+            i < state.schema.fields().len() && state.schema.field(i).name() == field.name()
+        });
+    if !unchanged {
+        return plan_err!(
+            "the semantic columns of {} changed while this query was planned; run it again",
+            scan.table_name
+        );
+    }
     let exprs = wanted
         .into_iter()
         .map(|i| {
-            let field = table.schema.field(i);
+            let field = state.schema.field(i);
             if i < base.fields().len() {
                 return Expr::Column(Column::new(Some(qualifier.clone()), field.name()));
             }
-            let column = &table.columns[i - base.fields().len()];
+            let column = &state.columns[i - base.fields().len()];
             Expr::ScalarFunction(ScalarFunction::new_udf(
                 Arc::new(means.clone()),
                 vec![
@@ -296,19 +460,30 @@ pub async fn add_column(
         Some(catalog) => Some(catalog.lock().await),
         None => None,
     };
+    let _serial = ALTERS.lock().await;
     let provider = ctx.table_provider(table).await?;
-    let (inner, mut columns) = unwrap(provider);
     let name = column.name.clone();
-    columns.push(column);
-    let wrapped = SemanticColumnsTable::new(inner, columns)?;
-    ctx.deregister_table(table)?;
-    ctx.register_table(table, Arc::new(wrapped))?;
+    match provider.downcast_ref::<SemanticColumnsTable>() {
+        // Changed in place: the name never goes without a table.
+        Some(wrapped) => {
+            let mut columns = wrapped.columns();
+            columns.push(column);
+            wrapped.set_columns(columns)?;
+        }
+        // A table's first semantic column wraps it, once. DataFusion offers
+        // no swap, so for that moment the name is free.
+        None => {
+            let wrapped = SemanticColumnsTable::new(provider, vec![column])?;
+            ctx.deregister_table(table)?;
+            ctx.register_table(table, Arc::new(wrapped))?;
+        }
+    }
     if let Some(catalog) = catalog {
         let resolved = resolve(ctx, table);
         if catalog.has_relation(&resolved).await? {
             let entry = crate::catalog::Entry {
                 kind: crate::catalog::EntryKind::SemanticColumn,
-                name: crate::catalog::index_name(table, &name),
+                name: catalog_key(table, &name),
                 definition: text.to_owned(),
             };
             let failure = format!(
@@ -342,8 +517,18 @@ pub async fn drop_column(
         Some(catalog) => Some(catalog.lock().await),
         None => None,
     };
+    let _serial = ALTERS.lock().await;
     let provider = ctx.table_provider(table).await?;
-    let (inner, mut columns) = unwrap(provider);
+    let Some(wrapped) = provider.downcast_ref::<SemanticColumnsTable>() else {
+        if if_exists {
+            return Ok(());
+        }
+        return Err(datafusion::error::DataFusionError::Plan(format!(
+            "{table} has no semantic column named {name}"
+        ))
+        .into());
+    };
+    let mut columns = wrapped.columns();
     let before = columns.len();
     columns.retain(|column| column.name != name);
     if columns.len() == before {
@@ -355,17 +540,13 @@ pub async fn drop_column(
         ))
         .into());
     }
-    let provider: Arc<dyn TableProvider> = if columns.is_empty() {
-        inner
-    } else {
-        Arc::new(SemanticColumnsTable::new(inner, columns)?)
-    };
-    ctx.deregister_table(table)?;
-    ctx.register_table(table, provider)?;
+    // In place, even to none: the wrapper stays, and with no columns reads
+    // exactly like the table it wraps.
+    wrapped.set_columns(columns)?;
     if let Some(catalog) = catalog {
         let forget = crate::catalog::Change::Forget {
             kind: crate::catalog::EntryKind::SemanticColumn,
-            name: crate::catalog::index_name(table, name),
+            name: catalog_key(table, name),
         };
         let failure = format!(
             "the semantic column {table}.{name} is dropped for this session but will come \
@@ -386,7 +567,7 @@ pub async fn refresh_column(
     let provider = ctx.table_provider(table).await?;
     let known = provider
         .downcast_ref::<SemanticColumnsTable>()
-        .is_some_and(|wrapped| wrapped.columns.iter().any(|column| column.name == name));
+        .is_some_and(|wrapped| wrapped.columns().iter().any(|column| column.name == name));
     if !known {
         return Err(datafusion::error::DataFusionError::Plan(format!(
             "{table} has no semantic column named {name}"
@@ -404,12 +585,19 @@ pub async fn refresh_column(
     Ok(batches.iter().map(|batch| batch.num_rows()).sum())
 }
 
-/// The table under any semantic columns, and those columns.
-fn unwrap(provider: Arc<dyn TableProvider>) -> (Arc<dyn TableProvider>, Vec<SemanticColumn>) {
-    match provider.downcast_ref::<SemanticColumnsTable>() {
-        Some(wrapped) => (Arc::clone(&wrapped.inner), wrapped.columns.clone()),
-        None => (provider, Vec::new()),
-    }
+/// One `ALTER` at a time: each reads the table's columns, changes them, and
+/// writes them back (or wraps the table), and two interleaved would lose one's
+/// change.
+static ALTERS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// The catalog key of a semantic column: `table(name)` by the table's bare
+/// name, as indexes are keyed, so `public.tickets` and `tickets` name one
+/// entry, and dropping the table forgets it.
+fn catalog_key(table: &str, name: &str) -> String {
+    let bare = datafusion::common::TableReference::from(table)
+        .table()
+        .to_owned();
+    crate::catalog::index_name(&bare, name)
 }
 
 /// `table` as the catalog names relations: fully qualified.
