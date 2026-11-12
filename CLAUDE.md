@@ -90,7 +90,10 @@ before `statement_to_plan`.
 the completion model, the embedder (separate — Anthropic can't embed, Voyage can't
 complete), the chunk store semantic indexes keep their vectors in
 (`src/index/stored.rs`: SQLite with `--store`, memory otherwise), the `(table, column) → index` map, the semantic type
-registry and the optional durable catalog (`src/catalog.rs`). Both the public API
+registry, the session's verdict store (for statements that read it without
+planning a query, like `EXPLAIN REFRESH`) and the optional durable catalog
+(`src/catalog.rs`). List prices for cost estimates live in
+`src/model/pricing.rs`, dated by `PRICES_AS_OF`; update both together. Both the public API
 and the physical planner reach it via
 `state.config().get_extension::<SemcastRuntime>()`; that's the plumbing to reuse
 rather than threading new parameters through.

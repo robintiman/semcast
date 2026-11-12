@@ -42,8 +42,13 @@ pub enum SemanticDdl {
         name: String,
         if_exists: bool,
     },
-    /// `REFRESH SEMANTIC COLUMN table(name)`
-    RefreshColumn { table: String, name: String },
+    /// `[EXPLAIN] REFRESH SEMANTIC COLUMN table(name)`: with `EXPLAIN`, what
+    /// the refresh would cost, without running it.
+    RefreshColumn {
+        table: String,
+        name: String,
+        explain: bool,
+    },
     /// `CREATE SEMANTIC PREDICATE name(params) AS template [CHEAP USING ...]`
     CreatePredicate {
         name: String,
@@ -165,7 +170,7 @@ pub fn parse_alter_semantic(parser: &mut Parser) -> crate::Result<SemanticDdl> {
 
 /// Parse the tail of `REFRESH SEMANTIC COLUMN table(name)` — `REFRESH
 /// SEMANTIC` is already consumed.
-pub fn parse_semantic_refresh(parser: &mut Parser) -> crate::Result<SemanticDdl> {
+pub fn parse_semantic_refresh(parser: &mut Parser, explain: bool) -> crate::Result<SemanticDdl> {
     expect_word(parser, "COLUMN").map_err(column_error)?;
     let table = parse_table_name(parser).map_err(column_error)?;
     parser
@@ -184,6 +189,7 @@ pub fn parse_semantic_refresh(parser: &mut Parser) -> crate::Result<SemanticDdl>
     Ok(SemanticDdl::RefreshColumn {
         table,
         name: normalized(name),
+        explain,
     })
 }
 

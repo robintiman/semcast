@@ -25,6 +25,9 @@ pub struct SemcastRuntime {
     /// Where semantic indexes keep their chunks and vectors: memory unless
     /// the builder brought the store file.
     chunk_store: Arc<dyn crate::index::stored::ChunkStore>,
+    /// The verdict store the operators read and write, for statements that
+    /// look up what is already answered without planning a query.
+    cache: Arc<dyn crate::cache::SemanticCache>,
     /// Registered indexes keyed by `(table, column)`. Resolution is exact:
     /// a same-named column on a different table never borrows an index.
     indexes: Mutex<HashMap<(String, String), Arc<dyn SemanticIndex>>>,
@@ -42,6 +45,7 @@ impl SemcastRuntime {
             embedder: Arc::clone(&model),
             model,
             chunk_store: Arc::new(crate::index::stored::MemoryChunkStore::default()),
+            cache: Arc::new(crate::cache::InMemoryCache::default()),
             indexes: Mutex::new(HashMap::new()),
             types: Arc::new(TypeRegistry::default()),
             catalog: None,
@@ -80,6 +84,17 @@ impl SemcastRuntime {
     /// Where semantic indexes keep their chunks and vectors.
     pub fn chunk_store(&self) -> &Arc<dyn crate::index::stored::ChunkStore> {
         &self.chunk_store
+    }
+
+    /// Share the session's verdict store.
+    pub fn with_cache(mut self, cache: Arc<dyn crate::cache::SemanticCache>) -> Self {
+        self.cache = cache;
+        self
+    }
+
+    /// The session's verdict store.
+    pub fn cache(&self) -> &Arc<dyn crate::cache::SemanticCache> {
+        &self.cache
     }
 
     /// Save definitions to `catalog` as they are made.

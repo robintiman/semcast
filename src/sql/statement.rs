@@ -69,13 +69,20 @@ pub fn parse_semcast_statement(query: &str) -> crate::Result<SemcastStatement> {
         return ddl::parse_semantic_drop(parser).map(SemcastStatement::Ddl);
     }
 
-    if peek_nth_is_word(&df_parser.parser, 0, "REFRESH")
-        && peek_nth_is_word(&df_parser.parser, 1, "SEMANTIC")
+    let explain = peek_nth_is_word(&df_parser.parser, 0, "EXPLAIN")
+        && peek_nth_is_word(&df_parser.parser, 1, "REFRESH")
+        && peek_nth_is_word(&df_parser.parser, 2, "SEMANTIC");
+    if explain
+        || (peek_nth_is_word(&df_parser.parser, 0, "REFRESH")
+            && peek_nth_is_word(&df_parser.parser, 1, "SEMANTIC"))
     {
         let parser = &mut df_parser.parser;
+        if explain {
+            parser.next_token(); // EXPLAIN
+        }
         parser.next_token(); // REFRESH
         parser.next_token(); // SEMANTIC
-        return ddl::parse_semantic_refresh(parser).map(SemcastStatement::Ddl);
+        return ddl::parse_semantic_refresh(parser, explain).map(SemcastStatement::Ddl);
     }
     if peek_nth_is_word(&df_parser.parser, 0, "ALTER")
         && peek_nth_is_word(&df_parser.parser, 1, "TABLE")

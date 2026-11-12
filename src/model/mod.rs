@@ -12,6 +12,7 @@ mod anthropic;
 mod fallback;
 mod mock;
 mod ollama;
+pub mod pricing;
 mod scheduler;
 mod voyage;
 
