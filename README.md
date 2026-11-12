@@ -155,10 +155,9 @@ does not reuse verdicts cached by a single-condition query.
 
 Under a `LIMIT` with no `ORDER BY`, a single `MEANS` filter stops asking once
 it has the rows: each partition asks twice the limit plus any offset (at least
-32 rows), then
-twice as many each round until enough match. `ORDER BY … LIMIT` still asks
-every row, since the top row can be any of them, and so does a `MEANS` fused
-with another `MEANS` or under `NOT`, `OR` or `CONFIDENCE()`.
+32 rows), then twice as many each round until enough match. `ORDER BY … LIMIT`
+still asks every row, since the top row can be any of them, and so does a
+`MEANS` fused with another `MEANS` or under `NOT`, `OR` or `CONFIDENCE()`.
 
 `MEANS` also works anywhere else an expression does: under `NOT` or `OR`, as a
 `GROUP BY` key, inside an aggregate or window function. There it can't prune,
