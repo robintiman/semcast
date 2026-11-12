@@ -429,7 +429,41 @@ impl Scanner {
         let pool = draw_sample(&strings, self.label_budget());
         let sampled: HashSet<u64> = pool.iter().map(|text| doc_hash(text)).collect();
         let scores = self.score(&strings, &sampled).await;
+        // The rows the scorer judges, before labels join the store: what
+        // the pruning curve measures shares of.
+        let mut seen = HashSet::new();
+        let mut undecided: Vec<u64> = Vec::new();
+        for array in &strings {
+            for row in 0..array.len() {
+                if array.is_valid(row) {
+                    let text = array.value(row);
+                    let hash = doc_hash(text);
+                    if seen.insert(hash) && self.stored_verdict(text).is_none() {
+                        undecided.push(hash);
+                    }
+                }
+            }
+        }
         let (calibrated, labels) = self.calibrate(&pool, &scores).await;
+        if let Some(key) = self.calibration.stats_key {
+            let (mut scored, mut always) = (Vec::new(), 0);
+            for (text, label) in &labels {
+                if *label == Some(true) {
+                    match scores.get(&doc_hash(text)) {
+                        Some(score) => scored.push(*score),
+                        None => always += 1,
+                    }
+                }
+            }
+            let population: Vec<Option<f32>> = undecided
+                .iter()
+                .map(|hash| scores.get(hash).copied())
+                .collect();
+            self.calibration.cache.record_curve(
+                key,
+                crate::optimizer::budget::curve_from(&scored, always, 0, &population),
+            );
+        }
         // A sampled match is already paid for, and a failed label may be
         // one: never prune either, whatever the scorer said. Verify reads
         // their labels from the cache.

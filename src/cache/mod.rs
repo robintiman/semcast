@@ -100,6 +100,13 @@ impl AskStats {
     }
 }
 
+/// How much of its input a filter keeps at each recall level, from its last
+/// calibration: `(recall, share of rows kept)`, recall ascending. The recall
+/// budget splits a statement's allowed loss by these (see
+/// `optimizer::budget`); like [`AskStats`] they price a plan and never decide
+/// a row.
+pub type PruneCurve = Vec<(f64, f64)>;
+
 pub trait SemanticCache: std::fmt::Debug + Send + Sync {
     fn get(&self, key: &CacheKey) -> Option<CachedValue>;
     fn put(&self, key: CacheKey, value: CachedValue);
@@ -127,6 +134,14 @@ pub trait SemanticCache: std::fmt::Debug + Send + Sync {
     fn stats(&self, _question: u128) -> Option<AskStats> {
         None
     }
+
+    /// Replace a filter's pruning curve with its latest calibration's.
+    fn record_curve(&self, _key: u128, _curve: PruneCurve) {}
+
+    /// A filter's latest pruning curve, if one was recorded.
+    fn curve(&self, _key: u128) -> Option<PruneCurve> {
+        None
+    }
 }
 
 /// Process-local cache — enough for tests and single-session use. For one
@@ -135,6 +150,7 @@ pub trait SemanticCache: std::fmt::Debug + Send + Sync {
 pub struct InMemoryCache {
     entries: Mutex<HashMap<CacheKey, CachedValue>>,
     stats: Mutex<HashMap<u128, AskStats>>,
+    curves: Mutex<HashMap<u128, PruneCurve>>,
 }
 
 impl SemanticCache for InMemoryCache {
@@ -157,6 +173,14 @@ impl SemanticCache for InMemoryCache {
 
     fn stats(&self, question: u128) -> Option<AskStats> {
         self.stats.lock().unwrap().get(&question).copied()
+    }
+
+    fn record_curve(&self, key: u128, curve: PruneCurve) {
+        self.curves.lock().unwrap().insert(key, curve);
+    }
+
+    fn curve(&self, key: u128) -> Option<PruneCurve> {
+        self.curves.lock().unwrap().get(&key).cloned()
     }
 }
 

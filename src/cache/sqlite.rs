@@ -29,7 +29,7 @@ use std::thread::JoinHandle;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use super::{AskStats, CacheKey, CachedValue, SemanticCache, stable_digest};
+use super::{AskStats, CacheKey, CachedValue, PruneCurve, SemanticCache, stable_digest};
 use crate::{Result, SemcastError};
 
 /// Bumped when the table layout changes; a file from another layout is
@@ -53,6 +53,8 @@ enum Message {
     Flush(Sender<()>),
     /// Add to a question's statistics.
     Stats(u128, AskStats),
+    /// Replace a filter's pruning curve.
+    Curve(u128, String),
 }
 
 /// One verdict on its way to disk.
@@ -83,6 +85,9 @@ pub struct SqliteCache {
     /// count a batch twice or miss it: statistics order filters, never
     /// decide rows, so that costs at most some calls.
     pending_stats: Arc<Mutex<HashMap<u128, AskStats>>>,
+    /// Curves recorded by this instance: the latest wins, and is read from
+    /// here before disk, so a curve is visible before it is committed.
+    curves: Mutex<HashMap<u128, PruneCurve>>,
 }
 
 impl SqliteCache {
@@ -114,6 +119,7 @@ impl SqliteCache {
             messages: Some(messages),
             writer: Some(writer),
             pending_stats,
+            curves: Mutex::new(HashMap::new()),
         })
     }
 
@@ -209,12 +215,14 @@ fn write_loop(
     while let Ok(first) = messages.recv() {
         let mut batch: Vec<Row> = Vec::new();
         let mut stats: Vec<(u128, AskStats)> = Vec::new();
+        let mut curves: Vec<(u128, String)> = Vec::new();
         let mut flushes: Vec<Sender<()>> = Vec::new();
         let mut next = Some(first);
         while let Some(message) = next.take() {
             match message {
                 Message::Rows(rows) => batch.extend(rows),
                 Message::Stats(question, delta) => stats.push((question, delta)),
+                Message::Curve(key, curve) => curves.push((key, curve)),
                 Message::Flush(done) => {
                     // Commit what precedes the flush before answering it.
                     flushes.push(done);
@@ -228,6 +236,11 @@ fn write_loop(
         }
         if !batch.is_empty() {
             commit(&mut connection, &batch);
+        }
+        if !curves.is_empty()
+            && let Err(error) = write_curves(&mut connection, &curves)
+        {
+            tracing::warn!(target: "semcast::store", %error, "store could not save pruning curves");
         }
         if !stats.is_empty() {
             if let Err(error) = write_stats(&mut connection, &stats) {
@@ -282,6 +295,20 @@ fn commit(connection: &mut Connection, batch: &[Row]) {
             );
         }
     }
+}
+
+fn write_curves(connection: &mut Connection, curves: &[(u128, String)]) -> rusqlite::Result<()> {
+    let transaction = connection.transaction()?;
+    {
+        let mut upsert = transaction.prepare_cached(
+            "INSERT INTO prune_curves (key, curve) VALUES (?1, ?2)
+             ON CONFLICT (key) DO UPDATE SET curve = excluded.curve",
+        )?;
+        for (key, curve) in curves {
+            upsert.execute(params![key.to_le_bytes().to_vec(), curve])?;
+        }
+    }
+    transaction.commit()
 }
 
 fn write_stats(connection: &mut Connection, stats: &[(u128, AskStats)]) -> rusqlite::Result<()> {
@@ -513,6 +540,32 @@ impl SemanticCache for SqliteCache {
         }
     }
 
+    fn record_curve(&self, key: u128, curve: PruneCurve) {
+        let json = serde_json::to_string(&curve).unwrap_or_default();
+        self.curves
+            .lock()
+            .expect("curves lock poisoned")
+            .insert(key, curve);
+        if let Some(messages) = &self.messages {
+            let _ = messages.send(Message::Curve(key, json));
+        }
+    }
+
+    fn curve(&self, key: u128) -> Option<PruneCurve> {
+        if let Some(curve) = self.curves.lock().expect("curves lock poisoned").get(&key) {
+            return Some(curve.clone());
+        }
+        let reader = self.reader.lock().expect("store lock poisoned");
+        let json: String = reader
+            .query_row(
+                "SELECT curve FROM prune_curves WHERE key = ?1",
+                params![key.to_le_bytes().to_vec()],
+                |row| row.get(0),
+            )
+            .ok()?;
+        serde_json::from_str(&json).ok()
+    }
+
     fn stats(&self, question: u128) -> Option<AskStats> {
         let stored: Option<AskStats> = {
             let reader = self.reader.lock().expect("store lock poisoned");
@@ -610,6 +663,12 @@ pub(crate) fn open_store(path: &Path) -> Result<Connection> {
                      asked       INTEGER NOT NULL,
                      matched     INTEGER NOT NULL,
                      input_chars INTEGER NOT NULL
+                 ) WITHOUT ROWID;
+                 -- Each filter's latest pruning curve, as JSON pairs of
+                 -- (recall, share kept). Added in place.
+                 CREATE TABLE IF NOT EXISTS prune_curves (
+                     key   BLOB PRIMARY KEY,
+                     curve TEXT NOT NULL
                  ) WITHOUT ROWID;
                  -- Which chunks each semantic index holds, and the embedding
                  -- each one reads. Added in place: an older build ignores it.
