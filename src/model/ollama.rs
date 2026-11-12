@@ -3,13 +3,14 @@
 //! The free-local-dev path: completions through `/api/chat`, embeddings
 //! through `/api/embed` (which the semantic index needs at roadmap step 2).
 //!
-//! Every request sets the context length (`num_ctx`). Left to Ollama, it
-//! falls back to a default (16k tokens in 0.40) and keeps only the end of a
-//! longer input, so a long document's verdict would be about its last pages
-//! with nothing said. An input that can't fit is an error instead, before
-//! the call when it is clearly too long and after it when the model's own
-//! token count shows the prompt was cut: rows fail, they are never answered
-//! from part of the text.
+//! Every request sets the context length (`num_ctx`) and turns truncation
+//! off. Left to Ollama, the context falls back to a default (16k tokens in
+//! 0.40) and a longer prompt is cut to fit, keeping its end, so a long
+//! document's verdict would be about its last pages with nothing said. With
+//! `truncate: false` Ollama refuses such a prompt instead (an HTTP 400 that
+//! counts with its own tokenizer, before any generation), and the row fails:
+//! rows fail, they are never answered from part of the text. `shift: false`
+//! likewise stops a long answer from sliding the prompt out of the context.
 //!
 //! [Ollama]: https://ollama.com
 
@@ -27,28 +28,6 @@ pub const DEFAULT_EMBED_MODEL: &str = "nomic-embed-text";
 /// `--ollama-num-ctx` for longer ones, up to the model's own limit; memory
 /// grows with it.
 pub const DEFAULT_NUM_CTX: usize = 32_768;
-
-/// Characters per token assumed when checking an input fits before the
-/// call: generous, so only an input clearly too long is refused unasked.
-const CHARS_PER_TOKEN: usize = 4;
-
-/// Refuse an input that clearly can't fit `num_ctx` with room to answer.
-fn check_fits(request: &CompletionRequest, num_ctx: usize) -> Result<()> {
-    let estimated = (request.system.len() + request.input.len()) / CHARS_PER_TOKEN;
-    if estimated + request.max_tokens > num_ctx {
-        return Err(SemcastError::Model(format!(
-            "input of about {estimated} tokens doesn't fit the model's context \
-             of {num_ctx} (--ollama-num-ctx); refused rather than truncated"
-        )));
-    }
-    Ok(())
-}
-
-/// Whether Ollama cut the prompt: it evaluated as many tokens as the context
-/// leaves room for, which is what truncation looks like from outside.
-fn truncated(prompt_eval_count: usize, max_tokens: usize, num_ctx: usize) -> bool {
-    prompt_eval_count + max_tokens >= num_ctx
-}
 
 #[derive(Debug, Clone)]
 pub struct OllamaProvider {
@@ -91,7 +70,6 @@ impl OllamaProvider {
     }
 
     async fn complete_one(&self, request: CompletionRequest) -> Result<Completion> {
-        check_fits(&request, self.num_ctx)?;
         let body = ChatRequest {
             model: &self.model,
             messages: vec![
@@ -122,6 +100,8 @@ impl OllamaProvider {
             // Enough alternatives to see both answers in their usual
             // spellings ("yes", "Yes", " yes", "no", ...).
             top_logprobs: request.logprobs.then_some(TOP_LOGPROBS),
+            truncate: false,
+            shift: false,
         };
         tracing::debug!(
             target: "semcast::model",
@@ -148,14 +128,6 @@ impl OllamaProvider {
             response = %chat.message.content,
             "llm response"
         );
-        if truncated(chat.prompt_eval_count, request.max_tokens, self.num_ctx) {
-            return Err(SemcastError::Model(format!(
-                "the model read {} tokens, all its context of {} \
-                 (--ollama-num-ctx) allows: the input was cut, so the answer \
-                 is not used",
-                chat.prompt_eval_count, self.num_ctx
-            )));
-        }
         let yes_probability = chat
             .logprobs
             .as_deref()
@@ -239,6 +211,11 @@ struct ChatRequest<'a> {
     logprobs: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     top_logprobs: Option<usize>,
+    /// Always false: refuse a prompt longer than the context rather than cut
+    /// it (see the module docs).
+    truncate: bool,
+    /// Always false: never slide the prompt out to make room for the answer.
+    shift: bool,
 }
 
 #[derive(Serialize)]
@@ -311,27 +288,12 @@ struct EmbedResponse {
 mod tests {
     use super::*;
 
-    fn request(chars: usize) -> CompletionRequest {
-        CompletionRequest {
-            system: String::new(),
-            input: "x".repeat(chars),
-            max_tokens: 8,
-            schema: None,
-            logprobs: false,
-        }
-    }
-
     #[test]
-    fn an_input_too_long_for_the_context_is_refused_not_truncated() {
-        assert!(check_fits(&request(4 * 1000), 2048).is_ok());
-        let error = check_fits(&request(4 * 3000), 2048).unwrap_err();
-        assert!(
-            error.to_string().contains("refused rather than truncated"),
-            "{error}"
-        );
-        // What Ollama reports when it cut the prompt to fit.
-        assert!(truncated(16_380, 8, 16_384));
-        assert!(!truncated(12_039, 8, 16_384));
+    fn chat_request_refuses_truncation() {
+        let body = serde_json::to_value(chat_request(None)).unwrap();
+        assert_eq!(body["truncate"], false);
+        assert_eq!(body["shift"], false);
+        assert_eq!(body["options"]["num_ctx"], DEFAULT_NUM_CTX);
     }
 
     #[test]
@@ -372,6 +334,8 @@ mod tests {
             },
             logprobs: None,
             top_logprobs: None,
+            truncate: false,
+            shift: false,
         }
     }
 
