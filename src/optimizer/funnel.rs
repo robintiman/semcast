@@ -10,13 +10,22 @@
 //!
 //! These are estimates and say so: pruning with no history is priced at its
 //! ceiling (every row reaches verify), a model with no listed price costs
-//! "unknown", and nothing here decides a row.
+//! "unknown", and nothing here decides a row. They are priced before stored
+//! answers: which rows the store already holds is known only once the input
+//! is read, so a repeat query can cost far less than its estimate. A `LIMIT`
+//! that stops verify early is noted, not priced.
+//!
+//! On a joint index-and-scorer funnel the history is cost per row in
+//! verify calls, scorer calls weighted in (what the joint choice minimizes),
+//! so the estimate reads "verify-equivalent calls" there rather than a share
+//! reaching verify.
 
 use crate::cache::{AskStats, PruneCurve};
 use crate::model::ModelId;
 
-/// Characters of prompt every yes/no request carries besides its input.
-const PROMPT_CHARS: f64 = 250.0;
+/// Characters of one chunk under the default chunking (512 tokens, about
+/// four characters each): the input a chunked verify reads per chunk.
+const CHUNK_CHARS: f64 = 2048.0;
 
 /// Output tokens a yes/no answer is billed for (`VERIFY_MAX_TOKENS`).
 const ANSWER_TOKENS: f64 = 8.0;
@@ -30,6 +39,11 @@ pub struct FunnelFacts {
     pub index: bool,
     /// A scorer prunes before verify (alone, or after the index).
     pub scorer: bool,
+    /// Verify reads this many chunks per row (an index without a full-text
+    /// fallback); `None` when it reads the full text.
+    pub chunks_per_row: Option<usize>,
+    /// Characters of the synthesized prompt around each input.
+    pub prompt_chars: usize,
     /// This filter's recall share, under `WITH RECALL`.
     pub recall: Option<f64>,
     /// Whether the recall is certified (`WITH CONFIDENCE`).
@@ -59,8 +73,16 @@ pub struct FunnelEstimate {
     pub reach_share: Option<f64>,
     /// Verify calls expected, when the row count is known.
     pub verify_calls: Option<f64>,
-    /// Session-model cost of labels and verify, at list price.
+    /// Session-model cost of labels and verify, at list price (the scorer
+    /// is not priced).
     pub cost_usd: Option<f64>,
+    /// The share is a joint funnel's cost per row, scorer weighted in.
+    pub joint: bool,
+    /// No recall target: the index prunes at its fixed floor, which no
+    /// history prices.
+    pub uncalibrated: bool,
+    /// A `LIMIT` verify stops at, set when the plan pushes one down.
+    pub fetch: Option<usize>,
 }
 
 /// Combine what the planner built with what the store has seen.
@@ -83,6 +105,7 @@ pub fn derive_funnel(facts: &FunnelFacts) -> FunnelEstimate {
         _ => None,
     };
     let verify_calls = rows.map(|rows| rows * reach_share.unwrap_or(1.0));
+    let joint = facts.index && facts.scorer && facts.recall.is_some();
     let scorer_calls = if facts.scorer && !facts.index && facts.recall.is_some() {
         rows
     } else {
@@ -90,10 +113,18 @@ pub fn derive_funnel(facts: &FunnelFacts) -> FunnelEstimate {
     };
     let cost_usd = (|| {
         let (input_price, output_price) = crate::model::pricing::price_per_mtok(&facts.model)?;
-        let chars = facts.stats.and_then(|s| s.chars_per_ask())?;
-        let calls = verify_calls? + labels.unwrap_or(0) as f64;
-        let input_tokens = calls * (chars + PROMPT_CHARS) / 4.0;
-        let output_tokens = calls * ANSWER_TOKENS;
+        // Full text, as the history measured it: what labels read, and what
+        // verify reads unless it reads a few chunks.
+        let full = facts.stats.and_then(|s| s.chars_per_ask())?;
+        let read = match facts.chunks_per_row {
+            Some(chunks) => full.min(chunks as f64 * CHUNK_CHARS),
+            None => full,
+        };
+        let prompt = facts.prompt_chars as f64;
+        let labels = labels.unwrap_or(0) as f64;
+        let verify = verify_calls?;
+        let input_tokens = (verify * (read + prompt) + labels * (full + prompt)) / 4.0;
+        let output_tokens = (verify + labels) * ANSWER_TOKENS;
         Some((input_tokens * input_price + output_tokens * output_price) / 1e6)
     })();
     FunnelEstimate {
@@ -103,22 +134,59 @@ pub fn derive_funnel(facts: &FunnelFacts) -> FunnelEstimate {
         reach_share,
         verify_calls,
         cost_usd,
+        joint,
+        uncalibrated: facts.index && facts.recall.is_none(),
+        fetch: None,
+    }
+}
+
+/// A share as a percentage, with a decimal where whole percents would round
+/// it to 0 or 100.
+fn percent(share: f64) -> String {
+    let p = share * 100.0;
+    if p > 0.0 && p < 1.0 || p > 99.0 && p < 100.0 {
+        format!("{p:.1}%")
+    } else {
+        format!("{p:.0}%")
+    }
+}
+
+/// Dollars to two significant figures, so a small cost isn't shown as zero.
+fn dollars(cost: f64) -> String {
+    if cost == 0.0 {
+        "$0".to_owned()
+    } else if cost >= 0.01 {
+        format!("${cost:.2}")
+    } else {
+        let digits = (-cost.log10()).ceil() as usize + 1;
+        format!("${cost:.digits$}")
     }
 }
 
 impl std::fmt::Display for FunnelEstimate {
-    /// `expect ~200 verify calls (20% reach verify, from history) + 64
-    /// labels, ~$0.0700 at list price`.
+    /// `expect, before stored answers, ~200 verify calls (20% reach verify,
+    /// from history) + 64 labels, session model ~$0.07 at list price`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "expect ")?;
+        write!(f, "expect, before stored answers, ")?;
+        let unit = if self.joint {
+            "verify-equivalent calls"
+        } else {
+            "verify calls"
+        };
         match self.verify_calls {
-            Some(calls) => write!(f, "~{calls:.0} verify calls")?,
-            None => write!(f, "verify calls unknown")?,
+            Some(calls) => write!(f, "~{calls:.0} {unit}")?,
+            None => write!(f, "{unit} unknown")?,
         }
         match self.reach_share {
-            Some(share) if share < 1.0 => {
-                write!(f, " ({:.0}% reach verify, from history)", share * 100.0)?
+            Some(share) if self.joint => write!(
+                f,
+                " ({} of rows, verify + scorer, from history)",
+                percent(share)
+            )?,
+            Some(share) if share < 1.0 || self.labels.is_some() => {
+                write!(f, " ({} reach verify, from history)", percent(share))?
             }
+            None if self.uncalibrated => write!(f, " (uncalibrated floor: ceiling)")?,
             None => write!(f, " (no pruning history: ceiling)")?,
             _ => {}
         }
@@ -129,8 +197,11 @@ impl std::fmt::Display for FunnelEstimate {
             let up_to = if self.labels_up_to { "≤" } else { "" };
             write!(f, " + {up_to}{labels} labels")?;
         }
+        if let Some(fetch) = self.fetch {
+            write!(f, ", fewer under LIMIT {fetch}")?;
+        }
         match self.cost_usd {
-            Some(cost) => write!(f, ", ~${cost:.4} at list price"),
+            Some(cost) => write!(f, ", session model ~{} at list price", dollars(cost)),
             None => write!(f, ", cost unknown"),
         }
     }
@@ -145,6 +216,8 @@ mod tests {
             input_rows: Some(1000),
             index: true,
             scorer: false,
+            chunks_per_row: None,
+            prompt_chars: 250,
             recall: Some(0.9),
             certified: false,
             sample: 64,
@@ -174,7 +247,7 @@ mod tests {
         );
         let shown = estimate.to_string();
         assert!(
-            shown.starts_with("expect ~200 verify calls (20% reach verify"),
+            shown.starts_with("expect, before stored answers, ~200 verify calls (20% reach verify"),
             "{shown}"
         );
     }
@@ -202,6 +275,61 @@ mod tests {
         assert_eq!(estimate.reach_share, Some(1.0));
         assert_eq!(estimate.labels, None);
         assert_eq!(estimate.verify_calls, Some(1000.0));
+    }
+
+    #[test]
+    fn chunked_verify_reads_less_than_the_full_text() {
+        let full = derive_funnel(&FunnelFacts {
+            stats: Some(AskStats {
+                asked: 1,
+                matched: 0,
+                input_chars: 40_000,
+            }),
+            ..facts()
+        });
+        let chunked = derive_funnel(&FunnelFacts {
+            chunks_per_row: Some(3),
+            stats: Some(AskStats {
+                asked: 1,
+                matched: 0,
+                input_chars: 40_000,
+            }),
+            ..facts()
+        });
+        assert!(chunked.cost_usd.unwrap() < full.cost_usd.unwrap() / 2.0);
+    }
+
+    #[test]
+    fn a_joint_funnel_reads_as_cost_not_a_share() {
+        let estimate = derive_funnel(&FunnelFacts {
+            scorer: true,
+            ..facts()
+        });
+        let shown = estimate.to_string();
+        assert!(
+            shown.contains("~200 verify-equivalent calls (20% of rows, verify + scorer"),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn an_uncalibrated_index_says_so() {
+        let shown = derive_funnel(&FunnelFacts {
+            recall: None,
+            ..facts()
+        })
+        .to_string();
+        assert!(shown.contains("uncalibrated floor: ceiling"), "{shown}");
+    }
+
+    #[test]
+    fn small_shares_and_costs_keep_their_digits() {
+        assert_eq!(percent(0.996), "99.6%");
+        assert_eq!(percent(0.004), "0.4%");
+        assert_eq!(percent(0.2), "20%");
+        assert_eq!(dollars(0.00001234), "$0.000012");
+        assert_eq!(dollars(1.5), "$1.50");
+        assert_eq!(dollars(0.0), "$0");
     }
 
     #[test]

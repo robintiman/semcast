@@ -144,10 +144,13 @@ otherwise run. `EXPLAIN` shows the lookup (`StoreLookupExec: ask=…`), and the 
 notice says how many rows the store answered.
 
 `EXPLAIN` also prices each `MEANS` filter before it runs: on its verify line,
-`expect ~N verify calls (P% reach verify, from history) + L labels, ~$X at
-list price`. The share reaching verify comes from the filter's last
-calibration on that column; with no history it is the ceiling, every row.
-The cost needs a priced model and the filter's past input size.
+`expect, before stored answers, ~N verify calls (P% reach verify, from
+history) + L labels, session model ~$X at list price`. The share reaching
+verify comes from the filter's last calibration on that column; with no
+history it is the ceiling, every row. It can't know which rows the store
+already holds, so a repeat query usually costs less. An index with a scorer
+shows verify-equivalent calls (scorer calls weighted in), and only the
+session model is priced.
 
 Several `MEANS` in one `WHERE` are ordered by what they cost, not by the order
 you wrote them: one whose column has a semantic index prunes for free, so it

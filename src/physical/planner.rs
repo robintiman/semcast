@@ -128,11 +128,15 @@ impl ExtensionPlanner for SemcastExtensionPlanner {
                 | Ok(datafusion::common::stats::Precision::Inexact(rows)) => Some(rows),
                 _ => None,
             };
-            let estimate = |index: bool, scorer: bool| {
+            let prompt_chars =
+                crate::physical::verify::synthesize_means_prompt(&filter.condition).len();
+            let estimate = |index: bool, scorer: bool, chunks_per_row: Option<usize>| {
                 crate::optimizer::funnel::derive_funnel(&crate::optimizer::funnel::FunnelFacts {
                     input_rows,
                     index,
                     scorer,
+                    chunks_per_row,
+                    prompt_chars,
                     recall: filter.recall,
                     certified: filter.confidence.is_some(),
                     sample: DEFAULT_CALIBRATION_SAMPLE,
@@ -202,7 +206,11 @@ impl ExtensionPlanner for SemcastExtensionPlanner {
                         params.chunks_per_doc,
                     )
                     .with_store_evidence(store)
-                    .with_estimate(estimate(true, joint)),
+                    .with_estimate(estimate(
+                        true,
+                        joint,
+                        Some(params.chunks_per_doc),
+                    )),
                 )));
             }
             // No index, but a scorer and a recall target: the scorer reads
@@ -246,7 +254,7 @@ impl ExtensionPlanner for SemcastExtensionPlanner {
                 Arc::clone(&self.cache),
             )
             .with_store_evidence(store)
-            .with_estimate(estimate(false, prefiltered));
+            .with_estimate(estimate(false, prefiltered, None));
             // Behind a scorer, verify sees mostly matches: its rate would
             // mislead the optimizer, and calibration's labels count instead.
             if !prefiltered {

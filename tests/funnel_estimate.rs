@@ -50,7 +50,10 @@ async fn verify_alone_expects_a_call_per_row() {
         "SELECT id FROM tickets WHERE body MEANS 'asks for a refund'",
     )
     .await;
-    assert!(plan.contains("expect ~200 verify calls"), "{plan}");
+    assert!(
+        plan.contains("expect, before stored answers, ~200 verify calls"),
+        "{plan}"
+    );
     // The mock has no price.
     assert!(plan.contains("cost unknown"), "{plan}");
 }
@@ -74,4 +77,15 @@ async fn a_calibrated_filter_is_priced_from_its_history() {
         .unwrap();
     let after = explain(&ctx, query).await;
     assert!(after.contains("reach verify, from history"), "{after}");
+}
+
+#[tokio::test]
+async fn a_limit_is_noted() {
+    let ctx = context().await;
+    let plan = explain(
+        &ctx,
+        "SELECT id FROM tickets WHERE body MEANS 'asks for a refund' LIMIT 3",
+    )
+    .await;
+    assert!(plan.contains("fewer under LIMIT 3"), "{plan}");
 }

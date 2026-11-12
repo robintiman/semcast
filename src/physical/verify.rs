@@ -287,7 +287,10 @@ impl ExecutionPlan for VerifyExec {
         verify.store = self.store.clone();
         verify.fetch = limit;
         verify.stats_key = self.stats_key;
-        verify.estimate = self.estimate.clone();
+        verify.estimate = self.estimate.clone().map(|mut estimate| {
+            estimate.fetch = limit;
+            estimate
+        });
         Some(Arc::new(verify))
     }
 
