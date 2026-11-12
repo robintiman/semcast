@@ -196,7 +196,12 @@ pub(crate) async fn run_sql(ctx: &SessionContext, text: &str, record: bool) -> R
                     let no_rows = LogicalPlanBuilder::empty(false).build()?;
                     Ok(DataFrame::new(ctx.state(), no_rows))
                 }
-                sql::ddl::SemanticDdl::RefreshColumn { table, name } => {
+                sql::ddl::SemanticDdl::RefreshColumn {
+                    table,
+                    name,
+                    explain: true,
+                } => semantic_column::explain_refresh(ctx, &table, &name).await,
+                sql::ddl::SemanticDdl::RefreshColumn { table, name, .. } => {
                     semantic_column::refresh_column(ctx, &table, &name).await?;
                     let no_rows = LogicalPlanBuilder::empty(false).build()?;
                     Ok(DataFrame::new(ctx.state(), no_rows))
@@ -510,8 +515,9 @@ impl SemcastContextBuilder {
         // One queue per provider, in front of everything that calls it.
         let model: Arc<dyn ModelProvider> =
             Arc::new(crate::model::Scheduler::new(model, self.max_in_flight));
-        let mut runtime =
-            SemcastRuntime::new(Arc::clone(&model)).with_type_registry(Arc::clone(&types));
+        let mut runtime = SemcastRuntime::new(Arc::clone(&model))
+            .with_type_registry(Arc::clone(&types))
+            .with_cache(Arc::clone(&self.cache));
         if let Some(embedder) = self.embedder {
             runtime = runtime.with_embedder(Arc::new(crate::model::Scheduler::new(
                 embedder,

@@ -149,7 +149,8 @@ async fn ids(ctx: &SessionContext, sql: &str) -> Vec<i64> {
 }
 
 /// The teardown's measurement, inverted. Stacked, this query cost 7 calls one
-/// way round and 11 the other; fused it costs one per row either way.
+/// way round and 11 the other; fused it costs one per distinct text either
+/// way.
 #[tokio::test]
 async fn conjunct_order_no_longer_changes_the_cost() {
     let mut costs = Vec::new();
@@ -160,9 +161,11 @@ async fn conjunct_order_no_longer_changes_the_cost() {
         costs.push(model.calls());
     }
     assert_eq!(costs[0], costs[1], "order must not change the price");
+    // Rows 2-5 share one text, asked once: one fused call per distinct
+    // text (3), beating the best stacked ordering.
     assert_eq!(
-        costs[0], 6,
-        "one fused call per row, beating the best stacked ordering",
+        costs[0], 3,
+        "one fused call per distinct text, beating the best stacked ordering",
     );
 }
 

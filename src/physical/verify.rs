@@ -39,6 +39,9 @@ pub const MEANS_PROMPT_VERSION: &str = "means-v2";
 /// full-text verdict for a chunked question.
 pub const MEANS_CHUNKED_PROMPT_VERSION: &str = "means-v2-chunked";
 
+/// The output cap of a yes/no verify request — a word, with room to spare.
+pub const VERIFY_MAX_TOKENS: usize = 8;
+
 /// Separates chunks in a chunked verify input; part of the cache-keyed
 /// input, so changing it invalidates exactly the chunked verdicts.
 pub const CHUNK_SEPARATOR: &str = "\n---\n";
@@ -302,6 +305,11 @@ impl Verifier {
         let mut keep = vec![false; batch.num_rows()];
         let mut requests = Vec::new();
         let mut pending: Vec<(usize, String, bool)> = Vec::new();
+        // A text repeated in the batch is asked once (the cache only learns
+        // the answer afterwards); later copies take the first one's verdict.
+        let mut first_ask: std::collections::HashMap<(String, bool), usize> =
+            std::collections::HashMap::new();
+        let mut copies: Vec<(usize, usize)> = Vec::new();
         for (row, keep_row) in keep.iter_mut().enumerate() {
             if !texts.is_valid(row) {
                 continue;
@@ -332,10 +340,15 @@ impl Verifier {
                 *keep_row = verdict == "yes";
                 continue;
             }
+            if let Some(&asked) = first_ask.get(&(input.clone(), chunked)) {
+                copies.push((row, asked));
+                continue;
+            }
+            first_ask.insert((input.clone(), chunked), pending.len());
             requests.push(CompletionRequest {
                 system: prompt.clone(),
                 input: input.clone(),
-                max_tokens: 8,
+                max_tokens: VERIFY_MAX_TOKENS,
                 schema: None,
                 logprobs: true,
             });
@@ -366,6 +379,17 @@ impl Verifier {
                 }
                 // Row-level failure: exclude and count, don't fail the query.
                 Ok((None, _)) | Err(_) => self.rows_dropped.add(1),
+            }
+        }
+        for (row, asked) in copies {
+            let (source, ..) = pending[asked];
+            keep[row] = keep[source];
+            let answered = matches!(
+                verdicts[asked].as_ref().map(|c| parse_verdict(&c.text)),
+                Ok(Some(_))
+            );
+            if !answered {
+                self.rows_dropped.add(1);
             }
         }
         Ok(filter_record_batch(&batch, &BooleanArray::from(keep))?)

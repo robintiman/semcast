@@ -583,3 +583,122 @@ fn resolve(ctx: &datafusion::execution::context::SessionContext, table: &str) ->
         .resolve(&defaults.default_catalog, &defaults.default_schema)
         .to_string()
 }
+
+/// `EXPLAIN REFRESH SEMANTIC COLUMN table(name)`: what the refresh would
+/// cost, without asking the model anything. One row: the rows and distinct
+/// texts the column covers, how many the store already answers, how many
+/// would be asked, the estimated tokens, and the estimated cost at the
+/// session model's list price (NULL when its price isn't known).
+///
+/// Estimates: tokens are counted at four characters each, the refresh asks
+/// one full-text question per distinct text without one stored (repeats are
+/// asked once), and each answer is billed up to the request's output cap,
+/// [`VERIFY_MAX_TOKENS`] — an upper bound, since a model that thinks first
+/// spends it. A semantic index doesn't prune a refresh, which answers every
+/// row.
+///
+/// [`VERIFY_MAX_TOKENS`]: crate::physical::verify::VERIFY_MAX_TOKENS
+pub async fn explain_refresh(
+    ctx: &datafusion::execution::context::SessionContext,
+    table: &str,
+    name: &str,
+) -> crate::Result<datafusion::dataframe::DataFrame> {
+    use datafusion::arrow::array::{ArrayRef, Float64Array, StringArray, UInt64Array};
+    use datafusion::arrow::compute::cast;
+    use datafusion::arrow::record_batch::RecordBatch;
+
+    let provider = ctx.table_provider(table).await?;
+    let column = provider
+        .downcast_ref::<SemanticColumnsTable>()
+        .and_then(|wrapped| wrapped.columns().into_iter().find(|c| c.name == name))
+        .ok_or_else(|| {
+            datafusion::error::DataFusionError::Plan(format!(
+                "{table} has no semantic column named {name}"
+            ))
+        })?;
+    let runtime = crate::index::runtime(ctx)?;
+    let model = runtime.model.id();
+
+    // The text column only: no semantic column is read, so nothing is asked.
+    let batches = ctx
+        .table(table)
+        .await?
+        .select_columns(&[column.text.as_str()])?
+        .collect()
+        .await?;
+    let mut rows = 0_u64;
+    let mut seen = std::collections::HashSet::new();
+    let mut texts: Vec<String> = Vec::new();
+    for batch in &batches {
+        rows += batch.num_rows() as u64;
+        let strings = cast(batch.column(0), &DataType::Utf8)
+            .map_err(datafusion::error::DataFusionError::from)?;
+        let strings = strings
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("cast to Utf8");
+        for text in strings.iter().flatten() {
+            if seen.insert(crate::cache::stable_digest(&[text.as_bytes()])) {
+                texts.push(text.to_owned());
+            }
+        }
+    }
+    let keys: Vec<_> = texts
+        .iter()
+        .map(|text| {
+            crate::physical::verify::means_cache_key(
+                &column.condition,
+                text,
+                &model,
+                crate::physical::verify::MEANS_PROMPT_VERSION,
+            )
+        })
+        .collect();
+    let cache = std::sync::Arc::clone(runtime.cache());
+    let answers = tokio::task::spawn_blocking(move || cache.get_many(&keys))
+        .await
+        .map_err(|error| datafusion::error::DataFusionError::External(Box::new(error)))?;
+    let prompt_chars = crate::physical::verify::synthesize_means_prompt(&column.condition)
+        .chars()
+        .count() as u64;
+    let mut stored = 0_u64;
+    let mut input_tokens = 0_u64;
+    for (text, answer) in texts.iter().zip(&answers) {
+        if matches!(answer, Some(crate::cache::CachedValue::Value(_))) {
+            stored += 1;
+        } else {
+            input_tokens += (prompt_chars + text.chars().count() as u64).div_ceil(4);
+        }
+    }
+    let to_ask = texts.len() as u64 - stored;
+    let output_tokens = to_ask * crate::physical::verify::VERIFY_MAX_TOKENS as u64;
+    let cost = crate::model::pricing::price_per_mtok(&model).map(|(input, output)| {
+        (input_tokens as f64 * input + output_tokens as f64 * output) / 1_000_000.0
+    });
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("model", DataType::Utf8, false),
+        Field::new("rows", DataType::UInt64, false),
+        Field::new("texts", DataType::UInt64, false),
+        Field::new("stored", DataType::UInt64, false),
+        Field::new("to_ask", DataType::UInt64, false),
+        Field::new("est_input_tokens", DataType::UInt64, false),
+        Field::new("est_output_tokens", DataType::UInt64, false),
+        Field::new("est_cost_usd", DataType::Float64, true),
+        Field::new("prices_as_of", DataType::Utf8, false),
+    ]));
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(StringArray::from(vec![model.0.clone()])),
+        Arc::new(UInt64Array::from(vec![rows])),
+        Arc::new(UInt64Array::from(vec![texts.len() as u64])),
+        Arc::new(UInt64Array::from(vec![stored])),
+        Arc::new(UInt64Array::from(vec![to_ask])),
+        Arc::new(UInt64Array::from(vec![input_tokens])),
+        Arc::new(UInt64Array::from(vec![output_tokens])),
+        Arc::new(Float64Array::from(vec![cost])),
+        Arc::new(StringArray::from(vec![crate::model::pricing::PRICES_AS_OF])),
+    ];
+    let batch =
+        RecordBatch::try_new(schema, columns).map_err(datafusion::error::DataFusionError::from)?;
+    Ok(ctx.read_batch(batch)?)
+}

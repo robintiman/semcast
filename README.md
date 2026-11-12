@@ -259,6 +259,7 @@ qualifies a recall target.
 ALTER TABLE <table> ADD SEMANTIC COLUMN <name> AS (<text_column> MEANS '<condition>');
 ALTER TABLE <table> DROP SEMANTIC COLUMN [IF EXISTS] <name>;
 REFRESH SEMANTIC COLUMN <table>(<name>);
+EXPLAIN REFRESH SEMANTIC COLUMN <table>(<name>);
 ```
 
 A named `MEANS`, read like any column. Nothing is stored in the table: reading
@@ -273,6 +274,14 @@ ALTER TABLE tickets ADD SEMANTIC COLUMN angry AS (body MEANS 'the customer is an
 SELECT id, angry FROM tickets;
 SELECT count(*) FROM tickets WHERE angry;
 ```
+
+`EXPLAIN REFRESH` shows the bill before you pay it, asking the model nothing:
+rows, distinct texts, how many the store already answers, how many would be
+asked, the estimated tokens, and the estimated cost at the model's list price
+(NULL for a model semcast has no price for; $0 for Ollama; a fallback chain at
+its first model's price). Estimates: four characters a token, each answer at
+its output cap (an upper bound), list prices as of `prices_as_of`, no batch or
+cache discounts. A text that repeats within a batch is asked once.
 
 Saved with `--store` on a saved table, and dropped with its table. Writes go
 to the table underneath: `INSERT` names its columns (`INSERT INTO tickets (id,

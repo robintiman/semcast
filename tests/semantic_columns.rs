@@ -513,3 +513,145 @@ async fn replacing_a_table_in_another_schema_keeps_this_ones_columns() {
         [1]
     );
 }
+
+/// A model under another id, so an estimate can find a list price.
+#[derive(Debug)]
+struct Priced(MockModel, &'static str);
+
+#[async_trait::async_trait]
+impl semcast::model::ModelProvider for Priced {
+    fn id(&self) -> semcast::model::ModelId {
+        semcast::model::ModelId(self.1.to_owned())
+    }
+    async fn complete(
+        &self,
+        requests: Vec<semcast::model::CompletionRequest>,
+    ) -> Vec<semcast::Result<semcast::model::Completion>> {
+        self.0.complete(requests).await
+    }
+    async fn embed(&self, texts: Vec<String>) -> semcast::Result<Vec<semcast::model::Embedding>> {
+        self.0.embed(texts).await
+    }
+}
+
+fn cell_u64(batches: &[RecordBatch], name: &str) -> u64 {
+    let column = batches[0].column_by_name(name).unwrap();
+    column
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::UInt64Array>()
+        .unwrap()
+        .value(0)
+}
+
+fn cell_cost(batches: &[RecordBatch]) -> Option<f64> {
+    let column = batches[0].column_by_name("est_cost_usd").unwrap();
+    let column = column
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Float64Array>()
+        .unwrap();
+    column.is_valid(0).then(|| column.value(0))
+}
+
+#[tokio::test]
+async fn explain_refresh_shows_the_bill_without_paying_it() {
+    let model = Arc::new(MockModel::answering_yes_to(["furious"]));
+    let ctx = tickets(Arc::clone(&model)).await;
+    // A duplicate text: one question, asked once.
+    run(
+        &ctx,
+        "INSERT INTO tickets VALUES (4, 'I am furious about the outage')",
+    )
+    .await;
+    run(&ctx, ADD).await;
+
+    let before = run(&ctx, "EXPLAIN REFRESH SEMANTIC COLUMN tickets(angry)").await;
+    assert_eq!(cell_u64(&before, "rows"), 4);
+    assert_eq!(
+        cell_u64(&before, "texts"),
+        2,
+        "NULL and the duplicate don't count"
+    );
+    assert_eq!(cell_u64(&before, "stored"), 0);
+    assert_eq!(cell_u64(&before, "to_ask"), 2);
+    assert!(cell_u64(&before, "est_input_tokens") > 0);
+    assert_eq!(
+        cell_u64(&before, "est_output_tokens"),
+        16,
+        "each answer at its 8-token cap"
+    );
+    assert_eq!(cell_cost(&before), None, "the mock has no list price");
+    assert_eq!(model.completion_calls(), 0, "explaining asks nothing");
+
+    run(&ctx, "REFRESH SEMANTIC COLUMN tickets(angry)").await;
+    assert_eq!(model.completion_calls(), 2);
+    let after = run(&ctx, "EXPLAIN REFRESH SEMANTIC COLUMN tickets(angry)").await;
+    assert_eq!(cell_u64(&after, "stored"), 2);
+    assert_eq!(cell_u64(&after, "to_ask"), 0);
+    assert_eq!(cell_u64(&after, "est_input_tokens"), 0);
+}
+
+#[tokio::test]
+async fn explain_refresh_prices_a_known_model() {
+    let model = Arc::new(Priced(
+        MockModel::answering_yes_to(["furious"]),
+        "anthropic/claude-haiku-4-5",
+    ));
+    let ctx = SemcastContextBuilder::new(model).build();
+    ctx.sql(
+        "CREATE TABLE t AS SELECT * FROM (VALUES (1, 'I am furious'), (2, 'fine')) AS v(id, body)",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+    run(
+        &ctx,
+        "ALTER TABLE t ADD SEMANTIC COLUMN angry AS (body MEANS 'is angry')",
+    )
+    .await;
+    let batches = run(&ctx, "EXPLAIN REFRESH SEMANTIC COLUMN t(angry)").await;
+    let input = cell_u64(&batches, "est_input_tokens") as f64;
+    let output = cell_u64(&batches, "est_output_tokens") as f64;
+    let expected = (input * 1.0 + output * 5.0) / 1_000_000.0;
+    let cost = cell_cost(&batches).expect("Haiku 4.5 has a list price");
+    assert!((cost - expected).abs() < 1e-12, "{cost} vs {expected}");
+}
+
+/// A text repeated within one batch is asked once, whether it is read as a
+/// label or filtered on — and so the estimate's "to ask" is what is paid.
+#[tokio::test]
+async fn a_repeated_text_is_asked_once_per_batch() {
+    for sql in [
+        "SELECT id, angry FROM many",
+        "SELECT id FROM many WHERE angry",
+        "SELECT id FROM many WHERE body MEANS 'the customer is angry'",
+    ] {
+        let model = Arc::new(MockModel::answering_yes_to(["furious"]));
+        let ctx = SemcastContextBuilder::new(Arc::clone(&model) as _).build();
+        // 100 rows, two texts, one batch.
+        ctx.sql(
+            "CREATE TABLE many AS SELECT value AS id, \
+             CASE WHEN value % 2 = 0 THEN 'I am furious' ELSE 'all good' END AS body \
+             FROM generate_series(1, 100)",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+        run(
+            &ctx,
+            "ALTER TABLE many ADD SEMANTIC COLUMN angry AS (body MEANS 'the customer is angry')",
+        )
+        .await;
+        let explained = run(&ctx, "EXPLAIN REFRESH SEMANTIC COLUMN many(angry)").await;
+        assert_eq!(cell_u64(&explained, "to_ask"), 2);
+        run(&ctx, sql).await;
+        assert!(
+            model.completion_calls() <= 2 * 16,
+            "{sql}: {} calls for two texts (at most two per partition batch; without the dedupe it is one per row)",
+            model.completion_calls()
+        );
+    }
+}
