@@ -62,3 +62,35 @@ Only Movie is wired up: it is SemBench's text-only scenario. Queries are in
 - Only the `sf_2000` data SemBench ships in its repository is used. SemBench
   asks for regenerated data before publishing numbers.
 - A prompt in a query file must not contain a semicolon.
+
+## Store hits
+
+`storehit.py` replays a session against one server and one fresh `--store`
+file, and reports the share of semantic questions the store answered rather
+than the model.
+
+```sh
+uv run --project eval eval/storehit.py movie     # SemBench Movie, Q1–Q10 in order
+uv run --project eval eval/storehit.py cfpb --data data/cfpb_complaints.csv
+```
+
+A session file in `queries/sessions/` marks each statement with `-- setup` or
+`-- step: <label>`; `{data}` is replaced by `--data`. Per-step counts land in
+`results/storehit/<session>.json`.
+
+Counts are per operator, as the funnel NOTICE reports them, so read the share
+with care:
+
+- A CTE referenced twice is planned twice: the second copy's answers count as
+  stored though no earlier step paid for them. Movie Q5–Q7 self-join one, so
+  each counts its 256 reviews twice; without that the Movie share is 28.0%,
+  not the 37.1% the script prints.
+- Units are rows, not distinct texts. Verify and classify ask a text once
+  per batch, EXTRACT once per row, and the store counts every row. Half of
+  the reviews of the movie Q5–Q9 ask about are exact duplicates; counted by
+  distinct text, Movie is about 21%.
+- A multi-branch `CASE` or multi-field EXTRACT counts stored answers per
+  branch or field but calls per row.
+- A failed step reports nothing, though the calls it sent were spent and
+  later steps find their answers stored. The summary line flags failed steps.
+- With `--scorer`, scorer calls and hits count as questions too.
