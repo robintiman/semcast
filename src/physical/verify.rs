@@ -5,7 +5,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, BooleanArray, StringArray};
-use datafusion::arrow::compute::{cast, filter_record_batch};
+use datafusion::arrow::compute::{cast, concat_batches, filter_record_batch};
 use datafusion::arrow::datatypes::DataType;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::stats::Precision;
@@ -41,6 +41,11 @@ pub const MEANS_CHUNKED_PROMPT_VERSION: &str = "means-v2-chunked";
 
 /// The output cap of a yes/no verify request — a word, with room to spare.
 pub const VERIFY_MAX_TOKENS: usize = 8;
+
+/// The first wave of a verify under `LIMIT`: rows asked before checking
+/// whether enough matched. Each later wave doubles, so a limited query asks at
+/// most about twice the rows it needed, plus this.
+pub const FIRST_LIMIT_WAVE: usize = 32;
 
 /// Separates chunks in a chunked verify input; part of the cache-keyed
 /// input, so changing it invalidates exactly the chunked verdicts.
@@ -92,6 +97,9 @@ pub struct VerifyExec {
     store: Option<Arc<StoreEvidence>>,
     /// How many chunks the evidence holds per document — display only.
     chunks_per_doc: usize,
+    /// A `LIMIT` pushed down from above: each partition stops asking once
+    /// this many rows matched.
+    fetch: Option<usize>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -157,6 +165,7 @@ impl VerifyExec {
             evidence,
             store: None,
             chunks_per_doc,
+            fetch: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -184,6 +193,9 @@ impl DisplayAs for VerifyExec {
         )?;
         if self.evidence.is_some() {
             write!(f, " reads top-{} chunks per doc", self.chunks_per_doc)?;
+        }
+        if let Some(fetch) = self.fetch {
+            write!(f, " fetch={fetch}")?;
         }
         // Know the bill before you run: worst-case model calls from input
         // statistics (cache hits and NULLs are free, so this is a ceiling).
@@ -226,7 +238,30 @@ impl ExecutionPlan for VerifyExec {
             self.chunks_per_doc,
         );
         verify.store = self.store.clone();
+        verify.fetch = self.fetch;
         Ok(Arc::new(verify))
+    }
+
+    /// Take a `LIMIT` from above, so the stage stops asking once it has the
+    /// rows; without it, a whole input batch is asked before the limit sees
+    /// a single row.
+    fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        let mut verify = Self::build(
+            Arc::clone(&self.input),
+            Arc::clone(&self.text),
+            self.condition.clone(),
+            Arc::clone(&self.model),
+            Arc::clone(&self.cache),
+            self.evidence.clone(),
+            self.chunks_per_doc,
+        );
+        verify.store = self.store.clone();
+        verify.fetch = limit;
+        Some(Arc::new(verify))
+    }
+
+    fn fetch(&self) -> Option<usize> {
+        self.fetch
     }
 
     fn execute(
@@ -251,11 +286,33 @@ impl ExecutionPlan for VerifyExec {
             cache_hits: MetricBuilder::new(&self.metrics).counter("cache_hits", partition),
             rows_dropped: MetricBuilder::new(&self.metrics).counter("rows_dropped", partition),
         });
-        let stream = input.and_then(move |batch| {
-            let verifier = Arc::clone(&verifier);
-            async move { verifier.verify_batch(batch).await }
-        });
-        let output = Box::pin(RecordBatchStreamAdapter::new(self.input.schema(), stream));
+        let output: SendableRecordBatchStream = match self.fetch {
+            None => {
+                let stream = input.and_then(move |batch| {
+                    let verifier = Arc::clone(&verifier);
+                    async move { verifier.verify_batch(batch).await }
+                });
+                Box::pin(RecordBatchStreamAdapter::new(self.input.schema(), stream))
+            }
+            // Ends once `wanted` rows matched, without pulling more input.
+            Some(fetch) => {
+                let stream = futures::stream::try_unfold(
+                    (input, verifier, fetch),
+                    |(mut input, verifier, wanted)| async move {
+                        if wanted == 0 {
+                            return Ok(None);
+                        }
+                        let Some(batch) = input.try_next().await? else {
+                            return Ok(None);
+                        };
+                        let out = verifier.verify_until(batch, wanted).await?;
+                        let wanted = wanted - out.num_rows();
+                        Ok(Some((out, (input, verifier, wanted))))
+                    },
+                );
+                Box::pin(RecordBatchStreamAdapter::new(self.input.schema(), stream))
+            }
+        };
         Ok(crate::physical::trace::trace_stage(
             "VerifyExec",
             partition,
@@ -289,6 +346,26 @@ struct Verifier {
 }
 
 impl Verifier {
+    /// Verify `batch` in waves until `wanted` rows matched, returning at
+    /// most that many. The first wave is a few times the in-flight cap and
+    /// each next one doubles, so a sparse match costs few round trips and a
+    /// dense one few wasted calls.
+    async fn verify_until(&self, batch: RecordBatch, wanted: usize) -> Result<RecordBatch> {
+        let mut kept = Vec::new();
+        let (mut found, mut start) = (0, 0);
+        let mut wave = (2 * wanted).max(FIRST_LIMIT_WAVE);
+        while start < batch.num_rows() && found < wanted {
+            let len = wave.min(batch.num_rows() - start);
+            let out = self.verify_batch(batch.slice(start, len)).await?;
+            found += out.num_rows();
+            kept.push(out);
+            start += len;
+            wave = wave.saturating_mul(2);
+        }
+        let out = concat_batches(&batch.schema(), &kept)?;
+        Ok(out.slice(0, out.num_rows().min(wanted)))
+    }
+
     async fn verify_batch(&self, batch: RecordBatch) -> Result<RecordBatch> {
         if batch.num_rows() == 0 {
             return Ok(batch);
