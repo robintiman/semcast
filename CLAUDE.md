@@ -142,8 +142,9 @@ thresholded at a floor calibrated the same way. Both calibrating stages draw
 and label their sample through `src/physical/sample.rs`, so they share labels
 through the verdict cache.
 
-`src/optimizer/funnel.rs::derive_funnel` is an unimplemented stub — the funnel is
-assembled in the physical planner, not there.
+The funnel is assembled in the physical planner. `src/optimizer/funnel.rs::derive_funnel`
+prices it for `EXPLAIN` (expected verify calls, labels, list-price cost) from the
+plan's row estimate and the store's history for that filter; it decides nothing.
 
 ### Invariants worth not breaking
 

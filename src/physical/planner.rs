@@ -119,6 +119,36 @@ impl ExtensionPlanner for SemcastExtensionPlanner {
                 &self.model.id(),
                 &filter.text.to_string(),
             );
+            // What the store has seen of this filter, for the estimate below.
+            let input_rows = match physical_inputs[0]
+                .partition_statistics(None)
+                .map(|s| s.num_rows)
+            {
+                Ok(datafusion::common::stats::Precision::Exact(rows))
+                | Ok(datafusion::common::stats::Precision::Inexact(rows)) => Some(rows),
+                _ => None,
+            };
+            let prompt_chars =
+                crate::physical::verify::synthesize_means_prompt(&filter.condition).len();
+            let estimate = |index: bool, scorer: bool, chunks_per_row: Option<usize>| {
+                crate::optimizer::funnel::derive_funnel(&crate::optimizer::funnel::FunnelFacts {
+                    input_rows,
+                    index,
+                    scorer,
+                    chunks_per_row,
+                    prompt_chars,
+                    recall: filter.recall,
+                    certified: filter.confidence.is_some(),
+                    sample: DEFAULT_CALIBRATION_SAMPLE,
+                    label_budget: crate::optimizer::calibrate::CALIBRATION_LABEL_BUDGET,
+                    stats: self.cache.stats(stats_key),
+                    curve: self.cache.curve(crate::physical::verify::curve_key(
+                        stats_key,
+                        index && scorer && filter.recall.is_some(),
+                    )),
+                    model: self.model.id(),
+                })
+            };
             let looked_up: Arc<dyn ExecutionPlan> = Arc::new(StoreLookupExec::new(
                 Arc::clone(&physical_inputs[0]),
                 Arc::clone(&text),
@@ -155,6 +185,7 @@ impl ExtensionPlanner for SemcastExtensionPlanner {
                     Arc::clone(&evidence),
                 )
                 .with_store_evidence(Arc::clone(&store));
+                let mut joint = false;
                 // An index and a scorer under a recall target: one funnel,
                 // both floors chosen together (`optimizer::joint`).
                 if let Some((scorer, health)) = self
@@ -164,6 +195,7 @@ impl ExtensionPlanner for SemcastExtensionPlanner {
                     .filter(|_| has_calibration)
                 {
                     scan = scan.with_scorer(Arc::clone(scorer), Arc::clone(health));
+                    joint = true;
                 }
                 let scan = Arc::new(scan);
                 return Ok(Some(Arc::new(
@@ -176,7 +208,12 @@ impl ExtensionPlanner for SemcastExtensionPlanner {
                         evidence,
                         params.chunks_per_doc,
                     )
-                    .with_store_evidence(store),
+                    .with_store_evidence(store)
+                    .with_estimate(estimate(
+                        true,
+                        joint,
+                        Some(params.chunks_per_doc),
+                    )),
                 )));
             }
             // No index, but a scorer and a recall target: the scorer reads
@@ -219,7 +256,8 @@ impl ExtensionPlanner for SemcastExtensionPlanner {
                 Arc::clone(&self.model),
                 Arc::clone(&self.cache),
             )
-            .with_store_evidence(store);
+            .with_store_evidence(store)
+            .with_estimate(estimate(false, prefiltered, None));
             // Behind a scorer, verify sees mostly matches: its rate would
             // mislead the optimizer, and calibration's labels count instead.
             if !prefiltered {

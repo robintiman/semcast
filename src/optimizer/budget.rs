@@ -67,11 +67,16 @@ impl RecallBudgetRule {
 
     /// Where the filter's pruning curve is kept: its statistics key.
     fn curve_key(&self, filter: &SemFilterNode) -> u128 {
-        crate::physical::verify::stats_key(
+        let stats_key = crate::physical::verify::stats_key(
             &filter.condition,
             &self.runtime.model.id(),
             &filter.text.to_string(),
-        )
+        );
+        // The planner builds a joint funnel for an indexed filter when a
+        // scorer is configured (the statement has a target here).
+        let joint =
+            self.runtime.covers(&filter.text, filter.input.schema()) && self.runtime.has_scorer();
+        crate::physical::verify::curve_key(stats_key, joint)
     }
 }
 

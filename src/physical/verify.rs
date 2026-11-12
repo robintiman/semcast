@@ -101,6 +101,8 @@ pub struct VerifyExec {
     chunks_per_doc: usize,
     /// Where to record this stage's answers; see [`VerifyExec::with_stats_key`].
     stats_key: Option<u128>,
+    /// What the funnel is expected to cost, for `EXPLAIN`.
+    estimate: Option<crate::optimizer::funnel::FunnelEstimate>,
     /// A `LIMIT` pushed down from above: each partition stops asking once
     /// this many rows matched.
     fetch: Option<usize>,
@@ -170,6 +172,7 @@ impl VerifyExec {
             store: None,
             chunks_per_doc,
             stats_key: None,
+            estimate: None,
             fetch: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -192,6 +195,13 @@ impl VerifyExec {
     /// sees are mostly matches, and their rate would mislead the optimizer.
     pub fn with_stats_key(mut self, key: u128) -> Self {
         self.stats_key = Some(key);
+        self
+    }
+
+    /// The funnel's expected cost, which `EXPLAIN` prints after the ceiling
+    /// (see [`crate::optimizer::funnel`]).
+    pub fn with_estimate(mut self, estimate: crate::optimizer::funnel::FunnelEstimate) -> Self {
+        self.estimate = Some(estimate);
         self
     }
 }
@@ -220,7 +230,11 @@ impl DisplayAs for VerifyExec {
             Ok(Precision::Exact(rows)) => write!(f, "   ≤{rows} model calls"),
             Ok(Precision::Inexact(rows)) => write!(f, "   ~{rows} model calls"),
             _ => write!(f, "   model calls unknown"),
+        }?;
+        if let Some(estimate) = &self.estimate {
+            write!(f, "; {estimate}")?;
         }
+        Ok(())
     }
 }
 
@@ -253,6 +267,7 @@ impl ExecutionPlan for VerifyExec {
         verify.store = self.store.clone();
         verify.fetch = self.fetch;
         verify.stats_key = self.stats_key;
+        verify.estimate = self.estimate.clone();
         Ok(Arc::new(verify))
     }
 
@@ -272,6 +287,10 @@ impl ExecutionPlan for VerifyExec {
         verify.store = self.store.clone();
         verify.fetch = limit;
         verify.stats_key = self.stats_key;
+        verify.estimate = self.estimate.clone().map(|mut estimate| {
+            estimate.fetch = limit;
+            estimate
+        });
         Some(Arc::new(verify))
     }
 
@@ -524,6 +543,19 @@ pub fn stats_key(condition: &str, model_id: &ModelId, text: &str) -> u128 {
         MEANS_PROMPT_VERSION,
     );
     crate::cache::stable_digest(&[&question.0.to_le_bytes(), text.as_bytes()])
+}
+
+/// Where a filter's pruning curve is kept: by its statistics key, and apart
+/// for a joint index-and-scorer funnel, whose curve is cost per row with the
+/// scorer weighted in rather than a share of rows kept. A plan reads the
+/// curve of the funnel it builds, so changing the scorer setup never reads
+/// one kind as the other.
+pub fn curve_key(stats_key: u128, joint: bool) -> u128 {
+    if joint {
+        crate::cache::stable_digest(&[&stats_key.to_le_bytes(), b"joint"])
+    } else {
+        stats_key
+    }
 }
 
 /// Add fresh answers — `(matched, input characters)` each — to a question's
