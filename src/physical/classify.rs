@@ -115,6 +115,9 @@ pub struct SemClassifyExec {
     output: ClassifyOutput,
     model: Arc<dyn ModelProvider>,
     cache: Arc<dyn SemanticCache>,
+    /// Per condition, where its answers are recorded; see
+    /// [`SemClassifyExec::with_stats_keys`].
+    stats_keys: Option<Vec<u128>>,
     output_schema: SchemaRef,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
@@ -156,10 +159,21 @@ impl SemClassifyExec {
             output,
             model,
             cache,
+            stats_keys: None,
             output_schema,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         })
+    }
+
+    /// Record each condition's fresh answers under its key (see
+    /// [`crate::physical::verify::stats_key`]), one per condition in order.
+    /// Only for a label every row reaches: under a guard (`a OR x MEANS p`,
+    /// a later `CASE` branch) the rows asked are a biased few.
+    pub fn with_stats_keys(mut self, keys: Vec<u128>) -> Self {
+        debug_assert_eq!(keys.len(), self.conditions.len());
+        self.stats_keys = Some(keys);
+        self
     }
 
     fn column_names(&self) -> Vec<String> {
@@ -221,7 +235,7 @@ impl ExecutionPlan for SemClassifyExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(Self::new(
+        let mut rebuilt = Self::new(
             Arc::clone(&children[0]),
             Arc::clone(&self.text),
             self.conditions.clone(),
@@ -230,7 +244,9 @@ impl ExecutionPlan for SemClassifyExec {
             self.column_names(),
             Arc::clone(&self.model),
             Arc::clone(&self.cache),
-        )?))
+        )?;
+        rebuilt.stats_keys = self.stats_keys.clone();
+        Ok(Arc::new(rebuilt))
     }
 
     fn execute(
@@ -246,6 +262,7 @@ impl ExecutionPlan for SemClassifyExec {
             model_id: self.model.id(),
             model: Arc::clone(&self.model),
             cache: Arc::clone(&self.cache),
+            stats_keys: self.stats_keys.clone(),
             output_schema: Arc::clone(&self.output_schema),
             model_calls: MetricBuilder::new(&self.metrics).counter("model_calls", partition),
             model_calls_merged: MetricBuilder::new(&self.metrics)
@@ -294,6 +311,7 @@ struct PendingRow {
 struct Classifier {
     text: Arc<dyn PhysicalExpr>,
     conditions: Vec<String>,
+    stats_keys: Option<Vec<u128>>,
     guard: Option<Arc<dyn PhysicalExpr>>,
     model_id: ModelId,
     model: Arc<dyn ModelProvider>,
@@ -495,11 +513,10 @@ impl Classifier {
         }
         // Each branch a row was asked counts as one answer to that
         // condition, whether asked alone or fused with others.
-        for (branch, condition) in self.conditions.iter().enumerate() {
+        for (branch, key) in self.stats_keys.iter().flatten().enumerate() {
             crate::physical::verify::record_means_stats(
                 self.cache.as_ref(),
-                condition,
-                &self.model_id,
+                *key,
                 pending_rows
                     .iter()
                     .zip(&completions)

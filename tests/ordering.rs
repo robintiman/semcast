@@ -9,8 +9,7 @@ use datafusion::execution::context::SessionContext;
 use semcast::SemcastContextBuilder;
 use semcast::cache::{AskStats, InMemoryCache, SemanticCache};
 use semcast::model::{MockModel, ModelId};
-use semcast::physical::verify::MEANS_PROMPT_VERSION;
-use semcast::semir::{AskType, question_id};
+use semcast::physical::verify::stats_key;
 
 /// `name(id, subject, body)`: `subject` mentions "refund" in most rows,
 /// `body` in one in ten. The mock answers yes to "refund" in either.
@@ -48,28 +47,34 @@ const QUERY: &str = "SELECT count(*) AS n FROM tickets \
 
 #[tokio::test]
 async fn statistics_put_the_rarer_filter_first() {
-    // Written order asks every subject (100), then the 90 that matched:
-    // 190 calls. Seen from earlier answers, `body` is the rarer: asked
-    // first, it leaves 10 rows for `subject`, 110 calls.
+    // History from the table's first 50 rows; then 100 new rows arrive. In
+    // written order the new rows cost every subject (100), then the 90 that
+    // matched: 190 calls. Seen from history, `body` is the rarer: asked
+    // first, it leaves 10 rows for `subject`, 110 calls. Old rows are cached
+    // either way.
     let model = Arc::new(MockModel::answering_yes_to(["refund"]));
     let ctx = SemcastContextBuilder::new(Arc::clone(&model) as _).build();
-    table(&ctx, "seed", 50).await;
-    table(&ctx, "tickets", 100).await;
-
+    table(&ctx, "tickets", 50).await;
     run(
         &ctx,
-        "SELECT count(*) FROM seed WHERE subject MEANS 'asks for money back'",
+        "SELECT count(*) FROM tickets WHERE subject MEANS 'asks for money back'",
     )
     .await;
     run(
         &ctx,
-        "SELECT count(*) FROM seed WHERE body MEANS 'mentions a refund'",
+        "SELECT count(*) FROM tickets WHERE body MEANS 'mentions a refund'",
+    )
+    .await;
+    table(&ctx, "fresh", 100).await;
+    run(
+        &ctx,
+        "INSERT INTO tickets SELECT id + 1000, subject, body FROM fresh",
     )
     .await;
     let seeded = model.completion_calls();
 
     let out = run(&ctx, QUERY).await;
-    assert!(out.contains("| 10 "), "{out}");
+    assert!(out.contains("| 15 "), "{out}");
     assert_eq!(model.completion_calls() - seeded, 110);
 }
 
@@ -90,9 +95,8 @@ async fn stacked_conditions_on_one_column_go_rarest_first() {
     let cache = Arc::new(InMemoryCache::default());
     let model = ModelId("mock".to_owned());
     let seed = |condition: &str, matched: u64| {
-        let question = question_id(condition, AskType::Bool, &model, MEANS_PROMPT_VERSION).0;
         cache.record_stats(
-            question,
+            stats_key(condition, &model, "tickets.body"),
             AskStats {
                 asked: 100,
                 matched,
@@ -161,4 +165,32 @@ fn statistics_survive_reopening_the_store() {
         })
     );
     assert_eq!(store.stats(8), None);
+}
+
+#[tokio::test]
+async fn a_condition_without_history_does_not_jump_a_known_rare_one() {
+    // `body` is known to match 5% of long texts; `subject` has no history.
+    // Assumed to read as much as `body` and to match half, it stays behind.
+    let cache = Arc::new(InMemoryCache::default());
+    cache.record_stats(
+        stats_key("is rare", &ModelId("mock".to_owned()), "tickets.body"),
+        AskStats {
+            asked: 100,
+            matched: 5,
+            input_chars: 400_000,
+        },
+    );
+    let ctx = SemcastContextBuilder::new(Arc::new(MockModel::answering_yes_to(["x"])))
+        .with_cache(Arc::clone(&cache) as _)
+        .build();
+    table(&ctx, "tickets", 10).await;
+    let plan = run(
+        &ctx,
+        "EXPLAIN SELECT id FROM tickets \
+         WHERE subject MEANS 'is half' AND body MEANS 'is rare'",
+    )
+    .await;
+    let half = plan.find("SemFilter: MEANS('is half')").expect("planned");
+    let rare = plan.find("SemFilter: MEANS('is rare')").expect("planned");
+    assert!(half < rare, "the rare filter runs first, below: {plan}");
 }

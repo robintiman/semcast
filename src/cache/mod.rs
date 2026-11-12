@@ -54,10 +54,18 @@ pub enum CachedValue {
     Error(String),
 }
 
-/// What the model has answered for one question (a SemIR `question_id`):
-/// how often it was asked, how often it said yes, and how much text it read.
-/// The optimizer orders filters by it; it never decides an answer, so a
-/// count that is slightly off costs calls, not rows.
+/// What the model has answered for one question about one text column (see
+/// `physical::verify::stats_key`): how often it was asked, how often it said
+/// yes, and how much text it read. The optimizer orders filters by it; it
+/// never decides an answer, so a count that is slightly off costs calls,
+/// not rows.
+///
+/// Recorded only where the rows asked are an unbiased view of the condition:
+/// a verify nothing pre-filters, calibration's full-text labels (a uniform
+/// sample), and an unguarded label. Not by a verify behind an index or
+/// scorer (mostly matches), a guarded label, a scorer, or `CONFIDENCE()`.
+/// A filter stacked behind another still sees only that one's survivors, so
+/// its rate is conditional on it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AskStats {
     pub asked: u64,

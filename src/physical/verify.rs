@@ -99,6 +99,8 @@ pub struct VerifyExec {
     store: Option<Arc<StoreEvidence>>,
     /// How many chunks the evidence holds per document — display only.
     chunks_per_doc: usize,
+    /// Where to record this stage's answers; see [`VerifyExec::with_stats_key`].
+    stats_key: Option<u128>,
     /// A `LIMIT` pushed down from above: each partition stops asking once
     /// this many rows matched.
     fetch: Option<usize>,
@@ -167,6 +169,7 @@ impl VerifyExec {
             evidence,
             store: None,
             chunks_per_doc,
+            stats_key: None,
             fetch: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -181,6 +184,14 @@ impl VerifyExec {
     /// [`StoreLookupExec`]: crate::physical::StoreLookupExec
     pub fn with_store_evidence(mut self, store: Arc<StoreEvidence>) -> Self {
         self.store = Some(store);
+        self
+    }
+
+    /// Record this stage's fresh answers under `key` (see [`stats_key`]).
+    /// Only for a verify no index or scorer feeds: behind one, the rows it
+    /// sees are mostly matches, and their rate would mislead the optimizer.
+    pub fn with_stats_key(mut self, key: u128) -> Self {
+        self.stats_key = Some(key);
         self
     }
 }
@@ -241,6 +252,7 @@ impl ExecutionPlan for VerifyExec {
         );
         verify.store = self.store.clone();
         verify.fetch = self.fetch;
+        verify.stats_key = self.stats_key;
         Ok(Arc::new(verify))
     }
 
@@ -259,6 +271,7 @@ impl ExecutionPlan for VerifyExec {
         );
         verify.store = self.store.clone();
         verify.fetch = limit;
+        verify.stats_key = self.stats_key;
         Some(Arc::new(verify))
     }
 
@@ -282,6 +295,7 @@ impl ExecutionPlan for VerifyExec {
             cache: Arc::clone(&self.cache),
             evidence: self.evidence.clone(),
             store: self.store.clone(),
+            stats_key: self.stats_key,
             model_calls: MetricBuilder::new(&self.metrics).counter("model_calls", partition),
             model_calls_merged: MetricBuilder::new(&self.metrics)
                 .counter("model_calls_merged", partition),
@@ -331,6 +345,7 @@ impl ExecutionPlan for VerifyExec {
 /// cheap to clone.
 struct Verifier {
     store: Option<Arc<StoreEvidence>>,
+    stats_key: Option<u128>,
     text: Arc<dyn PhysicalExpr>,
     condition: String,
     prompt: String,
@@ -440,18 +455,19 @@ impl Verifier {
         self.model_calls_merged
             .add(crate::physical::verify::merged_calls(&verdicts));
         debug_assert_eq!(verdicts.len(), pending.len());
-        record_means_stats(
-            self.cache.as_ref(),
-            &self.condition,
-            &self.model_id,
-            pending
-                .iter()
-                .zip(&verdicts)
-                .filter_map(|((_, input, _), verdict)| {
-                    let matched = parse_verdict(&verdict.as_ref().ok()?.text)?;
-                    Some((matched, input.len()))
-                }),
-        );
+        if let Some(key) = self.stats_key {
+            record_means_stats(
+                self.cache.as_ref(),
+                key,
+                pending
+                    .iter()
+                    .zip(&verdicts)
+                    .filter_map(|((_, input, _), verdict)| {
+                        let matched = parse_verdict(&verdict.as_ref().ok()?.text)?;
+                        Some((matched, input.len()))
+                    }),
+            );
+        }
         for ((row, input, chunked), verdict) in pending.iter().zip(&verdicts) {
             match verdict
                 .as_ref()
@@ -496,25 +512,25 @@ impl Verifier {
     }
 }
 
-/// The question a `MEANS` condition asks of `model`, as its statistics are
-/// kept: one per condition and model, whichever prompt asked it (full text,
-/// chunks, or fused with others), since all of them answer it.
-pub(crate) fn means_question(condition: &str, model_id: &ModelId) -> u128 {
-    crate::semir::question_id(
+/// Where a `MEANS` condition's statistics are kept: the question (condition
+/// and model) asked of one text column, named as the logical plan prints it
+/// (`tickets.body`). Per column, because a condition's match rate and input
+/// size on one column say little about another.
+pub fn stats_key(condition: &str, model_id: &ModelId, text: &str) -> u128 {
+    let question = crate::semir::question_id(
         condition,
         crate::semir::AskType::Bool,
         model_id,
         MEANS_PROMPT_VERSION,
-    )
-    .0
+    );
+    crate::cache::stable_digest(&[&question.0.to_le_bytes(), text.as_bytes()])
 }
 
-/// Add fresh answers — `(matched, input characters)` each — to the
-/// condition's statistics. Cache hits are not answers and are not passed.
+/// Add fresh answers — `(matched, input characters)` each — to a question's
+/// statistics. Cache hits are not answers and are not passed.
 pub(crate) fn record_means_stats(
     cache: &dyn SemanticCache,
-    condition: &str,
-    model_id: &ModelId,
+    key: u128,
     answers: impl IntoIterator<Item = (bool, usize)>,
 ) {
     let mut delta = crate::cache::AskStats::default();
@@ -524,7 +540,7 @@ pub(crate) fn record_means_stats(
         delta.input_chars += chars as u64;
     }
     if delta.asked > 0 {
-        cache.record_stats(means_question(condition, model_id), delta);
+        cache.record_stats(key, delta);
     }
 }
 

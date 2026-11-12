@@ -78,9 +78,10 @@ pub struct SqliteCache {
     messages: Option<Sender<Message>>,
     writer: Option<JoinHandle<()>>,
     /// Statistics recorded but not yet committed, added to what disk holds
-    /// when read. The writer subtracts them once committed, so a read racing
-    /// that moment may count a batch twice: statistics order filters, never
-    /// decide rows, so that costs at most a call.
+    /// when read. The writer subtracts them once committed (or failed: a
+    /// statistics write is not retried), so a read racing that moment may
+    /// count a batch twice or miss it: statistics order filters, never
+    /// decide rows, so that costs at most some calls.
     pending_stats: Arc<Mutex<HashMap<u128, AskStats>>>,
 }
 
@@ -239,6 +240,9 @@ fn write_loop(
                     entry.asked = entry.asked.saturating_sub(delta.asked);
                     entry.matched = entry.matched.saturating_sub(delta.matched);
                     entry.input_chars = entry.input_chars.saturating_sub(delta.input_chars);
+                    if entry.asked == 0 {
+                        pending.remove(question);
+                    }
                 }
             }
         }
@@ -598,16 +602,17 @@ pub(crate) fn open_store(path: &Path) -> Result<Connection> {
                      embed_model TEXT NOT NULL,
                      vector      BLOB NOT NULL
                  ) WITHOUT ROWID;
-                 -- Which chunks each semantic index holds, and the embedding
-                 -- each one reads. Added in place: an older build ignores it.
-                 -- What the model answered per question, for ordering
-                 -- filters. Added in place: an older build ignores it.
+                 -- What the model answered per question and text column,
+                 -- for ordering filters. Added in place: an older build
+                 -- ignores it.
                  CREATE TABLE IF NOT EXISTS ask_stats (
                      question    BLOB PRIMARY KEY,
                      asked       INTEGER NOT NULL,
                      matched     INTEGER NOT NULL,
                      input_chars INTEGER NOT NULL
                  ) WITHOUT ROWID;
+                 -- Which chunks each semantic index holds, and the embedding
+                 -- each one reads. Added in place: an older build ignores it.
                  CREATE TABLE IF NOT EXISTS index_chunks (
                      index_name  TEXT NOT NULL,
                      doc_hash    INTEGER NOT NULL,

@@ -112,6 +112,13 @@ impl ExtensionPlanner for SemcastExtensionPlanner {
             // already answered is settled before any pre-filter or call, and
             // the later stages honour its "yes" (see `StoreLookupExec`).
             let store = Arc::new(StoreEvidence::default());
+            // Where this condition's answers on this column are counted, by
+            // the stages that see an unbiased view of it.
+            let stats_key = crate::physical::verify::stats_key(
+                &filter.condition,
+                &self.model.id(),
+                &filter.text.to_string(),
+            );
             let looked_up: Arc<dyn ExecutionPlan> = Arc::new(StoreLookupExec::new(
                 Arc::clone(&physical_inputs[0]),
                 Arc::clone(&text),
@@ -134,6 +141,7 @@ impl ExtensionPlanner for SemcastExtensionPlanner {
                     sample_size: DEFAULT_CALIBRATION_SAMPLE,
                     model: Arc::clone(&self.model),
                     cache: Arc::clone(&self.cache),
+                    stats_key: Some(stats_key),
                 });
                 let evidence = Arc::new(ChunkEvidence::default());
                 let scan = Arc::new(
@@ -166,6 +174,7 @@ impl ExtensionPlanner for SemcastExtensionPlanner {
             // a target there is nothing to calibrate against, and the scorer
             // stays out of the way.
             let mut input = looked_up;
+            let mut prefiltered = false;
             // A scorer that is the session model would save nothing, and
             // under one id its answers are the session model's verdicts.
             let scorer = self
@@ -186,21 +195,27 @@ impl ExtensionPlanner for SemcastExtensionPlanner {
                             sample_size: DEFAULT_CALIBRATION_SAMPLE,
                             model: Arc::clone(&self.model),
                             cache: Arc::clone(&self.cache),
+                            stats_key: Some(stats_key),
                         },
                     )
                     .with_store_evidence(Arc::clone(&store)),
                 );
+                prefiltered = true;
             }
-            return Ok(Some(Arc::new(
-                VerifyExec::new(
-                    input,
-                    text,
-                    filter.condition.clone(),
-                    Arc::clone(&self.model),
-                    Arc::clone(&self.cache),
-                )
-                .with_store_evidence(store),
-            )));
+            let mut verify = VerifyExec::new(
+                input,
+                text,
+                filter.condition.clone(),
+                Arc::clone(&self.model),
+                Arc::clone(&self.cache),
+            )
+            .with_store_evidence(store);
+            // Behind a scorer, verify sees mostly matches: its rate would
+            // mislead the optimizer, and calibration's labels count instead.
+            if !prefiltered {
+                verify = verify.with_stats_key(stats_key);
+            }
+            return Ok(Some(Arc::new(verify)));
         }
         if let Some(distinct) = node.as_any().downcast_ref::<SemDistinctNode>() {
             let schema = logical_inputs[0].schema();
@@ -266,7 +281,8 @@ impl ExtensionPlanner for SemcastExtensionPlanner {
                 .as_ref()
                 .map(|guard| planner.create_physical_expr(guard, schema, session_state))
                 .transpose()?;
-            return Ok(Some(Arc::new(SemClassifyExec::new(
+            let unguarded = guard.is_none();
+            let mut exec = SemClassifyExec::new(
                 Arc::clone(&physical_inputs[0]),
                 text,
                 classify.conditions.clone(),
@@ -275,7 +291,20 @@ impl ExtensionPlanner for SemcastExtensionPlanner {
                 classify.column_names(),
                 Arc::clone(&self.model),
                 Arc::clone(&self.cache),
-            )?)));
+            )?;
+            // Every row reaches an unguarded label, so its answers are the
+            // condition's own rate on this column.
+            if unguarded {
+                let text = classify.text.to_string();
+                exec = exec.with_stats_keys(
+                    classify
+                        .conditions
+                        .iter()
+                        .map(|c| crate::physical::verify::stats_key(c, &self.model.id(), &text))
+                        .collect(),
+                );
+            }
+            return Ok(Some(Arc::new(exec)));
         }
         if let Some(rank) = node.as_any().downcast_ref::<SemRankNode>() {
             let text = planner.create_physical_expr(

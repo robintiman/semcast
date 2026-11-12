@@ -148,7 +148,8 @@ you wrote them: one whose column has a semantic index prunes for free, so it
 runs before one that pays for every row. Among the rest, the store remembers
 how often each condition matched and how long its texts were, so the one that
 drops the most rows per call runs first. With no history, written order
-stands.
+stands. History grows as queries run, so `EXPLAIN` shows the order a query
+would use now, and a later run may choose another.
 
 Several over the *same* column are asked in **one call per row** instead of one
 call per predicate per surviving row — the same fusion a `CASE` gets. An

@@ -360,30 +360,36 @@ impl MeansRewriteRule {
 /// the synthesized instruction around the condition.
 const PROMPT_CHARS: f64 = 250.0;
 
-/// Input characters assumed for a condition the store has no answers for.
-const UNKNOWN_CHARS: f64 = 1000.0;
-
 /// Selectivity assumed for a condition the store has no answers for.
 const UNKNOWN_SELECTIVITY: f64 = 0.5;
 
 impl MeansRewriteRule {
     /// What the store has recorded for one condition asked of the session
-    /// model: selectivity and characters per ask, when it has answers.
-    fn condition_stats(&self, condition: &str) -> Option<crate::cache::AskStats> {
-        let question = crate::physical::verify::means_question(condition, &self.runtime.model.id());
-        self.runtime.cache().stats(question).filter(|s| s.asked > 0)
+    /// model about `text`: selectivity and characters per ask.
+    fn condition_stats(&self, condition: &str, text: &Expr) -> Option<crate::cache::AskStats> {
+        let key = crate::physical::verify::stats_key(
+            condition,
+            &self.runtime.model.id(),
+            &text.to_string(),
+        );
+        self.runtime.cache().stats(key).filter(|s| s.asked > 0)
     }
 
     /// Order stages so the cheapest way to drop rows runs first: each group by
     /// `(selectivity - 1) / cost`, lowest first, the classic rank for
     /// ordering independent filters (a stage that removes much for little
-    /// goes early). Selectivity is the product of a group's conditions'; cost
-    /// is characters per ask plus the prompt. Within a stacked group, the
-    /// rarer condition goes first: same text, same cost.
+    /// goes early). Selectivity is the product of a group's conditions';
+    /// cost is characters per ask (plus the prompt) times the calls a row
+    /// costs: one for a fused group, one per condition still standing for a
+    /// stacked one. Within a stacked group the rarer condition goes first:
+    /// same text, same cost.
     ///
-    /// Ordering never changes which rows come back, only what they cost, so
-    /// rough statistics are safe. With none for any condition here, the
-    /// written order stands.
+    /// A condition with no statistics is assumed to match half its rows and
+    /// to read as much text as the known ones here, so lacking history never
+    /// makes a group look cheaper than one that has it. Ordering never
+    /// changes which rows come back, only what they cost, so rough
+    /// statistics are safe. With none for any condition here, the written
+    /// order stands.
     fn order_by_stats(&self, groups: &mut [TextGroup]) {
         let stats: Vec<Vec<Option<crate::cache::AskStats>>> = groups
             .iter()
@@ -391,7 +397,7 @@ impl MeansRewriteRule {
                 group
                     .specs
                     .iter()
-                    .map(|(condition, _, _)| self.condition_stats(condition))
+                    .map(|(condition, _, _)| self.condition_stats(condition, &group.text))
                     .collect()
             })
             .collect();
@@ -407,18 +413,42 @@ impl MeansRewriteRule {
             specs.sort_by(|(_, a), (_, b)| selectivity(a).total_cmp(&selectivity(b)));
             group.specs = specs.into_iter().map(|(spec, _)| spec).collect();
         }
-        let ranks: Vec<f64> = stats
+        let group_chars: Vec<Option<f64>> = stats
             .iter()
             .map(|group_stats| {
-                let kept: f64 = group_stats.iter().map(selectivity).product();
-                let chars = group_stats
+                group_stats
                     .iter()
                     .filter_map(|s| s.and_then(|s| s.chars_per_ask()))
                     .fold(None, |max: Option<f64>, c| {
                         Some(max.map_or(c, |m| m.max(c)))
                     })
-                    .unwrap_or(UNKNOWN_CHARS);
-                (kept - 1.0) / (chars + PROMPT_CHARS)
+            })
+            .collect();
+        let known: Vec<f64> = group_chars.iter().flatten().copied().collect();
+        let typical_chars = known.iter().sum::<f64>() / known.len().max(1) as f64;
+        let ranks: Vec<f64> = groups
+            .iter()
+            .zip(&stats)
+            .zip(&group_chars)
+            .map(|((group, group_stats), chars)| {
+                let mut rates: Vec<f64> = group_stats.iter().map(selectivity).collect();
+                rates.sort_by(f64::total_cmp);
+                let kept: f64 = rates.iter().product();
+                // Calls per row: a fused group asks once; a stacked one asks
+                // each condition of the rows the earlier ones kept.
+                let calls = if group.fusable() {
+                    1.0
+                } else {
+                    let mut standing = 1.0;
+                    let mut calls = 0.0;
+                    for rate in &rates {
+                        calls += standing;
+                        standing *= rate;
+                    }
+                    calls
+                };
+                let chars = chars.unwrap_or(typical_chars);
+                (kept - 1.0) / ((chars + PROMPT_CHARS) * calls)
             })
             .collect();
         let mut order: Vec<usize> = (0..groups.len()).collect();
