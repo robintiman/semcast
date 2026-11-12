@@ -142,7 +142,10 @@ impl ExtensionPlanner for SemcastExtensionPlanner {
                     sample: DEFAULT_CALIBRATION_SAMPLE,
                     label_budget: crate::optimizer::calibrate::CALIBRATION_LABEL_BUDGET,
                     stats: self.cache.stats(stats_key),
-                    curve: self.cache.curve(stats_key),
+                    curve: self.cache.curve(crate::physical::verify::curve_key(
+                        stats_key,
+                        index && scorer && filter.recall.is_some(),
+                    )),
                     model: self.model.id(),
                 })
             };

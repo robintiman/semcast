@@ -777,7 +777,9 @@ impl Scanner {
             if let Some(curve) =
                 crate::optimizer::budget::curve_from(&scored, always, lost, &population)
             {
-                calibration.cache.record_curve(key, curve);
+                calibration
+                    .cache
+                    .record_curve(crate::physical::verify::curve_key(key, false), curve);
             }
         }
         chunks.retain(|hash, _| {
@@ -1089,9 +1091,10 @@ impl Scanner {
                 .collect();
             let has_match = labels.iter().any(|(_, label)| *label == Some(true));
             if has_match && population.len() + unindexed > 0 {
-                calibration
-                    .cache
-                    .record_curve(key, crate::optimizer::budget::monotone(curve));
+                calibration.cache.record_curve(
+                    crate::physical::verify::curve_key(key, true),
+                    crate::optimizer::budget::monotone(curve),
+                );
             }
         }
         chunks.retain(|hash, _| {

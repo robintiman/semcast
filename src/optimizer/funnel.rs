@@ -122,7 +122,9 @@ pub fn derive_funnel(facts: &FunnelFacts) -> FunnelEstimate {
         };
         let prompt = facts.prompt_chars as f64;
         let labels = labels.unwrap_or(0) as f64;
-        let verify = verify_calls?;
+        // A joint funnel's count mixes in scorer work: only its labels are
+        // the session model's alone.
+        let verify = if joint { 0.0 } else { verify_calls? };
         let input_tokens = (verify * (read + prompt) + labels * (full + prompt)) / 4.0;
         let output_tokens = (verify + labels) * ANSWER_TOKENS;
         Some((input_tokens * input_price + output_tokens * output_price) / 1e6)
@@ -144,22 +146,40 @@ pub fn derive_funnel(facts: &FunnelFacts) -> FunnelEstimate {
 /// it to 0 or 100.
 fn percent(share: f64) -> String {
     let p = share * 100.0;
-    if p > 0.0 && p < 1.0 || p > 99.0 && p < 100.0 {
-        format!("{p:.1}%")
+    // Decimals until a share that is neither nothing nor everything stops
+    // reading as one.
+    for decimals in 0..=3 {
+        let text = format!("{p:.decimals$}");
+        let shown: f64 = text.parse().unwrap_or(p);
+        let misleads = (shown == 0.0 && p > 0.0) || (shown == 100.0 && p < 100.0);
+        if !misleads {
+            return format!("{text}%");
+        }
+    }
+    if p < 50.0 {
+        "<0.001%".to_owned()
     } else {
-        format!("{p:.0}%")
+        ">99.999%".to_owned()
     }
 }
 
 /// Dollars to two significant figures, so a small cost isn't shown as zero.
 fn dollars(cost: f64) -> String {
-    if cost == 0.0 {
-        "$0".to_owned()
-    } else if cost >= 0.01 {
-        format!("${cost:.2}")
+    if cost <= 0.0 {
+        return "$0".to_owned();
+    }
+    if cost >= 10.0 {
+        return format!("${cost:.0}");
+    }
+    let magnitude = cost.log10().floor() as i32;
+    let decimals = (1 - magnitude).max(0) as usize;
+    let text = format!("{cost:.decimals$}");
+    // Rounding up to the next power of ten adds a digit: drop it.
+    let rounded: f64 = text.parse().unwrap_or(cost);
+    if rounded >= 10f64.powi(magnitude + 1) && decimals > 0 {
+        format!("${rounded:.prec$}", prec = decimals - 1)
     } else {
-        let digits = (-cost.log10()).ceil() as usize + 1;
-        format!("${cost:.digits$}")
+        format!("${text}")
     }
 }
 
@@ -201,6 +221,11 @@ impl std::fmt::Display for FunnelEstimate {
             write!(f, ", fewer under LIMIT {fetch}")?;
         }
         match self.cost_usd {
+            Some(cost) if self.joint => write!(
+                f,
+                ", labels ~{} at list price (verify and scorer not priced)",
+                dollars(cost)
+            ),
             Some(cost) => write!(f, ", session model ~{} at list price", dollars(cost)),
             None => write!(f, ", cost unknown"),
         }
@@ -310,6 +335,7 @@ mod tests {
             shown.contains("~200 verify-equivalent calls (20% of rows, verify + scorer"),
             "{shown}"
         );
+        assert!(shown.contains("verify and scorer not priced"), "{shown}");
     }
 
     #[test]
@@ -328,8 +354,12 @@ mod tests {
         assert_eq!(percent(0.004), "0.4%");
         assert_eq!(percent(0.2), "20%");
         assert_eq!(dollars(0.00001234), "$0.000012");
-        assert_eq!(dollars(1.5), "$1.50");
+        assert_eq!(dollars(1.5), "$1.5");
+        assert_eq!(dollars(0.0123), "$0.012");
+        assert_eq!(dollars(0.0099999), "$0.010");
         assert_eq!(dollars(0.0), "$0");
+        assert_eq!(percent(0.9996), "99.96%");
+        assert_eq!(percent(0.0004), "0.04%");
     }
 
     #[test]

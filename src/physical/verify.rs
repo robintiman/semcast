@@ -545,6 +545,19 @@ pub fn stats_key(condition: &str, model_id: &ModelId, text: &str) -> u128 {
     crate::cache::stable_digest(&[&question.0.to_le_bytes(), text.as_bytes()])
 }
 
+/// Where a filter's pruning curve is kept: by its statistics key, and apart
+/// for a joint index-and-scorer funnel, whose curve is cost per row with the
+/// scorer weighted in rather than a share of rows kept. A plan reads the
+/// curve of the funnel it builds, so changing the scorer setup never reads
+/// one kind as the other.
+pub fn curve_key(stats_key: u128, joint: bool) -> u128 {
+    if joint {
+        crate::cache::stable_digest(&[&stats_key.to_le_bytes(), b"joint"])
+    } else {
+        stats_key
+    }
+}
+
 /// Add fresh answers — `(matched, input characters)` each — to a question's
 /// statistics. Cache hits are not answers and are not passed.
 pub(crate) fn record_means_stats(

@@ -462,7 +462,9 @@ impl Scanner {
             if let Some(curve) =
                 crate::optimizer::budget::curve_from(&scored, always, 0, &population)
             {
-                self.calibration.cache.record_curve(key, curve);
+                self.calibration
+                    .cache
+                    .record_curve(crate::physical::verify::curve_key(key, false), curve);
             }
         }
         // A sampled match is already paid for, and a failed label may be
