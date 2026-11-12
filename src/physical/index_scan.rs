@@ -12,11 +12,16 @@
 //!
 //! The target covers verify too. Verify reads a survivor's best chunks, and
 //! a match whose evidence sits elsewhere is lost at any floor, so each
-//! sampled match is also asked the chunked question verify will ask (keyed
-//! identically, so verify finds it cached). A chunked miss or failure counts
-//! as a lost match. When chunks cannot meet the target, the scan tells
-//! verify (through [`ChunkEvidence`]) to read the full text instead, whose
-//! answers the labels are, leaving only the floor's losses to certify.
+//! sampled document that may be a match (labelled yes, or whose label
+//! failed) is also asked the chunked question verify will ask. A chunked
+//! miss or failure counts as a lost match. The sampled rows themselves are
+//! decided by their full-text labels; the chunked answers measure what
+//! verify will do to the rows outside the sample (and are cached, so a
+//! repeat calibration doesn't pay for them twice). When chunks cannot meet
+//! the target and the full text does better, the scan tells verify (through
+//! [`ChunkEvidence`]) to read the full text instead, whose answers the labels
+//! are, leaving only the floor's losses to certify. Choosing between the two
+//! on one sample is two tests, so each is run at half the error budget.
 //!
 //! [`VerifyExec`]: crate::physical::VerifyExec
 
@@ -64,9 +69,11 @@ use crate::physical::store_lookup::StoreEvidence;
 /// assumes the worst for it at each floor (see
 /// [`SampledScores::unverified_scores`]).
 ///
-/// `verify_misses` are the matches verify would still reject (chunked verify
-/// said no, or failed): lost at any floor, so the certificate covers the
-/// floor and verify together.
+/// `verify_misses` are documents chunked verify said no to, or failed on:
+/// verify would reject them at any floor, so a match among them is lost and
+/// the certificate covers the floor and verify together. A document whose
+/// label failed is assumed a match when chunked verify would reject it, since
+/// the floor keeping it no longer saves it.
 fn score_labels(
     labels: &[Label],
     per_doc_best: &HashMap<u64, f32>,
@@ -83,6 +90,7 @@ fn score_labels(
             Some(false) => continue,
             None => {
                 match per_doc_best.get(&hash) {
+                    Some(_) if verify_misses.contains(&hash) => scores.positive_lost += 1,
                     Some(&score) => scores.unverified_scores.push(score),
                     None if indexed.contains(&hash) => scores.positive_lost += 1,
                     // Never indexed: passes through at any floor, so it is
@@ -327,6 +335,8 @@ impl ExecutionPlan for IndexScanExec {
                 .counter("calibration_model_calls_merged", partition),
             calibration_label_errors: MetricBuilder::new(&self.metrics)
                 .counter("calibration_label_errors", partition),
+            calibration_chunk_checks: MetricBuilder::new(&self.metrics)
+                .counter("calibration_chunk_checks", partition),
             calibration_verify_misses: MetricBuilder::new(&self.metrics)
                 .counter("calibration_verify_misses", partition),
             calibration_full_text: MetricBuilder::new(&self.metrics)
@@ -394,7 +404,9 @@ struct Scanner {
     /// Of `calibration_model_calls`, those merged onto an identical call.
     calibration_model_calls_merged: Count,
     calibration_label_errors: Count,
-    /// Sampled matches chunked verify would reject or failed on.
+    /// Sampled documents asked the chunked question verify would ask.
+    calibration_chunk_checks: Count,
+    /// Of those, the ones chunked verify rejected or failed on.
     calibration_verify_misses: Count,
     /// 1 when calibration switched verify to the full text.
     calibration_full_text: Count,
@@ -560,9 +572,18 @@ impl Scanner {
         let mut labels: Vec<Label> = Vec::new();
         let mut labelled = 0;
         let mut attempt: Option<(Calibration, HashMap<u64, f32>)> = None;
-        // What chunked verify answers for each sampled match it would read
-        // chunks of: a match it rejects is lost whatever the floor.
+        let mut full_text = false;
+        // What chunked verify answers for each sampled document that may be
+        // a match (labelled yes, or failed) and has chunks to read: one it
+        // rejects is lost whatever the floor.
         let mut chunked: HashMap<u64, Option<bool>> = HashMap::new();
+        // Two pipelines are tried on one sample, chunked verify and full-text
+        // verify, and the one that certifies is kept: each is tested at half
+        // the error budget, so the certificate holds at the confidence asked.
+        let per_mode = CalibrationConfig {
+            confidence: calibration.confidence.map(|c| 1.0 - (1.0 - c) / 2.0),
+            ..calibration.clone()
+        };
         while labelled < pool.len() {
             let tranche = (labelled + calibration.sample_size).min(pool.len());
             let new_labels = self
@@ -570,25 +591,42 @@ impl Scanner {
                 .await;
             let to_check: Vec<(u64, Vec<String>)> = new_labels
                 .iter()
-                .filter(|(_, label)| *label == Some(true))
+                .filter(|(_, label)| *label != Some(false))
                 .filter_map(|(text, _)| {
                     let hash = doc_hash(text);
                     Some((hash, chunks.get(&hash)?.clone()))
                 })
                 .filter(|(hash, _)| !chunked.contains_key(hash))
                 .collect();
+            self.calibration_chunk_checks.add(to_check.len());
             chunked.extend(self.ask_chunked(calibration, &to_check).await);
             labels.extend(new_labels);
             labelled = tranche;
 
-            let outcome = self.calibrate_over_best_proxy(
-                calibration,
-                &labels,
-                &per_doc_best,
-                &indexed,
-                &vectors,
-                &verify_misses(&chunked),
-            );
+            let calibrate = |misses: &HashSet<u64>| {
+                self.calibrate_over_best_proxy(
+                    &per_mode,
+                    &labels,
+                    &per_doc_best,
+                    &indexed,
+                    &vectors,
+                    misses,
+                )
+            };
+            let reading_chunks = calibrate(&verify_misses(&chunked));
+            let reading_text = calibrate(&HashSet::new());
+            // Chunks when they meet the target, being cheaper; else full text
+            // when it does better. Labels are full-text verdicts, so reading
+            // the full text leaves only the floor's losses.
+            let text_wins = !reading_chunks.0.meets(calibration.target_recall)
+                && (reading_text.0.meets(calibration.target_recall)
+                    || recall_of(&reading_text.0) > recall_of(&reading_chunks.0));
+            let outcome = if text_wins {
+                reading_text
+            } else {
+                reading_chunks
+            };
+            full_text = text_wins;
             let settled =
                 calibration.confidence.is_none() || outcome.0.meets(calibration.target_recall);
             attempt = Some(outcome);
@@ -597,30 +635,13 @@ impl Scanner {
             }
         }
         self.calibration_sampled_rows.add(labels.len());
-        let misses = verify_misses(&chunked);
-        self.calibration_verify_misses.add(misses.len());
-        // Chunked verify loses too many matches for the target, whatever the
-        // floor: verify reads the full text instead, which the labels are
-        // verdicts of, so only the floor's losses remain to certify.
-        let mut full_text = false;
-        if let Some((outcome, _)) = &attempt
-            && !misses.is_empty()
-            && !outcome.meets(calibration.target_recall)
-        {
-            full_text = true;
+        self.calibration_verify_misses
+            .add(verify_misses(&chunked).len());
+        if full_text {
             self.calibration_full_text.add(1);
-            attempt = Some(self.calibrate_over_best_proxy(
-                calibration,
-                &labels,
-                &per_doc_best,
-                &indexed,
-                &vectors,
-                &HashSet::new(),
-            ));
             tracing::info!(
                 target: "semcast::calibrate",
                 condition = %self.condition,
-                chunked_misses = misses.len(),
                 "chunked verify misses too many sampled matches for the \
                  target; verify reads the full text",
             );
@@ -773,7 +794,15 @@ impl Scanner {
     }
 }
 
-/// Sampled matches verify would lose: chunked verify said no or failed.
+/// The recall a calibration stands on: certified when it certifies,
+/// estimated otherwise.
+fn recall_of(calibration: &Calibration) -> f64 {
+    calibration
+        .certified_recall
+        .unwrap_or(calibration.estimated_recall)
+}
+
+/// Sampled documents verify would reject: chunked verify said no or failed.
 fn verify_misses(chunked: &HashMap<u64, Option<bool>>) -> HashSet<u64> {
     chunked
         .iter()

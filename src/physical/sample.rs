@@ -110,7 +110,8 @@ impl Labeler<'_> {
 
     /// What verify will answer for each document when it reads its chunks:
     /// byte-identical requests and keys to [`VerifyExec`]'s chunked path, so
-    /// verify finds these verdicts cached. `docs` pairs a document's hash
+    /// the answers measure what verify does to rows outside the sample, and
+    /// a repeat calibration finds them cached. `docs` pairs a document's hash
     /// with its chunks, best first. `None` is a failed call, which verify
     /// would drop, so the certificate counts it as a miss. Not recorded as
     /// store evidence: a chunked verdict is not the full-text answer.

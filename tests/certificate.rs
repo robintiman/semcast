@@ -50,7 +50,11 @@ const QUERY: &str = "SELECT id FROM docs WHERE body MEANS 'sync deadline' WITH R
 
 /// The matching ids and the index scan's metrics.
 async fn run(ctx: &SessionContext) -> (Vec<i64>, MetricsSet) {
-    let plan = semcast::sql(ctx, QUERY)
+    run_query(ctx, QUERY).await
+}
+
+async fn run_query(ctx: &SessionContext, query: &str) -> (Vec<i64>, MetricsSet) {
+    let plan = semcast::sql(ctx, query)
         .await
         .unwrap()
         .create_physical_plan()
@@ -137,4 +141,41 @@ async fn a_failed_chunked_answer_counts_as_a_miss() {
     let (ids, metrics) = run(&ctx).await;
     assert_eq!(ids, (1..=150).collect::<Vec<_>>());
     assert_eq!(count(&metrics, "calibration_full_text"), 1);
+}
+
+#[tokio::test]
+async fn a_failed_label_chunks_would_reject_counts_as_a_miss() {
+    // Every match's full-text label fails (its tail holds the failing
+    // words), while its chunks, which lack the tail, are answered. The floor
+    // keeps the failed documents, but verify reading chunks would drop them,
+    // so they count as lost and verify reads the full text.
+    let model = Arc::new(
+        MockModel::answering_yes_to(["deadline"])
+            .embedding_by_theme(["sync", "other"])
+            .failing_on(["other deadline other deadline"]),
+    );
+    let ctx = tail_context(Arc::clone(&model), true).await;
+    let (_, metrics) = run(&ctx).await;
+    assert!(count(&metrics, "calibration_label_errors") > 0);
+    assert!(count(&metrics, "calibration_chunk_checks") > 0);
+    assert_eq!(count(&metrics, "calibration_full_text"), 1);
+}
+
+#[tokio::test]
+async fn a_certified_target_settles_on_full_text_without_the_whole_budget() {
+    let model = model();
+    let ctx = tail_context(Arc::clone(&model), true).await;
+    let (ids, metrics) = run_query(
+        &ctx,
+        "SELECT id FROM docs WHERE body MEANS 'sync deadline' \
+         WITH RECALL 0.9 WITH CONFIDENCE 0.9",
+    )
+    .await;
+    assert_eq!(ids, (1..=150).collect::<Vec<_>>());
+    assert_eq!(count(&metrics, "calibration_full_text"), 1);
+    assert!(
+        count(&metrics, "calibration_sampled_rows") < 200,
+        "stopped once full text certified: {} labelled",
+        count(&metrics, "calibration_sampled_rows"),
+    );
 }
