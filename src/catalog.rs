@@ -60,6 +60,9 @@ pub enum EntryKind {
     SemanticType,
     /// A semantic index, keyed `table(column)`; its definition is JSON.
     SemanticIndex,
+    /// A semantic column, keyed `table(name)`; its definition is the
+    /// `ALTER TABLE ... ADD SEMANTIC COLUMN` text.
+    SemanticColumn,
 }
 
 impl EntryKind {
@@ -70,6 +73,7 @@ impl EntryKind {
             Self::Relation => "relation",
             Self::SemanticType => "semantic_type",
             Self::SemanticIndex => "semantic_index",
+            Self::SemanticColumn => "semantic_column",
         }
     }
 
@@ -80,6 +84,7 @@ impl EntryKind {
             Self::Relation,
             Self::SemanticType,
             Self::SemanticIndex,
+            Self::SemanticColumn,
         ]
         .into_iter()
         .find(|known| known.as_str() == kind)
@@ -234,7 +239,7 @@ fn apply_changes(connection: &mut Connection, changes: &[Change]) -> Result<()> 
                 transaction
                     .execute(
                         "DELETE FROM catalog \
-                         WHERE kind = 'semantic_index' \
+                         WHERE kind IN ('semantic_index', 'semantic_column') \
                            AND substr(name, 1, length(?1)) = ?1 \
                            AND NOT EXISTS (SELECT 1 FROM catalog \
                                WHERE kind = 'relation' \
@@ -543,6 +548,18 @@ async fn is_memory_table(ctx: &SessionContext, name: &TableReference) -> bool {
         .is_ok_and(|provider| {
             provider
                 .downcast_ref::<datafusion::datasource::MemTable>()
+                .map(|_| ())
+                .or_else(|| {
+                    // A table with semantic columns is what it wraps.
+                    provider
+                        .downcast_ref::<crate::semantic_column::SemanticColumnsTable>()
+                        .and_then(|table| {
+                            table
+                                .inner()
+                                .downcast_ref::<datafusion::datasource::MemTable>()
+                        })
+                        .map(|_| ())
+                })
                 .is_some()
         })
 }
@@ -558,6 +575,18 @@ fn reads_memory_table(plan: &LogicalPlan) -> Result<bool> {
         {
             if provider
                 .downcast_ref::<datafusion::datasource::MemTable>()
+                .map(|_| ())
+                .or_else(|| {
+                    // A table with semantic columns is what it wraps.
+                    provider
+                        .downcast_ref::<crate::semantic_column::SemanticColumnsTable>()
+                        .and_then(|table| {
+                            table
+                                .inner()
+                                .downcast_ref::<datafusion::datasource::MemTable>()
+                        })
+                        .map(|_| ())
+                })
                 .is_some()
             {
                 found = true;

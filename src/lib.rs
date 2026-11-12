@@ -28,6 +28,7 @@ pub mod logical;
 pub mod model;
 pub mod optimizer;
 pub mod physical;
+pub mod semantic_column;
 pub mod semir;
 pub mod server;
 pub mod sql;
@@ -158,6 +159,35 @@ pub(crate) async fn run_sql(ctx: &SessionContext, text: &str, record: bool) -> R
                         );
                         catalog::save(catalog, vec![forget], &failure).await?;
                     }
+                    let no_rows = LogicalPlanBuilder::empty(false).build()?;
+                    Ok(DataFrame::new(ctx.state(), no_rows))
+                }
+                sql::ddl::SemanticDdl::AddColumn {
+                    table,
+                    name,
+                    text: column,
+                    condition,
+                } => {
+                    let column = semantic_column::SemanticColumn {
+                        name,
+                        text: column,
+                        condition: semir::normalize_instruction(&condition),
+                    };
+                    semantic_column::add_column(ctx, &table, column, text, record).await?;
+                    let no_rows = LogicalPlanBuilder::empty(false).build()?;
+                    Ok(DataFrame::new(ctx.state(), no_rows))
+                }
+                sql::ddl::SemanticDdl::DropColumn {
+                    table,
+                    name,
+                    if_exists,
+                } => {
+                    semantic_column::drop_column(ctx, &table, &name, if_exists, record).await?;
+                    let no_rows = LogicalPlanBuilder::empty(false).build()?;
+                    Ok(DataFrame::new(ctx.state(), no_rows))
+                }
+                sql::ddl::SemanticDdl::RefreshColumn { table, name } => {
+                    semantic_column::refresh_column(ctx, &table, &name).await?;
                     let no_rows = LogicalPlanBuilder::empty(false).build()?;
                     Ok(DataFrame::new(ctx.state(), no_rows))
                 }
@@ -447,6 +477,7 @@ impl SemcastContextBuilder {
             state = state.with_runtime_env(runtime_env);
         }
         let state = state
+            .with_analyzer_rule(Arc::new(semantic_column::SemanticColumnsRule))
             .with_optimizer_rule(Arc::new(MeansRewriteRule::new(Arc::clone(&runtime))))
             .with_optimizer_rule(Arc::new(
                 crate::optimizer::extract::ExtractRewriteRule::new(Arc::clone(&types)),

@@ -25,6 +25,22 @@ pub enum SemanticDdl {
     CreateType(SemanticType),
     /// `DROP SEMANTIC TYPE [IF EXISTS] Name`
     DropType { name: String, if_exists: bool },
+    /// `ALTER TABLE table ADD SEMANTIC COLUMN name AS (column MEANS 'condition')`
+    AddColumn {
+        table: String,
+        name: String,
+        /// The text column the question reads.
+        text: String,
+        condition: String,
+    },
+    /// `ALTER TABLE table DROP SEMANTIC COLUMN [IF EXISTS] name`
+    DropColumn {
+        table: String,
+        name: String,
+        if_exists: bool,
+    },
+    /// `REFRESH SEMANTIC COLUMN table(name)`
+    RefreshColumn { table: String, name: String },
     /// `CREATE SEMANTIC PREDICATE name(params) AS template [CHEAP USING ...]`
     CreatePredicate {
         name: String,
@@ -74,6 +90,114 @@ pub fn parse_semantic_drop(parser: &mut Parser) -> crate::Result<SemanticDdl> {
         .expect_token(&Token::EOF)
         .map_err(|e| type_error(e.to_string()))?;
     Ok(SemanticDdl::DropType { name, if_exists })
+}
+
+/// Parse the tail of `ALTER TABLE table {ADD | DROP} SEMANTIC COLUMN ...` —
+/// `ALTER TABLE` is already consumed; the dispatcher checked that `ADD
+/// SEMANTIC` or `DROP SEMANTIC` follows the table name.
+pub fn parse_alter_semantic(parser: &mut Parser) -> crate::Result<SemanticDdl> {
+    let table = parse_table_name(parser).map_err(column_error)?;
+    let add = match parser.next_token().token {
+        Token::Word(word) if word.value.eq_ignore_ascii_case("add") => true,
+        Token::Word(word) if word.value.eq_ignore_ascii_case("drop") => false,
+        other => return Err(column_error(format!("expected ADD or DROP, got {other}"))),
+    };
+    expect_word(parser, "SEMANTIC").map_err(column_error)?;
+    expect_word(parser, "COLUMN").map_err(column_error)?;
+    let ddl = if add {
+        let name = parser
+            .parse_identifier()
+            .map_err(|e| column_error(e.to_string()))?;
+        expect_word(parser, "AS").map_err(column_error)?;
+        parser
+            .expect_token(&Token::LParen)
+            .map_err(|e| column_error(e.to_string()))?;
+        let text = parser
+            .parse_identifier()
+            .map_err(|e| column_error(e.to_string()))?;
+        expect_word(parser, "MEANS").map_err(column_error)?;
+        let condition = match parser.next_token().token {
+            Token::SingleQuotedString(condition) => condition,
+            other => {
+                return Err(column_error(format!(
+                    "expected the condition as a string literal, got {other}"
+                )));
+            }
+        };
+        parser
+            .expect_token(&Token::RParen)
+            .map_err(|e| column_error(e.to_string()))?;
+        SemanticDdl::AddColumn {
+            table,
+            name: normalized(name),
+            text: normalized(text),
+            condition,
+        }
+    } else {
+        let if_exists = parser.parse_keywords(&[
+            datafusion::sql::sqlparser::keywords::Keyword::IF,
+            datafusion::sql::sqlparser::keywords::Keyword::EXISTS,
+        ]);
+        let name = parser
+            .parse_identifier()
+            .map_err(|e| column_error(e.to_string()))?;
+        SemanticDdl::DropColumn {
+            table,
+            name: normalized(name),
+            if_exists,
+        }
+    };
+    let _ = parser.consume_token(&Token::SemiColon);
+    parser
+        .expect_token(&Token::EOF)
+        .map_err(|e| column_error(e.to_string()))?;
+    Ok(ddl)
+}
+
+/// Parse the tail of `REFRESH SEMANTIC COLUMN table(name)` — `REFRESH
+/// SEMANTIC` is already consumed.
+pub fn parse_semantic_refresh(parser: &mut Parser) -> crate::Result<SemanticDdl> {
+    expect_word(parser, "COLUMN").map_err(column_error)?;
+    let table = parse_table_name(parser).map_err(column_error)?;
+    parser
+        .expect_token(&Token::LParen)
+        .map_err(|e| column_error(e.to_string()))?;
+    let name = parser
+        .parse_identifier()
+        .map_err(|e| column_error(e.to_string()))?;
+    parser
+        .expect_token(&Token::RParen)
+        .map_err(|e| column_error(e.to_string()))?;
+    let _ = parser.consume_token(&Token::SemiColon);
+    parser
+        .expect_token(&Token::EOF)
+        .map_err(|e| column_error(e.to_string()))?;
+    Ok(SemanticDdl::RefreshColumn {
+        table,
+        name: normalized(name),
+    })
+}
+
+/// A possibly qualified table name, each part normalized, rejoined with `.`.
+fn parse_table_name(parser: &mut Parser) -> Result<String, String> {
+    let mut parts = vec![normalized(
+        parser.parse_identifier().map_err(|e| e.to_string())?,
+    )];
+    while parser.consume_token(&Token::Period) {
+        parts.push(normalized(
+            parser.parse_identifier().map_err(|e| e.to_string())?,
+        ));
+    }
+    Ok(parts.join("."))
+}
+
+fn column_error(message: impl Into<String>) -> crate::SemcastError {
+    crate::SemcastError::DataFusion(DataFusionError::Plan(format!(
+        "invalid semantic column statement: {}; expected ALTER TABLE t ADD SEMANTIC \
+         COLUMN name AS (column MEANS 'condition'), ALTER TABLE t DROP SEMANTIC COLUMN \
+         name, or REFRESH SEMANTIC COLUMN t(name)",
+        message.into()
+    )))
 }
 
 /// An identifier as DataFusion resolves it: unquoted folds to lowercase.

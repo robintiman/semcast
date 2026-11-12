@@ -69,9 +69,49 @@ pub fn parse_semcast_statement(query: &str) -> crate::Result<SemcastStatement> {
         return ddl::parse_semantic_drop(parser).map(SemcastStatement::Ddl);
     }
 
+    if peek_nth_is_word(&df_parser.parser, 0, "REFRESH")
+        && peek_nth_is_word(&df_parser.parser, 1, "SEMANTIC")
+    {
+        let parser = &mut df_parser.parser;
+        parser.next_token(); // REFRESH
+        parser.next_token(); // SEMANTIC
+        return ddl::parse_semantic_refresh(parser).map(SemcastStatement::Ddl);
+    }
+    if peek_nth_is_word(&df_parser.parser, 0, "ALTER")
+        && peek_nth_is_word(&df_parser.parser, 1, "TABLE")
+        && alters_a_semantic_column(&df_parser.parser)
+    {
+        let parser = &mut df_parser.parser;
+        parser.next_token(); // ALTER
+        parser.next_token(); // TABLE
+        return ddl::parse_alter_semantic(parser).map(SemcastStatement::Ddl);
+    }
+
     let statement = df_parser.parse_statement()?;
     let clauses = trailing_clauses(&mut df_parser.parser)?;
     Ok(SemcastStatement::Sql(statement, clauses))
+}
+
+/// Whether an `ALTER TABLE` adds or drops a semantic column: past the table
+/// name (dotted parts), the next two words are `ADD SEMANTIC` or `DROP
+/// SEMANTIC`. Lookahead only, so any other `ALTER TABLE` stays SQL.
+fn alters_a_semantic_column(parser: &datafusion::sql::sqlparser::parser::Parser) -> bool {
+    use datafusion::sql::sqlparser::tokenizer::Token;
+    // Tokens 0 and 1 are ALTER TABLE; the name starts at 2.
+    let mut at = 2;
+    loop {
+        if !matches!(parser.peek_nth_token_ref(at).token, Token::Word(_)) {
+            return false;
+        }
+        at += 1;
+        if matches!(parser.peek_nth_token_ref(at).token, Token::Period) {
+            at += 1;
+            continue;
+        }
+        break;
+    }
+    (peek_nth_is_word(parser, at, "ADD") || peek_nth_is_word(parser, at, "DROP"))
+        && peek_nth_is_word(parser, at + 1, "SEMANTIC")
 }
 
 /// [`parse_semcast_statement`] for callers that only handle SQL — the AST
