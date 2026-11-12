@@ -20,6 +20,10 @@
 //! failed document the pair would prune is a lost match, one it keeps is a
 //! kept non-match. The pair is picked with the sample that scores it, so a
 //! certified search tests each pair at `δ/m` over the `m` pairs it tries.
+//! A sample with no known match prunes nothing, and no floor sits above the
+//! best known match's score, as for a single floor. Like the single floor's
+//! calibration, the caller looks again after each tranche of labels without
+//! correcting for the repeated looks.
 
 use crate::optimizer::calibrate::wilson_lower_bound;
 
@@ -48,6 +52,9 @@ pub struct SampledDoc {
     /// Verify would reject this document whatever the floors (chunked
     /// verify said no or failed).
     pub verify_miss: bool,
+    /// The store already decided it: it never reaches the scorer or verify,
+    /// so it says nothing about what they will cost.
+    pub decided: bool,
 }
 
 /// The chosen floors and what they are expected to cost.
@@ -127,21 +134,40 @@ pub fn choose(
     unindexed: usize,
     scorer_cost: f64,
 ) -> JointChoice {
+    // A sample without a single known match certifies nothing, failed
+    // labels or not: the matches it missed are what a bound is about. Prune
+    // nothing, and under a confidence report the target unmet so the caller
+    // keeps drawing, as the single floor's calibration does.
+    let known_matches: Vec<&SampledDoc> = docs.iter().filter(|d| d.label == Some(true)).collect();
+    if known_matches.is_empty() {
+        return JointChoice {
+            index_floor: f32::NEG_INFINITY,
+            scorer_floor: f32::NEG_INFINITY,
+            estimated_recall: 1.0,
+            certified_recall: confidence.map(|_| if docs.is_empty() { 1.0 } else { 0.0 }),
+            scorer_calls: 0.0,
+            verify_calls: (population.len() + unindexed) as f64,
+        };
+    }
     // Floors that change what survives: the scores of matches and of
-    // documents whose truth is unknown.
+    // documents whose truth is unknown, never above the best known match's
+    // (a failed label can lower a floor, never raise it).
     let relevant = |doc: &&SampledDoc| doc.label != Some(false);
-    let index_floors = grid(
-        docs.iter()
-            .filter(relevant)
-            .filter_map(|d| d.index)
-            .collect(),
-    );
-    let scorer_floors = grid(
-        docs.iter()
-            .filter(relevant)
-            .filter_map(|d| d.scorer)
-            .collect(),
-    );
+    let floors = |stage: fn(&SampledDoc) -> Option<f32>| {
+        let top = known_matches
+            .iter()
+            .filter_map(|d| stage(d))
+            .fold(f32::NEG_INFINITY, f32::max);
+        grid(
+            docs.iter()
+                .filter(relevant)
+                .filter_map(stage)
+                .filter(|v| *v <= top)
+                .collect(),
+        )
+    };
+    let index_floors = floors(|d| d.index);
+    let scorer_floors = floors(|d| d.scorer);
     let pairs = index_floors.len() * scorer_floors.len();
     let alpha = confidence.map(|c| (1.0 - c) / pairs as f64);
 
@@ -152,7 +178,7 @@ pub fn choose(
         // the share of them passing `b` estimates verify's share.
         let reached: Vec<&SampledDoc> = docs
             .iter()
-            .filter(|d| d.index.is_none_or(|s| s >= a))
+            .filter(|d| !d.decided && d.index.is_none_or(|s| s >= a))
             .collect();
         for &b in &scorer_floors {
             let (kept, total) = recall_at(docs, a, b);
@@ -242,7 +268,39 @@ mod tests {
             scorer: Some(scorer),
             label: Some(label),
             verify_miss: false,
+            decided: false,
         }
+    }
+
+    #[test]
+    fn a_sample_without_a_known_match_prunes_nothing() {
+        // One failed label scoring high, the rest non-matches: nothing to
+        // certify against, so nothing is pruned and a bound reports unmet.
+        let mut docs: Vec<SampledDoc> = (0..63).map(|_| doc(0.2, 0.1, false)).collect();
+        docs.push(SampledDoc {
+            label: None,
+            ..doc(0.95, 0.9, true)
+        });
+        let population: Vec<f32> = (0..1000).map(|i| i as f32 / 1000.0).collect();
+        let certified = choose(0.9, Some(0.95), &docs, &population, 0, 0.2);
+        assert_eq!(certified.index_floor, f32::NEG_INFINITY);
+        assert!(!certified.meets(0.9));
+        let estimated = choose(0.9, None, &docs, &[0.5; 1000], 0, 0.2);
+        assert_eq!(estimated.index_floor, f32::NEG_INFINITY);
+        assert!(!estimated.uses_scorer());
+    }
+
+    #[test]
+    fn a_failed_label_never_raises_a_floor_above_the_best_match() {
+        let mut docs: Vec<SampledDoc> = (0..40).map(|_| doc(0.6, 0.6, true)).collect();
+        docs.push(SampledDoc {
+            label: None,
+            ..doc(0.95, 0.95, true)
+        });
+        docs.extend((0..60).map(|_| doc(0.1, 0.1, false)));
+        let choice = choose(0.9, None, &docs, &[0.5; 101], 0, 0.2);
+        assert!(choice.index_floor <= 0.6, "{choice:?}");
+        assert!(choice.scorer_floor <= 0.6, "{choice:?}");
     }
 
     #[test]

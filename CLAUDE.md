@@ -172,8 +172,9 @@ assembled in the physical planner, not there.
   filter (counted in `rows_dropped`) or falls through to `ELSE` in a `CASE`,
   rather than failing the statement. A failed calibration label stays in the
   sample, assumed a lost match wherever the floor would prune it.
-- An index gap degrades, never drops: unindexed documents pass the pre-filter
-  through to full-text verify; `SEMANTIC DISTINCT` falls back to exact-match
+- An index gap degrades, never drops: unindexed documents pass the index
+  pre-filter through to full-text verify (a scorer floor calibrated under
+  `WITH RECALL` may still prune them, inside its certificate); `SEMANTIC DISTINCT` falls back to exact-match
   dedupe. Never silently discard rows the index hasn't seen.
 - `UPDATE`/`DELETE` with a `MEANS`, `CONFIDENCE()` or subquery predicate is
   refused (`lib.rs::reject_semantic_dml`): DataFusion would hand the table

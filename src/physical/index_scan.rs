@@ -886,6 +886,18 @@ impl Scanner {
         let unindexed = undecided.len() - population.len();
 
         let pool = draw_sample(&strings, calibration.label_budget());
+        // What the store had decided before calibration: those never reach
+        // the scorer or verify. (Labels join the store evidence as they land,
+        // so it can't be asked later.)
+        let decided_before: HashSet<u64> = pool
+            .iter()
+            .filter(|text| {
+                self.store
+                    .as_deref()
+                    .is_some_and(|s| s.verdict(text).is_some())
+            })
+            .map(|text| doc_hash(text))
+            .collect();
         let per_mode = calibration.confidence.map(|c| 1.0 - (1.0 - c) / 2.0);
         let mut labels: Vec<Label> = Vec::new();
         let mut chunked: HashMap<u64, Option<bool>> = HashMap::new();
@@ -937,6 +949,7 @@ impl Scanner {
                             verify_miss: (indexed.contains(&hash) && score.is_none())
                                 || (chunk_misses
                                     && chunked.get(&hash).is_some_and(|v| *v != Some(true))),
+                            decided: decided_before.contains(&hash),
                         }
                     })
                     .collect()
