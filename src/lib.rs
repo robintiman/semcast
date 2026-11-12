@@ -527,6 +527,13 @@ impl SemcastContextBuilder {
         let scorer: Option<Arc<dyn ModelProvider>> = self
             .scorer
             .map(|scorer| Arc::new(crate::model::Scheduler::new(scorer, self.max_in_flight)) as _);
+        // The physical planner uses a scorer only when it is not the session
+        // model, which would save nothing; the budget rule must agree.
+        runtime = runtime.with_scorer(
+            scorer
+                .as_ref()
+                .is_some_and(|scorer| scorer.id() != model.id()),
+        );
         if let Some(store) = self.chunk_store {
             runtime = runtime.with_chunk_store(store);
         }
@@ -560,6 +567,10 @@ impl SemcastContextBuilder {
             .with_optimizer_rule(Arc::new(RelevanceRewriteRule))
             .with_optimizer_rule(Arc::new(ClusterRewriteRule))
             .with_optimizer_rule(Arc::new(DistinctRewriteRule))
+            // Last: it reads where every MEANS filter ended up.
+            .with_optimizer_rule(Arc::new(crate::optimizer::budget::RecallBudgetRule::new(
+                Arc::clone(&runtime),
+            )))
             .with_query_planner(Arc::new(
                 SemcastQueryPlanner::new(model, self.cache).with_scorer(scorer),
             ))

@@ -35,6 +35,8 @@ pub struct MockModel {
     failing: Vec<String>,
     /// See [`MockModel::with_yes_probability`].
     yes_probability: Option<YesProbability>,
+    /// See [`MockModel::with_id`]; `None` is "mock".
+    id: Option<String>,
 }
 
 type YesProbability = Arc<dyn Fn(&str) -> f32 + Send + Sync>;
@@ -152,6 +154,13 @@ impl MockModel {
         self
     }
 
+    /// Report this model id instead of "mock", so a test can stand up a
+    /// second model (a scorer, say) that the engine tells apart.
+    pub fn with_id(mut self, id: impl Into<String>) -> Self {
+        self.id = Some(id.into());
+        self
+    }
+
     /// Sleep this long in every `complete` call. Real providers take seconds
     /// per batch; tests that need to observe a query *while it runs* — batch
     /// job progress, cancellation — need a mock that isn't instantaneous.
@@ -164,7 +173,7 @@ impl MockModel {
 #[async_trait]
 impl ModelProvider for MockModel {
     fn id(&self) -> ModelId {
-        ModelId("mock".to_owned())
+        ModelId(self.id.clone().unwrap_or_else(|| "mock".to_owned()))
     }
 
     async fn complete(&self, requests: Vec<CompletionRequest>) -> Vec<Result<Completion>> {

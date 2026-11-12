@@ -29,6 +29,13 @@ pub struct SemFilterNode {
     /// estimate on the calibration sample into a bound certified for the
     /// population. `None` keeps the estimate.
     pub confidence: Option<f64>,
+    /// The statement's `WITH RECALL` / `WITH CONFIDENCE`, which `recall` and
+    /// `confidence` are this filter's share of once the statement has
+    /// several lossy filters (see [`crate::optimizer::budget`]).
+    pub statement_recall: Option<f64>,
+    pub statement_confidence: Option<f64>,
+    /// How many lossy filters share the statement's target: 1 alone.
+    pub shares: usize,
 }
 
 impl SemFilterNode {
@@ -47,15 +54,32 @@ impl SemFilterNode {
             condition: crate::semir::normalize_instruction(&condition.into()),
             recall,
             confidence,
+            statement_recall: recall,
+            statement_confidence: confidence,
+            shares: 1,
         }
     }
 
-    /// Both knobs as bit patterns, so equality and hashing agree on floats.
-    fn target_bits(&self) -> (Option<u64>, Option<u64>) {
+    /// Every knob as bit patterns, so equality and hashing agree on floats.
+    fn target_bits(&self) -> (Option<u64>, Option<u64>, Option<u64>, Option<u64>, usize) {
         (
             self.recall.map(f64::to_bits),
             self.confidence.map(f64::to_bits),
+            self.statement_recall.map(f64::to_bits),
+            self.statement_confidence.map(f64::to_bits),
+            self.shares,
         )
+    }
+}
+
+/// A target as EXPLAIN prints it: two decimals, more only when a share
+/// needs them (0.9967 must not read as 1.00).
+fn fraction(value: f64) -> String {
+    let text = format!("{value:.4}");
+    let text = text.trim_end_matches('0');
+    match text.split_once('.') {
+        Some((_, decimals)) if decimals.len() >= 2 => text.to_owned(),
+        _ => format!("{value:.2}"),
     }
 }
 
@@ -112,10 +136,26 @@ impl UserDefinedLogicalNodeCore for SemFilterNode {
         match (self.recall, self.confidence) {
             // A confidence turns the target into a claim about the population,
             // so EXPLAIN states which kind of promise this plan is making.
-            (Some(r), Some(c)) => write!(f, "   recall ≥ {r:.2} certified at {c:.2}"),
-            (Some(r), None) => write!(f, "   recall ≥ {r:.2} estimated"),
-            (None, _) => write!(f, "   recall best-effort"),
+            (Some(r), Some(c)) => write!(
+                f,
+                "   recall ≥ {} certified at {}",
+                fraction(r),
+                fraction(c)
+            )?,
+            (Some(r), None) => write!(f, "   recall ≥ {} estimated", fraction(r))?,
+            (None, _) => write!(f, "   recall best-effort")?,
         }
+        if self.shares > 1
+            && let Some(statement) = self.statement_recall
+        {
+            write!(
+                f,
+                " (its share of the statement's {} across {} filters)",
+                fraction(statement),
+                self.shares
+            )?;
+        }
+        Ok(())
     }
 
     fn with_exprs_and_inputs(
@@ -136,6 +176,22 @@ impl UserDefinedLogicalNodeCore for SemFilterNode {
             condition: self.condition.clone(),
             recall: self.recall,
             confidence: self.confidence,
+            statement_recall: self.statement_recall,
+            statement_confidence: self.statement_confidence,
+            shares: self.shares,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fraction;
+
+    #[test]
+    fn a_share_keeps_the_digits_it_needs() {
+        assert_eq!(fraction(0.9), "0.90");
+        assert_eq!(fraction(0.95), "0.95");
+        assert_eq!(fraction(1.0 - 0.01 / 3.0), "0.9967");
+        assert_eq!(fraction(0.975), "0.975");
     }
 }
