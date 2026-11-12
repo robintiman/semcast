@@ -314,7 +314,7 @@ pub fn render(counts: &FunnelCounts) -> String {
             }
             if counts.calibration_chunk_checks > 0 {
                 calibration.push_str(&format!(
-                    ", {} checked on chunks ({} rejected)",
+                    ", {} checked on chunks ({} rejected or failed)",
                     counts.calibration_chunk_checks, counts.calibration_verify_misses,
                 ));
             }

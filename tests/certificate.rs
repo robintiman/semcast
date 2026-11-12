@@ -179,3 +179,49 @@ async fn a_certified_target_settles_on_full_text_without_the_whole_budget() {
         count(&metrics, "calibration_sampled_rows"),
     );
 }
+
+/// 600 matches, `tail` of them with the needle only in the tail, plus 200
+/// non-matches.
+async fn mixed_context(model: Arc<MockModel>, tail: usize) -> SessionContext {
+    let body = "sync ".repeat(1200);
+    let rows: Vec<String> = (1..=600)
+        .map(|id| {
+            if id <= tail {
+                format!("({id}, 'id{id} {body}{}')", "other deadline ".repeat(300))
+            } else {
+                format!("({id}, 'id{id} deadline {body}{}')", "other ".repeat(600))
+            }
+        })
+        .chain((601..=800).map(|id| format!("({id}, 'id{id} {body}{}')", "other ".repeat(600))))
+        .collect();
+    let ctx = semcast_context(model);
+    ctx.sql(&format!(
+        "CREATE TABLE docs AS SELECT * FROM (VALUES {}) AS t(id, body)",
+        rows.join(", "),
+    ))
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+    create_semantic_index(&ctx, "docs", "body", IndexOptions::default())
+        .await
+        .unwrap();
+    ctx
+}
+
+/// Chunks that lose a few matches but stay well above the target are short
+/// of labels, not wrong: the certified loop keeps drawing on chunks instead
+/// of settling every survivor on full text after one tranche.
+#[tokio::test]
+async fn chunks_above_the_target_keep_drawing_instead_of_switching() {
+    let ctx = mixed_context(model(), 24).await;
+    let (_, metrics) = run_query(
+        &ctx,
+        "SELECT id FROM docs WHERE body MEANS 'sync deadline' \
+         WITH RECALL 0.9 WITH CONFIDENCE 0.9",
+    )
+    .await;
+    assert_eq!(count(&metrics, "calibration_full_text"), 0);
+    assert!(count(&metrics, "calibration_sampled_rows") > 64);
+}

@@ -21,7 +21,9 @@
 //! the target and the full text does better, the scan tells verify (through
 //! [`ChunkEvidence`]) to read the full text instead, whose answers the labels
 //! are, leaving only the floor's losses to certify. Choosing between the two
-//! on one sample is two tests, so each is run at half the error budget.
+//! on one sample is two tests, so each is run at half the error budget —
+//! even when chunks miss nothing and the two coincide, which costs a few
+//! labels but keeps the argument a plain union bound.
 //!
 //! [`VerifyExec`]: crate::physical::VerifyExec
 
@@ -617,8 +619,14 @@ impl Scanner {
             let reading_text = calibrate(&HashSet::new());
             // Chunks when they meet the target, being cheaper; else full text
             // when it does better. Labels are full-text verdicts, so reading
-            // the full text leaves only the floor's losses.
+            // the full text leaves only the floor's losses. A certified
+            // target whose chunks estimate above it is only short of labels:
+            // keep drawing rather than settle every survivor on full text.
+            let chunks_short_of_labels = calibration.confidence.is_some()
+                && tranche < pool.len()
+                && reading_chunks.0.estimated_recall >= calibration.target_recall;
             let text_wins = !reading_chunks.0.meets(calibration.target_recall)
+                && !chunks_short_of_labels
                 && (reading_text.0.meets(calibration.target_recall)
                     || recall_of(&reading_text.0) > recall_of(&reading_chunks.0));
             let outcome = if text_wins {
@@ -642,8 +650,8 @@ impl Scanner {
             tracing::info!(
                 target: "semcast::calibrate",
                 condition = %self.condition,
-                "chunked verify misses too many sampled matches for the \
-                 target; verify reads the full text",
+                "chunked verify does worse than the full text on the sample; \
+                 verify reads the full text",
             );
         }
         let (calibrated, scores) = match attempt {
