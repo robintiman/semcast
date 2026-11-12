@@ -82,6 +82,8 @@ pub(crate) struct Labeler<'a> {
     pub calls_merged: &'a Count,
     /// Labels whose call failed or answered unparseably.
     pub errors: &'a Count,
+    /// Where full-text labels are recorded as the condition's statistics.
+    pub stats_key: Option<u128>,
 }
 
 impl Labeler<'_> {
@@ -139,11 +141,13 @@ impl Labeler<'_> {
         let mut answers = Vec::new();
         let mut misses = Vec::new();
         let mut requests = Vec::new();
+        let mut input_chars = Vec::new();
         for (key, input) in inputs {
             let cache_key = means_cache_key(self.condition, &input, &model_id, prompt_version);
             match self.cache.get(&cache_key) {
                 Some(CachedValue::Value(verdict)) => answers.push((key, Some(verdict == "yes"))),
                 _ => {
+                    input_chars.push(input.len());
                     requests.push(CompletionRequest {
                         system: prompt.to_owned(),
                         input,
@@ -159,6 +163,24 @@ impl Labeler<'_> {
         let completions = self.model.complete(requests).await;
         self.calls_merged.add(merged_calls(&completions));
         debug_assert_eq!(completions.len(), misses.len());
+        // Full-text labels of a uniform sample: the condition's rate as it
+        // is. A chunked check is a second, weaker answer about the same
+        // document and is not counted.
+        if let Some(key) = self.stats_key
+            && prompt_version == MEANS_PROMPT_VERSION
+        {
+            crate::physical::verify::record_means_stats(
+                self.cache,
+                key,
+                input_chars
+                    .iter()
+                    .zip(&completions)
+                    .filter_map(|(chars, completion)| {
+                        let matched = parse_verdict(&completion.as_ref().ok()?.text)?;
+                        Some((matched, *chars))
+                    }),
+            );
+        }
         for ((key, cache_key), completion) in misses.into_iter().zip(&completions) {
             match completion
                 .as_ref()

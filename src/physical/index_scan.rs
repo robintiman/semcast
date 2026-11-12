@@ -169,6 +169,9 @@ pub struct CalibrationConfig {
     pub model: Arc<dyn ModelProvider>,
     /// Verdict cache; labels are full-text verify verdicts and share keys.
     pub cache: Arc<dyn SemanticCache>,
+    /// Where the labels are recorded as the condition's statistics: a
+    /// uniform sample, so its rate is the condition's own.
+    pub stats_key: Option<u128>,
 }
 
 impl CalibrationConfig {
@@ -800,6 +803,7 @@ impl Scanner {
             calls: &self.calibration_model_calls,
             calls_merged: &self.calibration_model_calls_merged,
             errors: &self.calibration_label_errors,
+            stats_key: calibration.stats_key,
         }
     }
 }

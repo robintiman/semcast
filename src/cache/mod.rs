@@ -54,6 +54,52 @@ pub enum CachedValue {
     Error(String),
 }
 
+/// What the model has answered for one question about one text column (see
+/// `physical::verify::stats_key`): how often it was asked, how often it said
+/// yes, and how much text it read. The optimizer orders filters by it; it
+/// never decides an answer, so a count that is slightly off costs calls,
+/// not rows.
+///
+/// Recorded only where the rows asked are an unbiased view of the condition:
+/// a verify nothing pre-filters, calibration's full-text labels (a uniform
+/// sample), and an unguarded label. Not by a verify behind an index or
+/// scorer (mostly matches), a guarded label, a scorer, or `CONFIDENCE()`.
+/// A filter stacked behind another still sees only that one's survivors, so
+/// its rate is conditional on it. An indexed filter records only through a
+/// `WITH RECALL` calibration.
+///
+/// The text column is named as the plan prints it: `tickets.body` once a
+/// filter is pushed down to its table, but an alias (`u.bio`) or expression
+/// where it stays above one, so two sources under one alias can share
+/// history, and one column can have two. Nothing is keyed by data version,
+/// so a table recreated under its old name keeps its history. Each costs
+/// calls, never rows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AskStats {
+    pub asked: u64,
+    pub matched: u64,
+    /// Characters of input sent, summed over `asked`.
+    pub input_chars: u64,
+}
+
+impl AskStats {
+    /// The share of asked inputs the model said yes to.
+    pub fn selectivity(&self) -> Option<f64> {
+        (self.asked > 0).then(|| self.matched as f64 / self.asked as f64)
+    }
+
+    /// Average characters of input per question asked.
+    pub fn chars_per_ask(&self) -> Option<f64> {
+        (self.asked > 0).then(|| self.input_chars as f64 / self.asked as f64)
+    }
+
+    pub(crate) fn add(&mut self, other: AskStats) {
+        self.asked += other.asked;
+        self.matched += other.matched;
+        self.input_chars += other.input_chars;
+    }
+}
+
 pub trait SemanticCache: std::fmt::Debug + Send + Sync {
     fn get(&self, key: &CacheKey) -> Option<CachedValue>;
     fn put(&self, key: CacheKey, value: CachedValue);
@@ -72,6 +118,15 @@ pub trait SemanticCache: std::fmt::Debug + Send + Sync {
             self.put(key, value);
         }
     }
+
+    /// Add fresh model answers to a question's statistics. Only answers the
+    /// model gave, not cache hits, so a repeat query adds nothing.
+    fn record_stats(&self, _question: u128, _delta: AskStats) {}
+
+    /// A question's statistics so far, if any were recorded.
+    fn stats(&self, _question: u128) -> Option<AskStats> {
+        None
+    }
 }
 
 /// Process-local cache — enough for tests and single-session use. For one
@@ -79,6 +134,7 @@ pub trait SemanticCache: std::fmt::Debug + Send + Sync {
 #[derive(Debug, Default)]
 pub struct InMemoryCache {
     entries: Mutex<HashMap<CacheKey, CachedValue>>,
+    stats: Mutex<HashMap<u128, AskStats>>,
 }
 
 impl SemanticCache for InMemoryCache {
@@ -88,6 +144,19 @@ impl SemanticCache for InMemoryCache {
 
     fn put(&self, key: CacheKey, value: CachedValue) {
         self.entries.lock().unwrap().insert(key, value);
+    }
+
+    fn record_stats(&self, question: u128, delta: AskStats) {
+        self.stats
+            .lock()
+            .unwrap()
+            .entry(question)
+            .or_default()
+            .add(delta);
+    }
+
+    fn stats(&self, question: u128) -> Option<AskStats> {
+        self.stats.lock().unwrap().get(&question).copied()
     }
 }
 

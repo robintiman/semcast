@@ -39,7 +39,9 @@ use crate::sql::means_udf::MEANS_UDF_NAME;
 /// Stacked semantic predicates are ordered before they are stacked: one that
 /// a semantic index covers prunes rows for free before the model sees them,
 /// so it belongs below one that pays full price for every row it is handed.
-/// Source order breaks ties within a tier, keeping the rewrite deterministic.
+/// Within a tier, the store's statistics for each condition (match rate and
+/// input size, from earlier answers) order the stages, rarest and cheapest
+/// first; with no statistics, source order stands.
 ///
 /// Restriction: `means()` is supported as a top-level `AND` conjunct of a
 /// `WHERE` clause, or anywhere in a `SELECT` list. Elsewhere — under
@@ -327,8 +329,12 @@ impl MeansRewriteRule {
         // An indexed group prunes before it pays, so it goes innermost.
         // `partition` preserves relative order, so equally-priced groups keep
         // the order they were written in.
-        let (indexed, unindexed): (Vec<_>, Vec<_>) =
+        let (mut indexed, mut unindexed): (Vec<_>, Vec<_>) =
             groups.into_iter().partition(|group| group.indexed);
+        // Within each tier, what the store has seen of each condition orders
+        // the stages (see `order_by_stats`).
+        self.order_by_stats(&mut indexed);
+        self.order_by_stats(&mut unindexed);
 
         // Free predicates stay in a Filter below the semantic stage, so they
         // run first and DataFusion keeps optimizing them as usual.
@@ -347,6 +353,119 @@ impl MeansRewriteRule {
             };
         }
         Ok(Transformed::yes(rewritten))
+    }
+}
+
+/// Characters of prompt every yes/no request carries besides its input:
+/// the synthesized instruction around the condition.
+const PROMPT_CHARS: f64 = 250.0;
+
+/// Selectivity assumed for a condition the store has no answers for.
+const UNKNOWN_SELECTIVITY: f64 = 0.5;
+
+impl MeansRewriteRule {
+    /// What the store has recorded for one condition asked of the session
+    /// model about `text`: selectivity and characters per ask.
+    fn condition_stats(&self, condition: &str, text: &Expr) -> Option<crate::cache::AskStats> {
+        let key = crate::physical::verify::stats_key(
+            condition,
+            &self.runtime.model.id(),
+            &text.to_string(),
+        );
+        self.runtime.cache().stats(key).filter(|s| s.asked > 0)
+    }
+
+    /// Order stages so the cheapest way to drop rows runs first: each group by
+    /// `(selectivity - 1) / cost`, lowest first, the classic rank for
+    /// ordering independent filters (a stage that removes much for little
+    /// goes early). Selectivity is the product of a group's conditions';
+    /// cost is characters per ask (plus the prompt) times the calls a row
+    /// costs: one for a fused group, one per condition still standing for a
+    /// stacked one. Within a stacked group the rarer condition goes first:
+    /// same text, same cost.
+    ///
+    /// A condition with no statistics is assumed to match half its rows and
+    /// to read as much text as the known ones here, so lacking history never
+    /// makes a group look cheaper than one that has it. Ordering never
+    /// changes which rows come back, only what they cost, so rough
+    /// statistics are safe. With none for any condition here, the written
+    /// order stands.
+    fn order_by_stats(&self, groups: &mut [TextGroup]) {
+        let stats: Vec<Vec<Option<crate::cache::AskStats>>> = groups
+            .iter()
+            .map(|group| {
+                group
+                    .specs
+                    .iter()
+                    .map(|(condition, _, _)| self.condition_stats(condition, &group.text))
+                    .collect()
+            })
+            .collect();
+        if stats.iter().flatten().all(Option::is_none) {
+            return;
+        }
+        let selectivity = |s: &Option<crate::cache::AskStats>| {
+            s.and_then(|s| s.selectivity())
+                .unwrap_or(UNKNOWN_SELECTIVITY)
+        };
+        for (group, group_stats) in groups.iter_mut().zip(&stats) {
+            let mut specs: Vec<_> = group.specs.drain(..).zip(group_stats.iter()).collect();
+            specs.sort_by(|(_, a), (_, b)| selectivity(a).total_cmp(&selectivity(b)));
+            group.specs = specs.into_iter().map(|(spec, _)| spec).collect();
+        }
+        let group_chars: Vec<Option<f64>> = stats
+            .iter()
+            .map(|group_stats| {
+                group_stats
+                    .iter()
+                    .filter_map(|s| s.and_then(|s| s.chars_per_ask()))
+                    .fold(None, |max: Option<f64>, c| {
+                        Some(max.map_or(c, |m| m.max(c)))
+                    })
+            })
+            .collect();
+        let known: Vec<f64> = group_chars.iter().flatten().copied().collect();
+        let typical_chars = known.iter().sum::<f64>() / known.len().max(1) as f64;
+        let ranks: Vec<f64> = groups
+            .iter()
+            .zip(&stats)
+            .zip(&group_chars)
+            .map(|((group, group_stats), chars)| {
+                let mut rates: Vec<f64> = group_stats.iter().map(selectivity).collect();
+                rates.sort_by(f64::total_cmp);
+                let kept: f64 = rates.iter().product();
+                // Calls per row: a fused group asks once; a stacked one asks
+                // each condition of the rows the earlier ones kept.
+                let calls = if group.fusable() {
+                    1.0
+                } else {
+                    let mut standing = 1.0;
+                    let mut calls = 0.0;
+                    for rate in &rates {
+                        calls += standing;
+                        standing *= rate;
+                    }
+                    calls
+                };
+                let chars = chars.unwrap_or(typical_chars);
+                (kept - 1.0) / ((chars + PROMPT_CHARS) * calls)
+            })
+            .collect();
+        let mut order: Vec<usize> = (0..groups.len()).collect();
+        order.sort_by(|&a, &b| ranks[a].total_cmp(&ranks[b]));
+        let mut taken: Vec<Option<TextGroup>> = groups
+            .iter_mut()
+            .map(|group| {
+                Some(TextGroup {
+                    text: group.text.clone(),
+                    specs: std::mem::take(&mut group.specs),
+                    indexed: group.indexed,
+                })
+            })
+            .collect();
+        for (slot, index) in order.into_iter().enumerate() {
+            groups[slot] = taken[index].take().expect("each group placed once");
+        }
     }
 }
 

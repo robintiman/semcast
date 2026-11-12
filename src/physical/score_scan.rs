@@ -500,6 +500,7 @@ impl Scanner {
             calls: &self.calibration_model_calls,
             calls_merged: &self.calibration_model_calls_merged,
             errors: &self.calibration_label_errors,
+            stats_key: calibration.stats_key,
         };
         let mut labels: Vec<Label> = Vec::new();
         let mut labelled = 0;
