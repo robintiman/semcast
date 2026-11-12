@@ -65,17 +65,13 @@ impl RecallBudgetRule {
         self.runtime.covers(&filter.text, filter.input.schema()) || self.runtime.has_scorer()
     }
 
-    /// The filter's pruning curve from its last calibration, if any.
-    fn curve(&self, filter: &SemFilterNode) -> Option<crate::cache::PruneCurve> {
-        let key = crate::physical::verify::stats_key(
+    /// Where the filter's pruning curve is kept: its statistics key.
+    fn curve_key(&self, filter: &SemFilterNode) -> u128 {
+        crate::physical::verify::stats_key(
             &filter.condition,
             &self.runtime.model.id(),
             &filter.text.to_string(),
-        );
-        self.runtime
-            .cache()
-            .curve(key)
-            .filter(|curve| !curve.is_empty())
+        )
     }
 }
 
@@ -137,8 +133,8 @@ impl OptimizerRule for RecallBudgetRule {
         // The statement's target: every filter that has one has the same.
         let mut target: Option<(f64, Option<f64>)> = None;
         let mut lossy = 0usize;
-        // Each lossy filter's pruning curve, in visiting order.
-        let mut curves: Vec<Option<crate::cache::PruneCurve>> = Vec::new();
+        // Each lossy filter's curve key, in visiting order.
+        let mut keys: Vec<u128> = Vec::new();
         plan.apply_with_subqueries(|node| {
             if let Some(filter) = as_filter(node) {
                 if let Some(recall) = filter.statement_recall {
@@ -146,7 +142,7 @@ impl OptimizerRule for RecallBudgetRule {
                 }
                 if self.lossy(filter) {
                     lossy += 1;
-                    curves.push(self.curve(filter));
+                    keys.push(self.curve_key(filter));
                 }
             }
             Ok(TreeNodeRecursion::Continue)
@@ -160,10 +156,20 @@ impl OptimizerRule for RecallBudgetRule {
         }
         let (equal_recall, confidence) = share(statement_recall, statement_confidence, lossy);
         // With every filter's curve, the loss goes where it prunes most;
-        // otherwise equal shares.
-        let recalls: Vec<f64> = match curves.into_iter().collect::<Option<Vec<_>>>() {
-            Some(curves) if lossy > 1 => allocate(1.0 - statement_recall, &curves),
-            _ => vec![equal_recall; lossy],
+        // otherwise equal shares. Curves are point estimates, so a certified
+        // target splits equally: a certified floor at a high level is far
+        // stricter than its curve says, and recall 1 can't be certified.
+        let curves: Option<Vec<crate::cache::PruneCurve>> =
+            if lossy > 1 && statement_confidence.is_none() {
+                keys.iter()
+                    .map(|key| self.runtime.cache().curve(*key).filter(|c| !c.is_empty()))
+                    .collect()
+            } else {
+                None
+            };
+        let recalls: Vec<f64> = match curves {
+            Some(curves) => allocate(1.0 - statement_recall, &curves),
+            None => vec![equal_recall; lossy],
         };
         let mut next = 0usize;
         plan.transform_down_with_subqueries(|node| {
@@ -202,38 +208,53 @@ pub const CURVE_LEVELS: [f64; 7] = [0.8, 0.85, 0.9, 0.95, 0.97, 0.99, 1.0];
 /// of `population` (each row's score, `None` for one that passes at any
 /// floor) kept by the floor that keeps that share of the sampled matches.
 /// `scored` are the matches' scores, `always` the matches that pass at any
-/// floor, `lost` those lost at any floor. A level the sample can't reach
-/// keeps everything.
+/// floor, `lost` those lost at any floor. A level the sample can't reach,
+/// or reaches with the always-passing matches alone (no floor is set then,
+/// as calibration sets none), keeps everything. `None` when there is nothing
+/// to measure: no known match, or no rows.
 pub fn curve_from(
     scored: &[f32],
     always: usize,
     lost: usize,
     population: &[Option<f32>],
-) -> crate::cache::PruneCurve {
+) -> Option<crate::cache::PruneCurve> {
     let mut scored = scored.to_vec();
     scored.sort_by(|a, b| b.total_cmp(a));
     let matches = scored.len() + always + lost;
-    let rows = population.len().max(1) as f64;
-    CURVE_LEVELS
+    if matches == 0 || population.is_empty() {
+        return None;
+    }
+    let rows = population.len() as f64;
+    let curve = CURVE_LEVELS
         .iter()
         .map(|&level| {
             let needed = (level * matches as f64).ceil() as usize;
-            let kept = if matches == 0 || needed > scored.len() + always {
-                1.0
-            } else {
-                let floor = match needed.checked_sub(always) {
-                    Some(0) | None => f32::INFINITY,
-                    Some(n) => scored[n - 1],
-                };
-                population
-                    .iter()
-                    .filter(|score| score.is_none_or(|s| s >= floor))
-                    .count() as f64
-                    / rows
+            let kept = match needed.checked_sub(always) {
+                Some(n) if n > 0 && n <= scored.len() => {
+                    let floor = scored[n - 1];
+                    population
+                        .iter()
+                        .filter(|score| score.is_none_or(|s| s >= floor))
+                        .count() as f64
+                        / rows
+                }
+                _ => 1.0,
             };
             (level, kept)
         })
-        .collect()
+        .collect();
+    Some(monotone(curve))
+}
+
+/// A curve where asking for more recall never keeps fewer rows: each level
+/// keeps at least what the level below it does.
+pub fn monotone(mut curve: crate::cache::PruneCurve) -> crate::cache::PruneCurve {
+    let mut floor = 0.0f64;
+    for (_, kept) in &mut curve {
+        *kept = kept.max(floor).clamp(0.0, 1.0);
+        floor = *kept;
+    }
+    curve
 }
 
 /// Units the allowed loss is divided into when it is split by curves.
@@ -315,15 +336,20 @@ mod tests {
         // Ten matches scoring 0.1..1.0; population of 100 rows spread evenly.
         let scored: Vec<f32> = (1..=10).map(|i| i as f32 / 10.0).collect();
         let population: Vec<Option<f32>> = (0..100).map(|i| Some(i as f32 / 100.0)).collect();
-        let curve = curve_from(&scored, 0, 0, &population);
+        let curve = curve_from(&scored, 0, 0, &population).unwrap();
         // 0.8 needs 8 matches: floor 0.3, keeping 70 rows.
         assert_eq!(curve[0], (0.8, 0.7));
         // 1.0 needs all ten: floor 0.1, keeping 90.
         assert_eq!(curve.last().copied(), Some((1.0, 0.9)));
         // A lost match makes 1.0 unreachable: everything is kept.
-        let lossy = curve_from(&scored, 0, 1, &population);
+        let lossy = curve_from(&scored, 0, 1, &population).unwrap();
         assert_eq!(lossy.last().copied(), Some((1.0, 1.0)));
         assert!((kept_at(&curve, 0.825) - 0.75).abs() < 1e-9);
+        // Matches that pass any floor meeting a level alone set no floor.
+        let unindexed = curve_from(&[0.9], 9, 0, &population).unwrap();
+        assert_eq!(unindexed[0], (0.8, 1.0));
+        assert!(curve_from(&[], 0, 0, &population).is_none());
+        assert!(curve_from(&scored, 0, 0, &[]).is_none());
     }
 
     #[test]

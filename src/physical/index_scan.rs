@@ -774,10 +774,11 @@ impl Scanner {
                     None => None,
                 })
                 .collect();
-            calibration.cache.record_curve(
-                key,
-                crate::optimizer::budget::curve_from(&scored, always, lost, &population),
-            );
+            if let Some(curve) =
+                crate::optimizer::budget::curve_from(&scored, always, lost, &population)
+            {
+                calibration.cache.record_curve(key, curve);
+            }
         }
         chunks.retain(|hash, _| {
             scores
@@ -1077,10 +1078,21 @@ impl Scanner {
                         unindexed,
                         joint::SCORER_COST,
                     );
-                    (level, at.verify_calls / rows)
+                    // What the funnel costs per row at the level, scorer
+                    // included: what `choose` minimizes, so a higher level
+                    // never looks cheaper.
+                    (
+                        level,
+                        (at.verify_calls + joint::SCORER_COST * at.scorer_calls) / rows,
+                    )
                 })
                 .collect();
-            calibration.cache.record_curve(key, curve);
+            let has_match = labels.iter().any(|(_, label)| *label == Some(true));
+            if has_match && population.len() + unindexed > 0 {
+                calibration
+                    .cache
+                    .record_curve(key, crate::optimizer::budget::monotone(curve));
+            }
         }
         chunks.retain(|hash, _| {
             per_doc_best

@@ -112,3 +112,17 @@ async fn a_calibration_records_its_curve() {
         "{curve:?}"
     );
 }
+
+#[tokio::test]
+async fn a_certified_target_keeps_equal_shares() {
+    // The curves are point estimates; recall 1 could never be certified.
+    let cache = Arc::new(InMemoryCache::default());
+    cache.record_curve(
+        key("asks for a refund"),
+        vec![(0.8, 0.9), (0.9, 0.9), (1.0, 0.9)],
+    );
+    cache.record_curve(key("is angry"), vec![(0.8, 0.1), (0.9, 0.3), (1.0, 1.0)]);
+    let ctx = context(cache).await;
+    let plan = explain(&ctx, &format!("{QUERY} WITH CONFIDENCE 0.9")).await;
+    assert_eq!(plan.matches("recall ≥ 0.95 certified").count(), 2, "{plan}");
+}

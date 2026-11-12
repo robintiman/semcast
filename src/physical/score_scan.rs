@@ -459,10 +459,11 @@ impl Scanner {
                 .iter()
                 .map(|hash| scores.get(hash).copied())
                 .collect();
-            self.calibration.cache.record_curve(
-                key,
-                crate::optimizer::budget::curve_from(&scored, always, 0, &population),
-            );
+            if let Some(curve) =
+                crate::optimizer::budget::curve_from(&scored, always, 0, &population)
+            {
+                self.calibration.cache.record_curve(key, curve);
+            }
         }
         // A sampled match is already paid for, and a failed label may be
         // one: never prune either, whatever the scorer said. Verify reads
