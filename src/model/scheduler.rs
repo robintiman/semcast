@@ -280,6 +280,19 @@ impl ModelProvider for Scheduler {
         self.inner.embed(texts).await
     }
 
+    fn embed_id(&self) -> ModelId {
+        self.inner.embed_id()
+    }
+
+    async fn embed_queries(&self, texts: Vec<String>) -> Result<Vec<Embedding>> {
+        let _permit = self
+            .permits
+            .acquire()
+            .await
+            .expect("the scheduler never closes its semaphore");
+        self.inner.embed_queries(texts).await
+    }
+
     fn embed_batch_size(&self) -> usize {
         self.inner.embed_batch_size()
     }

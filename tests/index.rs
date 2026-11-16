@@ -1470,3 +1470,104 @@ async fn an_index_built_right_after_its_table_is_replaced_keeps_its_documents() 
     let index = runtime.index_for("t", "body").unwrap();
     assert_eq!(index.indexed_doc_hashes().await.unwrap().len(), 3);
 }
+
+/// Vectors are keyed by the embedder, not the chat model: a session that
+/// chats with another model but embeds with the same one reads them back.
+#[tokio::test]
+async fn stored_vectors_survive_a_chat_model_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store.sqlite");
+    let session = |chat: &str| {
+        let model = Arc::new(
+            MockModel::answering_yes_to(["offline sync"])
+                .with_id(chat)
+                .with_embed_id("embedder"),
+        );
+        let store = semcast::index::stored::SqliteChunkStore::open(&path).unwrap();
+        let ctx = semcast::SemcastContextBuilder::new(Arc::clone(&model) as _)
+            .with_chunk_store(Arc::new(store))
+            .build();
+        (model, ctx)
+    };
+    let table = format!(
+        "CREATE TABLE meetings AS SELECT * FROM (VALUES (1, '{MATCHING}'), (2, '{OTHER}')) \
+         AS t(meeting_id, transcript)",
+    );
+    let (first, ctx) = session("chat-a");
+    ctx.sql(&table).await.unwrap().collect().await.unwrap();
+    let index = create_semantic_index(&ctx, "meetings", "transcript", IndexOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(index.embed_model_id(), ModelId("embedder".into()));
+    assert!(first.embed_calls() > 1);
+
+    let (second, ctx) = session("chat-b");
+    ctx.sql(&table).await.unwrap().collect().await.unwrap();
+    create_semantic_index(&ctx, "meetings", "transcript", IndexOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        second.embed_calls(),
+        1,
+        "only the dimension probe: the chunks' vectors are the same embedder's"
+    );
+}
+
+/// The index embeds its query as a query, not as a document.
+#[tokio::test]
+async fn the_index_embeds_its_query_as_a_query() {
+    let model = Arc::new(MockModel::answering_yes_to(["offline sync"]));
+    let ctx = separable_context(Arc::clone(&model)).await;
+    create_semantic_index(&ctx, "meetings", "transcript", IndexOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(model.query_embed_calls(), 0, "documents are not queries");
+    matching_ids(
+        &ctx,
+        "SELECT meeting_id FROM meetings WHERE transcript MEANS 'sync'",
+    )
+    .await;
+    assert_eq!(model.query_embed_calls(), 1);
+}
+
+/// Builds before the embedder had an id of its own saved the chat model's.
+/// Those vectors are keyed under the wrong name and were embedded without
+/// the embedder's prefixes, so restoring the entry rebuilds it.
+#[tokio::test]
+async fn an_index_saved_under_the_chat_models_id_is_rebuilt() {
+    let model = Arc::new(
+        MockModel::answering_yes_to(["offline sync"])
+            .with_id("chat")
+            .with_embed_id("embedder"),
+    );
+    let ctx = semcast_context(Arc::clone(&model) as _);
+    ctx.sql(&format!(
+        "CREATE TABLE meetings AS SELECT * FROM (VALUES (1, '{MATCHING}'), (2, '{OTHER}')) \
+         AS t(meeting_id, transcript)",
+    ))
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+    let saved = |embed_model: &str| {
+        format!(
+            r#"{{"table":"meetings","column":"transcript","embed_model":"{embed_model}",
+            "dim":256,"chunk_max_tokens":512,"chunk_overlap_tokens":64,
+            "fetch_k":256,"score_floor":0.35,"chunks_per_doc":3}}"#
+        )
+    };
+    let index = semcast::reattach_semantic_index(&ctx, &saved("chat"))
+        .await
+        .unwrap();
+    assert!(model.embed_calls() > 1, "rebuilt by embedding its column");
+    assert_eq!(index.embed_model_id(), ModelId("embedder".into()));
+    assert_eq!(index.indexed_doc_hashes().await.unwrap().len(), 2);
+
+    // Another embedder's index is still refused, not silently rebuilt.
+    let error = semcast::reattach_semantic_index(&ctx, &saved("someone-else"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("recreate it"), "{error}");
+}

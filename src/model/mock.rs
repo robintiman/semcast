@@ -37,6 +37,9 @@ pub struct MockModel {
     yes_probability: Option<YesProbability>,
     /// See [`MockModel::with_id`]; `None` is "mock".
     id: Option<String>,
+    /// See [`MockModel::with_embed_id`]; `None` is the model id.
+    embed_id: Option<String>,
+    query_embeds: AtomicUsize,
 }
 
 type YesProbability = Arc<dyn Fn(&str) -> f32 + Send + Sync>;
@@ -161,6 +164,19 @@ impl MockModel {
         self
     }
 
+    /// How many [`ModelProvider::embed_queries`] calls were made (each also
+    /// counts in [`MockModel::embed_calls`]).
+    pub fn query_embed_calls(&self) -> usize {
+        self.query_embeds.load(Ordering::Relaxed)
+    }
+
+    /// Report this embedder id instead of the model id, as a provider that
+    /// chats and embeds with different models does.
+    pub fn with_embed_id(mut self, id: impl Into<String>) -> Self {
+        self.embed_id = Some(id.into());
+        self
+    }
+
     /// Sleep this long in every `complete` call. Real providers take seconds
     /// per batch; tests that need to observe a query *while it runs* — batch
     /// job progress, cancellation — need a mock that isn't instantaneous.
@@ -174,6 +190,18 @@ impl MockModel {
 impl ModelProvider for MockModel {
     fn id(&self) -> ModelId {
         ModelId(self.id.clone().unwrap_or_else(|| "mock".to_owned()))
+    }
+
+    fn embed_id(&self) -> ModelId {
+        self.embed_id
+            .clone()
+            .map(ModelId)
+            .unwrap_or_else(|| self.id())
+    }
+
+    async fn embed_queries(&self, texts: Vec<String>) -> Result<Vec<Embedding>> {
+        self.query_embeds.fetch_add(1, Ordering::Relaxed);
+        self.embed(texts).await
     }
 
     async fn complete(&self, requests: Vec<CompletionRequest>) -> Vec<Result<Completion>> {

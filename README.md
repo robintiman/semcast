@@ -89,7 +89,7 @@ Flags of `semcast serve`:
 | `--model` | per provider | `qwen3.8:27b` (Ollama), `claude-haiku-4-5` (Anthropic) |
 | `--scorer-model` | off | small Ollama model that pre-filters an unindexed `MEANS` under [`WITH RECALL`](#with-recall) |
 | `--embed-provider` | `ollama` | embeddings: `ollama` or `voyage` |
-| `--embed-model` | `nomic-embed-text` | Ollama embedding model |
+| `--embed-model` | `nomic-embed-text` | Ollama embedding model; nomic models get their `search_query: ` / `search_document: ` prefixes |
 | `--voyage-model` | `voyage-4-large` | Voyage embedding model |
 | `--ollama-url` | `http://localhost:11434` | |
 | `--ollama-num-ctx` | `32768` | context Ollama is asked for, in tokens; a longer input fails its row instead of being silently truncated. Raise it for long documents (memory grows with it) |
@@ -106,7 +106,10 @@ Set `--store semcast.db` to keep state across restarts:
 * **Definitions.** Databases, schemas, external tables, views, semantic types,
   semantic indexes and semantic columns come back.
 * **Indexes** come back without re-embedding: their vectors are kept in the
-  same file. Set `--jobs-dir` to a directory that outlives the temp dir to
+  same file, keyed by the embedding model, so changing `--model` keeps them
+  and changing `--embed-model` needs a new `CREATE SEMANTIC INDEX`. An index
+  saved by v0.4.1 or earlier, which keyed them by the chat model, is rebuilt
+  once on restore. Set `--jobs-dir` to a directory that outlives the temp dir to
   keep job results too.
 * **Not kept:** in-memory tables (`CREATE TABLE ... AS`) and the views and
   indexes over them.

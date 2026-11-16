@@ -157,7 +157,9 @@ plan's row estimate and the store's history for that filter; it decides nothing.
   `MEANS` condition is normalized where it enters (`destructure_means`) and
   every key is built from it, so stored answers keep matching.
   `DefaultHasher` is only stable within one binary and must not key anything
-  durable.
+  durable. Stored vectors are keyed by `ModelProvider::embed_id` (the
+  embedder, not the chat model); a provider wrapping another must forward it
+  and `embed_queries`, or the defaults silently stand in.
 - Cache keys carry a prompt version (`MEANS_PROMPT_VERSION`,
   `EXTRACT_PROMPT_VERSION`, `SemanticType::version`). Change a synthesized prompt
   and bump its constant, so stale verdicts are invalidated honestly.

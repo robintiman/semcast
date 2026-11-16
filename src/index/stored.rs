@@ -453,7 +453,7 @@ impl std::fmt::Debug for StoredIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StoredIndex")
             .field("name", &self.name)
-            .field("embed_model", &self.embedder.id().0)
+            .field("embed_model", &self.embedder.embed_id().0)
             .field("dim", &self.dim)
             .finish_non_exhaustive()
     }
@@ -478,7 +478,7 @@ impl StoredIndex {
             .ok_or_else(|| {
                 SemcastError::Index(format!(
                     "embedder {} returned an empty embedding",
-                    embedder.id().0
+                    embedder.embed_id().0
                 ))
             })?;
         Ok(Self::open(name, store, embedder, chunk_config, params, dim))
@@ -540,7 +540,7 @@ impl StoredIndex {
         if chunk_texts.is_empty() {
             return Ok((0, Vec::new()));
         }
-        let model = self.embedder.id();
+        let model = self.embedder.embed_id();
         let keys: Vec<[u8; 16]> = chunk_texts
             .iter()
             .map(|text| embedding_key(&model, self.dim, text))
@@ -565,7 +565,7 @@ impl StoredIndex {
 
     /// Embed (and store) every chunk the store has no vector for.
     async fn ensure_vectors(&self, texts: &[String], keys: &[[u8; 16]]) -> Result<()> {
-        let model = self.embedder.id();
+        let model = self.embedder.embed_id();
         let store = Arc::clone(&self.store);
         let lookup = keys.to_vec();
         let stored = blocking(move || store.vectors(&lookup)).await?;
@@ -605,7 +605,7 @@ impl StoredIndex {
     }
 
     async fn embed_query(&self, query: &str) -> Result<Embedding> {
-        let mut embedded = self.embedder.embed(vec![query.to_owned()]).await?;
+        let mut embedded = self.embedder.embed_queries(vec![query.to_owned()]).await?;
         embedded
             .pop()
             .filter(|vector| vector.len() == self.dim)
@@ -613,7 +613,7 @@ impl StoredIndex {
                 SemcastError::Index(format!(
                     "embedder {} did not return a {}-dimensional query vector; recreate \
                      the index with CREATE SEMANTIC INDEX if the model changed",
-                    self.embedder.id().0,
+                    self.embedder.embed_id().0,
                     self.dim
                 ))
             })
@@ -657,7 +657,7 @@ impl StoredIndex {
 #[async_trait]
 impl SemanticIndex for StoredIndex {
     fn embed_model_id(&self) -> ModelId {
-        self.embedder.id()
+        self.embedder.embed_id()
     }
 
     fn search_params(&self) -> SearchParams {

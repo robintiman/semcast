@@ -92,7 +92,25 @@ pub trait ModelProvider: std::fmt::Debug + Send + Sync {
 
     async fn complete(&self, requests: Vec<CompletionRequest>) -> Vec<Result<Completion>>;
 
+    /// Embed documents: what an index stores and searches.
     async fn embed(&self, texts: Vec<String>) -> Result<Vec<Embedding>>;
+
+    /// The model behind [`embed`](Self::embed), which keys every stored
+    /// vector. A provider that chats with one model and embeds with another
+    /// must name the embedder here, or vectors outlive a chat model change
+    /// under the wrong name (and a new embedder reads the old one's).
+    fn embed_id(&self) -> ModelId {
+        self.id()
+    }
+
+    /// Embed search queries, to compare against [`embed`](Self::embed)'s
+    /// documents. Some embedders were trained to embed the two sides
+    /// differently (nomic-embed-text's `search_query: ` prefix); the default
+    /// embeds them alike. A provider wrapping another must forward this and
+    /// [`embed_id`](Self::embed_id), or it silently drops them.
+    async fn embed_queries(&self, texts: Vec<String>) -> Result<Vec<Embedding>> {
+        self.embed(texts).await
+    }
 
     /// Preferred number of texts per embed request. The index groups chunks
     /// into windows of this size before calling [`embed`](Self::embed), so a

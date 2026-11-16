@@ -199,7 +199,7 @@ pub async fn create_semantic_index(
         let saved = SavedIndex {
             table: table.to_owned(),
             column: column.to_owned(),
-            embed_model: Some(embedder.id().0),
+            embed_model: Some(embedder.embed_id().0),
             dim: Some(dim),
             chunk_max_tokens: Some(options.chunk.max_tokens),
             chunk_overlap_tokens: Some(options.chunk.overlap_tokens),
@@ -290,13 +290,37 @@ pub async fn reattach_semantic_index(
         )
         .await;
     };
-    if &embedder.id().0 != embed_model {
+    // Builds before the embedder had an id of its own saved the chat
+    // model's: vectors keyed under the wrong name, embedded without the
+    // embedder's search prefixes. Rebuild them, as a Lance-era entry is.
+    if &embedder.embed_id().0 != embed_model && &embedder.id().0 == embed_model {
+        tracing::warn!(
+            table = %saved.table,
+            column = %saved.column,
+            "semantic index saved under the chat model's id; rebuilding it from its column"
+        );
+        return create_semantic_index(
+            ctx,
+            &saved.table,
+            &saved.column,
+            IndexOptions {
+                embedder: None,
+                chunk: ChunkConfig {
+                    max_tokens,
+                    overlap_tokens,
+                },
+                search,
+            },
+        )
+        .await;
+    }
+    if &embedder.embed_id().0 != embed_model {
         return Err(SemcastError::Index(format!(
             "the semantic index on {}({}) was built with embedder {embed_model}, but the \
              session embeds with {}; recreate it with CREATE SEMANTIC INDEX",
             saved.table,
             saved.column,
-            embedder.id().0
+            embedder.embed_id().0
         )));
     }
     let name = crate::catalog::index_name(&saved.table, &saved.column);

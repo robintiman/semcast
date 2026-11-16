@@ -47,6 +47,39 @@ impl FallbackProvider {
         );
         Self { models, id }
     }
+
+    /// Each model in turn until one embeds the whole batch.
+    async fn embed_down_the_chain(
+        &self,
+        texts: Vec<String>,
+        queries: bool,
+    ) -> Result<Vec<Embedding>> {
+        let mut last_error = None;
+        for (rank, model) in self.models.iter().enumerate() {
+            let embedded = if queries {
+                model.embed_queries(texts.clone()).await
+            } else {
+                model.embed(texts.clone()).await
+            };
+            match embedded {
+                Ok(embeddings) => return Ok(embeddings),
+                Err(error) => {
+                    if rank + 1 < self.models.len() {
+                        tracing::warn!(
+                            target: "semcast::model",
+                            failed = %model.id(),
+                            next = %self.models[rank + 1].id(),
+                            error = %error,
+                            "falling back to the next embedder",
+                        );
+                    }
+                    last_error = Some(error);
+                }
+            }
+        }
+        Err(last_error
+            .unwrap_or_else(|| SemcastError::Model("no embedder answered the batch".into())))
+    }
 }
 
 #[async_trait]
@@ -127,26 +160,23 @@ impl ModelProvider for FallbackProvider {
     /// `Result` for the whole batch, so there are no individual failures to
     /// route and the next model re-embeds everything.
     async fn embed(&self, texts: Vec<String>) -> Result<Vec<Embedding>> {
-        let mut last_error = None;
-        for (rank, model) in self.models.iter().enumerate() {
-            match model.embed(texts.clone()).await {
-                Ok(embeddings) => return Ok(embeddings),
-                Err(error) => {
-                    if rank + 1 < self.models.len() {
-                        tracing::warn!(
-                            target: "semcast::model",
-                            failed = %model.id(),
-                            next = %self.models[rank + 1].id(),
-                            error = %error,
-                            "falling back to the next embedder",
-                        );
-                    }
-                    last_error = Some(error);
-                }
-            }
-        }
-        Err(last_error
-            .unwrap_or_else(|| SemcastError::Model("no embedder answered the batch".into())))
+        self.embed_down_the_chain(texts, false).await
+    }
+
+    /// Names every link's embedder, as [`id`](Self::id) names every chat
+    /// model: any of them may have made a vector.
+    fn embed_id(&self) -> ModelId {
+        ModelId(
+            self.models
+                .iter()
+                .map(|m| m.embed_id().0)
+                .collect::<Vec<_>>()
+                .join("+"),
+        )
+    }
+
+    async fn embed_queries(&self, texts: Vec<String>) -> Result<Vec<Embedding>> {
+        self.embed_down_the_chain(texts, true).await
     }
 
     /// The primary's preference. A fallback batches to whatever the model it

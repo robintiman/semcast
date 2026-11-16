@@ -29,6 +29,17 @@ use crate::{Result, SemcastError};
 pub const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
 pub const DEFAULT_CHAT_MODEL: &str = "qwen3.8:27b";
 pub const DEFAULT_EMBED_MODEL: &str = "nomic-embed-text";
+
+/// The (query, document) prefixes an embedder was trained with, which it
+/// needs to rank documents against a query well. nomic-embed-text (v1, v1.5
+/// and v2) was trained on `search_query: ` / `search_document: ` pairs.
+/// Part of what a stored vector is: changing them must change
+/// [`ModelProvider::embed_id`](super::ModelProvider::embed_id).
+fn search_prefixes(embed_model: &str) -> Option<(&'static str, &'static str)> {
+    embed_model
+        .contains("nomic-embed-text")
+        .then_some(("search_query: ", "search_document: "))
+}
 /// Context length requested by default, in tokens: room for a document of
 /// about 120k characters (nine CUAD contracts in ten). Raise it with
 /// `--ollama-num-ctx` for longer ones, up to the model's own limit; memory
@@ -78,6 +89,38 @@ impl OllamaProvider {
     pub fn with_embed_model(mut self, embed_model: impl Into<String>) -> Self {
         self.embed_model = embed_model.into();
         self
+    }
+
+    /// One `/api/embed` call, each text behind `prefix` if the model wants one.
+    async fn embed_with(&self, texts: Vec<String>, prefix: Option<&str>) -> Result<Vec<Embedding>> {
+        let texts: Vec<String> = match prefix {
+            Some(prefix) => texts
+                .into_iter()
+                .map(|text| format!("{prefix}{text}"))
+                .collect(),
+            None => texts,
+        };
+        let response = super::send_with_retry("ollama", || {
+            self.client
+                .post(format!("{}/api/embed", self.base_url))
+                .json(&EmbedRequest {
+                    model: &self.embed_model,
+                    input: &texts,
+                })
+        })
+        .await?;
+        let embed: EmbedResponse = response
+            .json()
+            .await
+            .map_err(|e| SemcastError::Model(format!("invalid ollama embed response: {e}")))?;
+        if embed.embeddings.len() != texts.len() {
+            return Err(SemcastError::Model(format!(
+                "ollama returned {} embeddings for {} inputs",
+                embed.embeddings.len(),
+                texts.len()
+            )));
+        }
+        Ok(embed.embeddings)
     }
 
     /// Request this context length, in tokens (see the module docs).
@@ -190,27 +233,17 @@ impl ModelProvider for OllamaProvider {
     }
 
     async fn embed(&self, texts: Vec<String>) -> Result<Vec<Embedding>> {
-        let response = super::send_with_retry("ollama", || {
-            self.client
-                .post(format!("{}/api/embed", self.base_url))
-                .json(&EmbedRequest {
-                    model: &self.embed_model,
-                    input: &texts,
-                })
-        })
-        .await?;
-        let embed: EmbedResponse = response
-            .json()
-            .await
-            .map_err(|e| SemcastError::Model(format!("invalid ollama embed response: {e}")))?;
-        if embed.embeddings.len() != texts.len() {
-            return Err(SemcastError::Model(format!(
-                "ollama returned {} embeddings for {} inputs",
-                embed.embeddings.len(),
-                texts.len()
-            )));
-        }
-        Ok(embed.embeddings)
+        let prefix = search_prefixes(&self.embed_model).map(|(_, document)| document);
+        self.embed_with(texts, prefix).await
+    }
+
+    fn embed_id(&self) -> ModelId {
+        ModelId(format!("ollama/{}", self.embed_model))
+    }
+
+    async fn embed_queries(&self, texts: Vec<String>) -> Result<Vec<Embedding>> {
+        let prefix = search_prefixes(&self.embed_model).map(|(query, _)| query);
+        self.embed_with(texts, prefix).await
     }
 }
 
@@ -319,6 +352,103 @@ struct EmbedResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One `/api/embed` exchange: answers one vector per input and hands
+    /// back the request body.
+    async fn embed_server() -> (String, tokio::task::JoinHandle<serde_json::Value>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let served = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 4096];
+            let body = loop {
+                let n = socket.read(&mut buf).await.unwrap();
+                request.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&request).to_string();
+                if let Some(end) = text.find("\r\n\r\n") {
+                    let length: usize = text[..end]
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= end + 4 + length {
+                        break serde_json::from_slice::<serde_json::Value>(
+                            &request[end + 4..end + 4 + length],
+                        )
+                        .unwrap();
+                    }
+                }
+            };
+            let inputs = body["input"].as_array().unwrap().len();
+            let answer =
+                serde_json::json!({ "embeddings": vec![vec![1.0_f32]; inputs] }).to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{answer}",
+                answer.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            body
+        });
+        (url, served)
+    }
+
+    #[tokio::test]
+    async fn nomic_embeds_documents_and_queries_behind_their_prefixes() {
+        let (url, served) = embed_server().await;
+        let ollama = OllamaProvider::new("qwen3.8:27b").with_base_url(&url);
+        ollama.embed(vec!["a contract".into()]).await.unwrap();
+        let body = served.await.unwrap();
+        assert_eq!(body["model"], "nomic-embed-text");
+        assert_eq!(
+            body["input"],
+            serde_json::json!(["search_document: a contract"])
+        );
+
+        let (url, served) = embed_server().await;
+        let ollama = OllamaProvider::new("qwen3.8:27b").with_base_url(&url);
+        ollama
+            .embed_queries(vec!["non-compete".into()])
+            .await
+            .unwrap();
+        assert_eq!(
+            served.await.unwrap()["input"],
+            serde_json::json!(["search_query: non-compete"])
+        );
+    }
+
+    #[tokio::test]
+    async fn other_embedders_get_no_prefix() {
+        let (url, served) = embed_server().await;
+        let ollama = OllamaProvider::new("qwen3.8:27b")
+            .with_base_url(&url)
+            .with_embed_model("mxbai-embed-large");
+        ollama
+            .embed_queries(vec!["non-compete".into()])
+            .await
+            .unwrap();
+        assert_eq!(
+            served.await.unwrap()["input"],
+            serde_json::json!(["non-compete"])
+        );
+    }
+
+    /// Vectors are keyed by the embedder, not the chat model: changing
+    /// `--model` keeps them, changing `--embed-model` does not.
+    #[test]
+    fn the_embedder_has_its_own_id() {
+        let ollama = OllamaProvider::new("qwen3.8:27b");
+        assert_eq!(ollama.id(), ModelId("ollama/qwen3.8:27b".into()));
+        assert_eq!(ollama.embed_id(), ModelId("ollama/nomic-embed-text".into()));
+        assert_eq!(
+            ollama.with_embed_model("mxbai-embed-large").embed_id(),
+            ModelId("ollama/mxbai-embed-large".into())
+        );
+    }
 
     #[test]
     fn an_answer_cut_by_the_context_is_not_used() {
