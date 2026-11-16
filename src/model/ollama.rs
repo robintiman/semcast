@@ -30,16 +30,6 @@ pub const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
 pub const DEFAULT_CHAT_MODEL: &str = "qwen3.8:27b";
 pub const DEFAULT_EMBED_MODEL: &str = "nomic-embed-text";
 
-/// The (query, document) prefixes an embedder was trained with, which it
-/// needs to rank documents against a query well. nomic-embed-text (v1, v1.5
-/// and v2) was trained on `search_query: ` / `search_document: ` pairs.
-/// Part of what a stored vector is: changing them must change
-/// [`ModelProvider::embed_id`](super::ModelProvider::embed_id).
-fn search_prefixes(embed_model: &str) -> Option<(&'static str, &'static str)> {
-    embed_model
-        .contains("nomic-embed-text")
-        .then_some(("search_query: ", "search_document: "))
-}
 /// Context length requested by default, in tokens: room for a document of
 /// about 120k characters (nine CUAD contracts in ten). Raise it with
 /// `--ollama-num-ctx` for longer ones, up to the model's own limit; memory
@@ -91,15 +81,8 @@ impl OllamaProvider {
         self
     }
 
-    /// One `/api/embed` call, each text behind `prefix` if the model wants one.
-    async fn embed_with(&self, texts: Vec<String>, prefix: Option<&str>) -> Result<Vec<Embedding>> {
-        let texts: Vec<String> = match prefix {
-            Some(prefix) => texts
-                .into_iter()
-                .map(|text| format!("{prefix}{text}"))
-                .collect(),
-            None => texts,
-        };
+    /// One `/api/embed` call.
+    async fn embed_texts(&self, texts: Vec<String>) -> Result<Vec<Embedding>> {
         let response = super::send_with_retry("ollama", || {
             self.client
                 .post(format!("{}/api/embed", self.base_url))
@@ -233,17 +216,18 @@ impl ModelProvider for OllamaProvider {
     }
 
     async fn embed(&self, texts: Vec<String>) -> Result<Vec<Embedding>> {
-        let prefix = search_prefixes(&self.embed_model).map(|(_, document)| document);
-        self.embed_with(texts, prefix).await
+        self.embed_texts(texts).await
     }
 
+    /// The embed model, not the chat model: it made the vectors.
+    ///
+    /// Queries and documents are embedded alike. nomic-embed-text's model
+    /// card asks for `search_query: ` / `search_document: ` prefixes, but on
+    /// CUAD (509 contracts, 5 clauses) they ranked worse on every clause
+    /// (AUC 0.64 to 0.84 against 0.67 to 0.85 without). Adding prefixes
+    /// later changes every vector, so it must change this id.
     fn embed_id(&self) -> ModelId {
         ModelId(format!("ollama/{}", self.embed_model))
-    }
-
-    async fn embed_queries(&self, texts: Vec<String>) -> Result<Vec<Embedding>> {
-        let prefix = search_prefixes(&self.embed_model).map(|(query, _)| query);
-        self.embed_with(texts, prefix).await
     }
 }
 
@@ -398,43 +382,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nomic_embeds_documents_and_queries_behind_their_prefixes() {
-        let (url, served) = embed_server().await;
-        let ollama = OllamaProvider::new("qwen3.8:27b").with_base_url(&url);
-        ollama.embed(vec!["a contract".into()]).await.unwrap();
-        let body = served.await.unwrap();
-        assert_eq!(body["model"], "nomic-embed-text");
-        assert_eq!(
-            body["input"],
-            serde_json::json!(["search_document: a contract"])
-        );
-
-        let (url, served) = embed_server().await;
-        let ollama = OllamaProvider::new("qwen3.8:27b").with_base_url(&url);
-        ollama
-            .embed_queries(vec!["non-compete".into()])
-            .await
-            .unwrap();
-        assert_eq!(
-            served.await.unwrap()["input"],
-            serde_json::json!(["search_query: non-compete"])
-        );
-    }
-
-    #[tokio::test]
-    async fn other_embedders_get_no_prefix() {
-        let (url, served) = embed_server().await;
-        let ollama = OllamaProvider::new("qwen3.8:27b")
-            .with_base_url(&url)
-            .with_embed_model("mxbai-embed-large");
-        ollama
-            .embed_queries(vec!["non-compete".into()])
-            .await
-            .unwrap();
-        assert_eq!(
-            served.await.unwrap()["input"],
-            serde_json::json!(["non-compete"])
-        );
+    async fn queries_and_documents_are_embedded_alike() {
+        for queries in [false, true] {
+            let (url, served) = embed_server().await;
+            let ollama = OllamaProvider::new("qwen3.8:27b").with_base_url(&url);
+            let texts = vec!["non-compete".to_owned()];
+            if queries {
+                ollama.embed_queries(texts).await.unwrap();
+            } else {
+                ollama.embed(texts).await.unwrap();
+            }
+            let body = served.await.unwrap();
+            assert_eq!(body["model"], "nomic-embed-text");
+            assert_eq!(body["input"], serde_json::json!(["non-compete"]));
+        }
     }
 
     /// Vectors are keyed by the embedder, not the chat model: changing

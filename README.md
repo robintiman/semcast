@@ -89,7 +89,7 @@ Flags of `semcast serve`:
 | `--model` | per provider | `qwen3.8:27b` (Ollama), `claude-haiku-4-5` (Anthropic) |
 | `--scorer-model` | off | small Ollama model that pre-filters an unindexed `MEANS` under [`WITH RECALL`](#with-recall) |
 | `--embed-provider` | `ollama` | embeddings: `ollama` or `voyage` |
-| `--embed-model` | `nomic-embed-text` | Ollama embedding model; nomic models get their `search_query: ` / `search_document: ` prefixes |
+| `--embed-model` | `nomic-embed-text` | Ollama embedding model |
 | `--voyage-model` | `voyage-4-large` | Voyage embedding model |
 | `--ollama-url` | `http://localhost:11434` | |
 | `--ollama-num-ctx` | `32768` | context Ollama is asked for, in tokens; a longer input fails its row instead of being silently truncated. Raise it for long documents (memory grows with it) |

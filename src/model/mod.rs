@@ -103,10 +103,16 @@ pub trait ModelProvider: std::fmt::Debug + Send + Sync {
         self.id()
     }
 
+    /// Whether [`embed`](Self::embed) can answer at all. A chat-only
+    /// provider (Anthropic) says no, so a fallback chain leaves it out of
+    /// the chain's [`embed_id`](Self::embed_id) and never asks it to embed.
+    fn embeds(&self) -> bool {
+        true
+    }
+
     /// Embed search queries, to compare against [`embed`](Self::embed)'s
     /// documents. Some embedders were trained to embed the two sides
-    /// differently (nomic-embed-text's `search_query: ` prefix); the default
-    /// embeds them alike. A provider wrapping another must forward this and
+    /// differently (Voyage's `input_type`); the default embeds them alike. A provider wrapping another must forward this and
     /// [`embed_id`](Self::embed_id), or it silently drops them.
     async fn embed_queries(&self, texts: Vec<String>) -> Result<Vec<Embedding>> {
         self.embed(texts).await

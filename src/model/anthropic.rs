@@ -158,6 +158,10 @@ impl ModelProvider for AnthropicProvider {
         super::complete_concurrently(requests, |req| self.complete_one(req)).await
     }
 
+    fn embeds(&self) -> bool {
+        false
+    }
+
     async fn embed(&self, _texts: Vec<String>) -> Result<Vec<Embedding>> {
         Err(SemcastError::Model(
             "the Anthropic API has no embedding models; use OllamaProvider or \

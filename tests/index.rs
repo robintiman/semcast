@@ -126,7 +126,7 @@ async fn reattaching_with_a_different_embedder_errors() {
 
     // What the catalog saves for an index built with the mock embedder.
     let definition = r#"{"table":"meetings","column":"transcript","embed_model":"mock",
-        "chunk_max_tokens":512,"chunk_overlap_tokens":64,
+        "embed_key":1,"chunk_max_tokens":512,"chunk_overlap_tokens":64,
         "fetch_k":256,"score_floor":0.35,"chunks_per_doc":3}"#;
     let ctx = semcast_context(Arc::new(OtherEmbedder(MockModel::default())));
     let err = semcast::reattach_semantic_index(&ctx, definition)
@@ -1530,9 +1530,9 @@ async fn the_index_embeds_its_query_as_a_query() {
     assert_eq!(model.query_embed_calls(), 1);
 }
 
-/// Builds before the embedder had an id of its own saved the chat model's.
-/// Those vectors are keyed under the wrong name and were embedded without
-/// the embedder's prefixes, so restoring the entry rebuilds it.
+/// Builds before the embedder had an id of its own saved the chat model's,
+/// which says nothing of what embedded the vectors, so restoring the entry
+/// rebuilds it with the session's embedder.
 #[tokio::test]
 async fn an_index_saved_under_the_chat_models_id_is_rebuilt() {
     let model = Arc::new(
@@ -1550,22 +1550,30 @@ async fn an_index_saved_under_the_chat_models_id_is_rebuilt() {
     .collect()
     .await
     .unwrap();
-    let saved = |embed_model: &str| {
+    let saved = |embed_model: &str, embed_key: &str| {
         format!(
-            r#"{{"table":"meetings","column":"transcript","embed_model":"{embed_model}",
+            r#"{{"table":"meetings","column":"transcript","embed_model":"{embed_model}",{embed_key}
             "dim":256,"chunk_max_tokens":512,"chunk_overlap_tokens":64,
             "fetch_k":256,"score_floor":0.35,"chunks_per_doc":3}}"#
         )
     };
-    let index = semcast::reattach_semantic_index(&ctx, &saved("chat"))
+    let index = semcast::reattach_semantic_index(&ctx, &saved("chat", ""))
         .await
         .unwrap();
     assert!(model.embed_calls() > 1, "rebuilt by embedding its column");
     assert_eq!(index.embed_model_id(), ModelId("embedder".into()));
     assert_eq!(index.indexed_doc_hashes().await.unwrap().len(), 2);
 
-    // Another embedder's index is still refused, not silently rebuilt.
-    let error = semcast::reattach_semantic_index(&ctx, &saved("someone-else"))
+    // An unversioned entry already under the embedder's id is reattached
+    // as it is: nothing embedded.
+    let calls = model.embed_calls();
+    semcast::reattach_semantic_index(&ctx, &saved("embedder", ""))
+        .await
+        .unwrap();
+    assert_eq!(model.embed_calls(), calls);
+
+    // A versioned entry of another embedder is still refused, not rebuilt.
+    let error = semcast::reattach_semantic_index(&ctx, &saved("someone-else", r#""embed_key":1,"#))
         .await
         .unwrap_err()
         .to_string();

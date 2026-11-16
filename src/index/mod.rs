@@ -200,6 +200,7 @@ pub async fn create_semantic_index(
             table: table.to_owned(),
             column: column.to_owned(),
             embed_model: Some(embedder.embed_id().0),
+            embed_key: Some(EMBED_KEY_VERSION),
             dim: Some(dim),
             chunk_max_tokens: Some(options.chunk.max_tokens),
             chunk_overlap_tokens: Some(options.chunk.overlap_tokens),
@@ -222,6 +223,11 @@ pub async fn create_semantic_index(
     Ok(index)
 }
 
+/// Saved with every index whose `embed_model` is the embedder's
+/// [`embed_id`](crate::model::ModelProvider::embed_id). Earlier builds saved
+/// the chat model's id there, and their vectors are rebuilt on restore.
+const EMBED_KEY_VERSION: u32 = 1;
+
 /// What the durable catalog keeps of a semantic index: enough to reopen its
 /// stored chunks without embedding anything. An entry written by a build
 /// that kept indexes in Lance has a `path` and none of the chunking fields;
@@ -232,6 +238,11 @@ struct SavedIndex {
     column: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     embed_model: Option<String>,
+    /// [`EMBED_KEY_VERSION`] for an entry whose `embed_model` names the
+    /// embedder; absent from one saved before, whose `embed_model` was the
+    /// chat model's id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    embed_key: Option<u32>,
     /// The dimension of the index's vectors.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     dim: Option<usize>,
@@ -291,13 +302,17 @@ pub async fn reattach_semantic_index(
         .await;
     };
     // Builds before the embedder had an id of its own saved the chat
-    // model's: vectors keyed under the wrong name, embedded without the
-    // embedder's search prefixes. Rebuild them, as a Lance-era entry is.
-    if &embedder.embed_id().0 != embed_model && &embedder.id().0 == embed_model {
+    // model's (an Ollama session) or the embedder's (Voyage, a separate
+    // embedder): an unversioned id that isn't the session embedder's may
+    // name a chat model, which says nothing of what embedded its vectors.
+    // Rebuild it with the session's embedder, as a Lance-era entry is, and
+    // it is saved under that embedder's id.
+    if saved.embed_key != Some(EMBED_KEY_VERSION) && &embedder.embed_id().0 != embed_model {
         tracing::warn!(
             table = %saved.table,
             column = %saved.column,
-            "semantic index saved under the chat model's id; rebuilding it from its column"
+            "semantic index saved before vectors were keyed by their embedder; rebuilding it \
+             from its column"
         );
         return create_semantic_index(
             ctx,
