@@ -14,9 +14,18 @@
 //! runs out of context stops instead of sliding the prompt out, and an answer
 //! that stopped there, short of its own token cap, fails too.
 //!
+//! Embeddings turn truncation off too. A chunk is sized by a words-per-token
+//! guess, and a run like `______` or `......` tokenizes far denser than
+//! words do (22 of CUAD's 12,105 chunks pass nomic-embed-text's 2048
+//! tokens), so left to Ollama its vector would describe only its start. A
+//! batch Ollama refuses for length is split until the input it refused is
+//! alone; that input is embedded in halves, recursively, and its vector is
+//! the halves' mean weighted by their tokens, which is what a mean-pooling
+//! embedder (nomic is one) would have made of the whole, less attention
+//! across the cut. Every word of every chunk counts toward its vector.
+//!
 //! Needs an Ollama that knows `truncate` and `shift` (0.40 does); an older
-//! one ignores them and cuts silently. Embeddings (`/api/embed`) still
-//! truncate an over-long chunk silently: a known gap.
+//! one ignores them and cuts silently.
 //!
 //! [Ollama]: https://ollama.com
 
@@ -83,12 +92,69 @@ impl OllamaProvider {
 
     /// One `/api/embed` call.
     async fn embed_texts(&self, texts: Vec<String>) -> Result<Vec<Embedding>> {
+        match self.embed_request(&texts).await {
+            Ok((embeddings, _)) => Ok(embeddings),
+            Err(error) if is_too_long(&error) && texts.len() > 1 => {
+                // Split the batch until the input Ollama refused is alone.
+                let right = texts[texts.len() / 2..].to_vec();
+                let mut left =
+                    Box::pin(self.embed_texts(texts[..texts.len() / 2].to_vec())).await?;
+                left.extend(Box::pin(self.embed_texts(right)).await?);
+                Ok(left)
+            }
+            Err(error) if is_too_long(&error) => {
+                let (mut vector, _) = self.embed_in_halves(&texts[0]).await?;
+                unit(&mut vector);
+                Ok(vec![vector])
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// One text too long for the embedder: its halves' vectors, averaged by
+    /// their tokens, and the tokens it took.
+    async fn embed_in_halves(&self, text: &str) -> Result<(Embedding, usize)> {
+        let Some((first, second)) = halves(text) else {
+            return Err(SemcastError::Model(format!(
+                "ollama cannot embed {:?} in its context",
+                text.chars().take(40).collect::<String>()
+            )));
+        };
+        let mut parts = Vec::with_capacity(2);
+        for half in [first, second] {
+            parts.push(match self.embed_request(&[half.to_owned()]).await {
+                Ok((mut vectors, tokens)) => (vectors.pop().unwrap_or_default(), tokens.max(1)),
+                Err(error) if is_too_long(&error) => Box::pin(self.embed_in_halves(half)).await?,
+                Err(error) => return Err(error),
+            });
+        }
+        let tokens: usize = parts.iter().map(|(_, tokens)| tokens).sum();
+        let dim = parts[0].0.len();
+        if parts[1].0.len() != dim {
+            return Err(SemcastError::Model(
+                "ollama embedded two halves of one text at different dimensions".to_owned(),
+            ));
+        }
+        let mut mean = vec![0.0_f32; dim];
+        for (vector, weight) in &parts {
+            let share = *weight as f32 / tokens as f32;
+            for (sum, value) in mean.iter_mut().zip(vector) {
+                *sum += share * value;
+            }
+        }
+        Ok((mean, tokens))
+    }
+
+    /// One `/api/embed` call with truncation off: the vectors, and the
+    /// tokens Ollama counted for the whole input (0 if it didn't say).
+    async fn embed_request(&self, texts: &[String]) -> Result<(Vec<Embedding>, usize)> {
         let response = super::send_with_retry("ollama", || {
             self.client
                 .post(format!("{}/api/embed", self.base_url))
                 .json(&EmbedRequest {
                     model: &self.embed_model,
-                    input: &texts,
+                    input: texts,
+                    truncate: false,
                 })
         })
         .await?;
@@ -103,7 +169,7 @@ impl OllamaProvider {
                 texts.len()
             )));
         }
-        Ok(embed.embeddings)
+        Ok((embed.embeddings, embed.prompt_eval_count.unwrap_or(0)))
     }
 
     /// Request this context length, in tokens (see the module docs).
@@ -326,65 +392,121 @@ struct ChatResponseMessage {
 struct EmbedRequest<'a> {
     model: &'a str,
     input: &'a [String],
+    /// Refuse an input past the context (HTTP 400) instead of cutting it.
+    truncate: bool,
 }
 
 #[derive(Deserialize)]
 struct EmbedResponse {
     embeddings: Vec<Embedding>,
+    #[serde(default)]
+    prompt_eval_count: Option<usize>,
+}
+
+/// Ollama's refusal of an input past the embedder's context, under
+/// `truncate: false`.
+fn is_too_long(error: &SemcastError) -> bool {
+    matches!(error, SemcastError::Model(message) if message.contains("exceeds the context length"))
+}
+
+/// `text` cut in two at the middle word, or the middle character of a
+/// single word; `None` for one character, which has no halves.
+fn halves(text: &str) -> Option<(&str, &str)> {
+    let spaces: Vec<usize> = text.match_indices(' ').map(|(at, _)| at).collect();
+    if let Some(&at) = spaces.get(spaces.len() / 2) {
+        return Some((&text[..at], &text[at + 1..]));
+    }
+    let chars: Vec<usize> = text.char_indices().map(|(at, _)| at).collect();
+    let &at = chars.get(chars.len() / 2).filter(|&&at| at > 0)?;
+    Some((&text[..at], &text[at..]))
+}
+
+/// Scale to unit length, as Ollama's own vectors are.
+fn unit(vector: &mut [f32]) {
+    let norm = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        vector.iter_mut().for_each(|x| *x /= norm);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// One `/api/embed` exchange: answers one vector per input and hands
-    /// back the request body.
-    async fn embed_server() -> (String, tokio::task::JoinHandle<serde_json::Value>) {
+    /// A fake `/api/embed`: refuses (as Ollama does under `truncate: false`)
+    /// any request with an input over `max_chars`, and embeds the rest as
+    /// `[words, 1]`, counting a token per word. Hands back every request body.
+    async fn embed_server_refusing_over(
+        max_chars: usize,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    ) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
-        let served = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            let mut buf = [0u8; 4096];
-            let body = loop {
-                let n = socket.read(&mut buf).await.unwrap();
-                request.extend_from_slice(&buf[..n]);
-                let text = String::from_utf8_lossy(&request).to_string();
-                if let Some(end) = text.find("\r\n\r\n") {
-                    let length: usize = text[..end]
-                        .lines()
-                        .find_map(|line| {
-                            let (name, value) = line.split_once(':')?;
-                            name.eq_ignore_ascii_case("content-length")
-                                .then(|| value.trim().parse().unwrap())
-                        })
-                        .unwrap_or(0);
-                    if request.len() >= end + 4 + length {
-                        break serde_json::from_slice::<serde_json::Value>(
-                            &request[end + 4..end + 4 + length],
-                        )
-                        .unwrap();
+        let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = std::sync::Arc::clone(&bodies);
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buf = [0u8; 4096];
+                let body = loop {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    request.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&request).to_string();
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let length: usize = text[..end]
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= end + 4 + length {
+                            break serde_json::from_slice::<serde_json::Value>(
+                                &request[end + 4..end + 4 + length],
+                            )
+                            .unwrap();
+                        }
                     }
-                }
-            };
-            let inputs = body["input"].as_array().unwrap().len();
-            let answer =
-                serde_json::json!({ "embeddings": vec![vec![1.0_f32]; inputs] }).to_string();
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{answer}",
-                answer.len()
-            );
-            socket.write_all(response.as_bytes()).await.unwrap();
-            body
+                };
+                let inputs: Vec<String> = body["input"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|input| input.as_str().unwrap().to_owned())
+                    .collect();
+                seen.lock().unwrap().push(body);
+                let (status, answer) = if inputs.iter().any(|input| input.len() > max_chars) {
+                    (
+                        "400 Bad Request",
+                        r#"{"error":"the input length exceeds the context length"}"#.to_owned(),
+                    )
+                } else {
+                    let words = |input: &String| input.split_whitespace().count();
+                    let answer = serde_json::json!({
+                        "embeddings": inputs.iter().map(|input| vec![words(input) as f32, 1.0]).collect::<Vec<_>>(),
+                        "prompt_eval_count": inputs.iter().map(words).sum::<usize>(),
+                    });
+                    ("200 OK", answer.to_string())
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{answer}",
+                    answer.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
         });
-        (url, served)
+        (url, bodies)
     }
 
     #[tokio::test]
     async fn queries_and_documents_are_embedded_alike() {
         for queries in [false, true] {
-            let (url, served) = embed_server().await;
+            let (url, bodies) = embed_server_refusing_over(usize::MAX).await;
             let ollama = OllamaProvider::new("qwen3.8:27b").with_base_url(&url);
             let texts = vec!["non-compete".to_owned()];
             if queries {
@@ -392,10 +514,77 @@ mod tests {
             } else {
                 ollama.embed(texts).await.unwrap();
             }
-            let body = served.await.unwrap();
+            let body = bodies.lock().unwrap()[0].clone();
             assert_eq!(body["model"], "nomic-embed-text");
             assert_eq!(body["input"], serde_json::json!(["non-compete"]));
+            assert_eq!(
+                body["truncate"], false,
+                "an over-long input is refused, not cut"
+            );
         }
+    }
+
+    /// An input past the context is never cut: the batch is split until it
+    /// is alone, and its vector is its halves' token-weighted mean.
+    #[tokio::test]
+    async fn an_over_long_input_is_embedded_in_halves_not_cut() {
+        let (url, bodies) = embed_server_refusing_over(40).await;
+        let ollama = OllamaProvider::new("qwen3.8:27b").with_base_url(&url);
+        // 12 words, 59 chars: halves of 6 words (29 chars) each fit.
+        let long = "aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj kkkk llll".to_owned();
+        let vectors = ollama
+            .embed(vec![
+                "short".to_owned(),
+                long.clone(),
+                "also short".to_owned(),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(vectors.len(), 3);
+        assert_eq!(vectors[0], vec![1.0, 1.0]);
+        assert_eq!(vectors[2], vec![2.0, 1.0]);
+        // Each half embeds as [6, 1] with 6 tokens: the mean is [6, 1], unit.
+        let norm = 37.0_f32.sqrt();
+        assert!(
+            (vectors[1][0] - 6.0 / norm).abs() < 1e-6,
+            "{:?}",
+            vectors[1]
+        );
+        assert!(
+            (vectors[1][1] - 1.0 / norm).abs() < 1e-6,
+            "{:?}",
+            vectors[1]
+        );
+        let sent: Vec<serde_json::Value> = bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|body| body["input"].clone())
+            .collect();
+        assert!(
+            sent.contains(&serde_json::json!(["aaaa bbbb cccc dddd eeee ffff"]))
+                && sent.contains(&serde_json::json!(["gggg hhhh iiii jjjj kkkk llll"])),
+            "every word reaches the embedder: {sent:?}"
+        );
+    }
+
+    /// A single word too long for the context is cut by characters.
+    #[tokio::test]
+    async fn an_over_long_word_is_halved_by_characters() {
+        let (url, _) = embed_server_refusing_over(10).await;
+        let ollama = OllamaProvider::new("qwen3.8:27b").with_base_url(&url);
+        let rule = "_".repeat(35);
+        let vectors = ollama.embed(vec![rule]).await.unwrap();
+        assert_eq!(vectors.len(), 1);
+        assert!((vectors[0].iter().map(|x| x * x).sum::<f32>() - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn halves_split_at_the_middle_word_or_character() {
+        assert_eq!(halves("a b c d"), Some(("a b", "c d")));
+        assert_eq!(halves("ab"), Some(("a", "b")));
+        assert_eq!(halves("é"), None);
+        assert_eq!(halves("ééé"), Some(("é", "éé")));
     }
 
     /// Vectors are keyed by the embedder, not the chat model: changing
