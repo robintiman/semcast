@@ -224,10 +224,9 @@ async fn indexed_query_plans_the_funnel_and_prunes() {
     let display = displayable(plan.as_ref()).indent(true).to_string();
     assert!(display.contains("IndexScanExec"), "plan:\n{display}");
     assert!(display.contains("best-effort"), "plan:\n{display}");
-    assert!(
-        display.contains("reads top-3 chunks per doc"),
-        "plan:\n{display}",
-    );
+    // No recall target, so nothing measures what chunks would lose:
+    // verify reads the survivors' full text.
+    assert!(!display.contains("chunks"), "plan:\n{display}");
 
     let embeds_before = model.embed_calls();
     assert_eq!(matching_ids(&ctx, query).await, vec![1]);
@@ -284,8 +283,11 @@ async fn unindexed_rows_pass_through_to_full_text_verify() {
     );
 }
 
+/// Plain `MEANS` on an indexed column verifies on the full text: chunks
+/// miss a match whose evidence sits outside them (a third of CUAD's), and
+/// without a recall target no calibration measures that loss.
 #[tokio::test]
-async fn verify_reads_chunks_not_the_full_document() {
+async fn plain_means_verifies_the_full_document() {
     let long_doc = "offline sync ".repeat(2000); // 4000 words ≫ one 384-word chunk
     let model = Arc::new(MockModel::answering_yes_to(["offline sync"]));
     let ctx = semcast_context(model.clone());
@@ -298,16 +300,9 @@ async fn verify_reads_chunks_not_the_full_document() {
     .collect()
     .await
     .unwrap();
-    create_semantic_index(
-        &ctx,
-        "meetings",
-        "transcript",
-        IndexOptions {
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
+    create_semantic_index(&ctx, "meetings", "transcript", IndexOptions::default())
+        .await
+        .unwrap();
 
     let query = "SELECT meeting_id FROM meetings WHERE transcript MEANS 'offline sync'";
     assert_eq!(matching_ids(&ctx, query).await, vec![1]);
@@ -315,16 +310,27 @@ async fn verify_reads_chunks_not_the_full_document() {
     let inputs = model.completion_inputs();
     let input = inputs.last().expect("one verify call");
     assert!(
-        input.len() < long_doc.len() / 2,
-        "verify read {} bytes of a {}-byte document — should be top-3 chunks",
+        input.len() >= long_doc.len(),
+        "verify read {} bytes of a {}-byte document — should be the full text",
         input.len(),
         long_doc.len(),
     );
-    assert!(input.contains("offline sync"));
 
-    // The chunked verdict is cached: re-running costs zero new calls.
+    // The full-text verdict is stored: re-running costs zero new calls,
+    // and so does a label over the same question, which reads only
+    // full-text verdicts (a chunked one would not answer it).
     let calls = model.completion_calls();
     assert_eq!(matching_ids(&ctx, query).await, vec![1]);
+    let labels = semcast::sql(
+        &ctx,
+        "SELECT transcript MEANS 'offline sync' AS hit FROM meetings",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+    assert_eq!(labels.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
     assert_eq!(model.completion_calls(), calls);
 }
 

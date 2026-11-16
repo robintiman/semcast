@@ -140,7 +140,9 @@ pub struct PrefilterResult {
 }
 
 /// Planning-time channel between [`IndexScanExec`] and [`VerifyExec`]: the
-/// scan populates it before emitting a batch, verify reads it per row.
+/// scan populates it before emitting a batch, verify reads it per row (only
+/// under `WITH RECALL`). It is also how the scan's partitions share one
+/// prefilter result, so an uncalibrated scan needs it too.
 /// Keyed by [`doc_hash`], so it survives whatever repartitioning DataFusion
 /// inserts between the two operators.
 ///
@@ -295,8 +297,8 @@ impl DisplayAs for IndexScanExec {
             ),
             None => write!(
                 f,
-                "floor={} top-{} chunks (threshold best-effort — no WITH RECALL)",
-                self.params.score_floor, self.params.chunks_per_doc,
+                "floor={} (threshold best-effort — no WITH RECALL)",
+                self.params.score_floor,
             ),
         }?;
         if let Some((scorer, _)) = &self.scorer {

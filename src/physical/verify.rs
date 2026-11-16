@@ -121,8 +121,10 @@ impl VerifyExec {
         Self::build(input, text, condition, model, cache, None, 0)
     }
 
-    /// A verify stage fed by an index pre-filter: rows with evidence are
-    /// verified on their top chunks, unindexed passthrough rows on full text.
+    /// A verify stage fed by a calibrated index pre-filter: rows with
+    /// evidence are verified on their top chunks, unindexed passthrough rows
+    /// on full text. Uncalibrated, nothing measures what chunks lose, so the
+    /// planner uses [`VerifyExec::new`] instead.
     pub fn new_with_evidence(
         input: Arc<dyn ExecutionPlan>,
         text: Arc<dyn PhysicalExpr>,

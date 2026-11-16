@@ -158,7 +158,8 @@ impl ExtensionPlanner for SemcastExtensionPlanner {
                 Arc::clone(&store),
             ));
             // Funnel when an index covers the filtered column: index scan
-            // prunes, verify reads the surviving rows' top chunks. No index
+            // prunes, verify reads the survivors (their top chunks only
+            // under a recall target). No index
             // (or an unresolvable text expr) → verify-only, correct but full
             // price.
             if let Some(index) = resolve_index(filter, logical_inputs[0].schema(), session_state) {
@@ -198,7 +199,11 @@ impl ExtensionPlanner for SemcastExtensionPlanner {
                     joint = true;
                 }
                 let scan = Arc::new(scan);
-                return Ok(Some(Arc::new(
+                // Verify reads chunks only where calibration measures what
+                // they lose (and falls back to full text when it is too
+                // much). Uncalibrated, nothing would: chunks miss matches
+                // whose evidence sits elsewhere, so verify reads full text.
+                let verify = if has_calibration {
                     VerifyExec::new_with_evidence(
                         scan,
                         text,
@@ -208,11 +213,20 @@ impl ExtensionPlanner for SemcastExtensionPlanner {
                         evidence,
                         params.chunks_per_doc,
                     )
-                    .with_store_evidence(store)
-                    .with_estimate(estimate(
+                } else {
+                    VerifyExec::new(
+                        scan,
+                        text,
+                        filter.condition.clone(),
+                        Arc::clone(&self.model),
+                        Arc::clone(&self.cache),
+                    )
+                };
+                return Ok(Some(Arc::new(
+                    verify.with_store_evidence(store).with_estimate(estimate(
                         true,
                         joint,
-                        Some(params.chunks_per_doc),
+                        has_calibration.then_some(params.chunks_per_doc),
                     )),
                 )));
             }
