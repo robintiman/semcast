@@ -21,14 +21,14 @@
 //! the target and the full text does better, the scan tells verify (through
 //! [`ChunkEvidence`]) to read the full text instead, whose answers the labels
 //! are, leaving only the floor's losses to certify. Full text and chunks are
-//! a fixed sequence rather than two tests: chunks lose more than full text
-//! at any floor, so they are adopted only when full text certifies too, and
-//! each runs at the full error budget of a look. Each look at the growing
-//! sample (a tranche) is a test, so a certified calibration runs each at a
-//! share of the budget; once the sample shows chunks can't keep enough
+//! two claims about different floors, so each look's error budget is split
+//! between them, most of it to full text ([`TEXT_SHARE`]). Each look at the
+//! growing sample (a tranche) is a test, so a certified calibration runs each
+//! at a share of the budget; once the sample shows chunks can't keep enough
 //! matches, no more chunk checks are bought. A calibration that can only
-//! certify pruning nothing keeps drawing while labels remain: a label costs
-//! no more than the verify call it replaces.
+//! certify pruning nothing keeps drawing while labels remain: in full-text
+//! mode a label costs no more than the verify call it replaces (in chunk mode
+//! it reads the whole document where verify would read a few chunks).
 //!
 //! [`VerifyExec`]: crate::physical::VerifyExec
 
@@ -649,9 +649,9 @@ impl Scanner {
         // the error budget, so the certificate holds at the confidence asked.
         // Each look at the growing sample is a test: at most `looks` of them,
         // so each runs at a share of the error budget. Full text and chunks
-        // are a fixed sequence, not two tests: chunks lose more than full
-        // text at any floor, so they are adopted only when full text also
-        // certifies, and each runs at the look's full share.
+        // are two claims about different floors, so the look's share is split
+        // between them, most of it to full text: chunks save tokens only
+        // where they keep enough matches, and long documents rarely let them.
         let looks = match calibration.confidence {
             Some(_) => calibration
                 .label_budget()
@@ -659,10 +659,10 @@ impl Scanner {
                 .max(1),
             None => 1,
         };
-        let per_look = CalibrationConfig {
+        let per_look = |share: f64| CalibrationConfig {
             confidence: calibration
                 .confidence
-                .map(|c| 1.0 - (1.0 - c) / looks as f64),
+                .map(|c| 1.0 - (1.0 - c) * share / looks as f64),
             ..calibration.clone()
         };
         // Once the sample shows chunked verify can't keep enough matches, no
@@ -688,9 +688,9 @@ impl Scanner {
             labels.extend(new_labels);
             labelled = tranche;
 
-            let calibrate = |misses: &HashSet<u64>| {
+            let calibrate = |misses: &HashSet<u64>, share: f64| {
                 self.calibrate_over_best_proxy(
-                    &per_look,
+                    &per_look(share),
                     &labels,
                     &per_doc_best,
                     &indexed,
@@ -701,7 +701,7 @@ impl Scanner {
             // Chunked verify keeps a sampled match only if the chunks say
             // yes: when even an upper bound on that share is below the
             // target, chunks can never certify.
-            if let Some(confidence) = per_look.confidence {
+            if let Some(confidence) = per_look(1.0 - TEXT_SHARE).confidence {
                 let checked = chunked.len();
                 let kept = chunked.values().filter(|v| **v == Some(true)).count();
                 if checked > 0
@@ -714,16 +714,15 @@ impl Scanner {
                     chunks_ruled_out = true;
                 }
             }
-            let reading_text = calibrate(&HashSet::new());
-            let reading_chunks = (!chunks_ruled_out).then(|| calibrate(&verify_misses(&chunked)));
+            let reading_text = calibrate(&HashSet::new(), TEXT_SHARE);
+            let reading_chunks =
+                (!chunks_ruled_out).then(|| calibrate(&verify_misses(&chunked), 1.0 - TEXT_SHARE));
             let target = calibration.target_recall;
-            // Chunks when they certify (and so does full text), being cheaper
-            // to verify. A certified target whose chunks estimate above it is
-            // only short of labels: keep drawing rather than settle on full
-            // text. Otherwise full text, which loses only the floor's matches.
-            let chunks_win = reading_chunks
-                .as_ref()
-                .is_some_and(|c| c.0.meets(target) && reading_text.0.meets(target));
+            // Chunks when they certify, being cheaper to verify. A certified
+            // target whose chunks estimate above it is only short of labels:
+            // keep drawing rather than settle on full text. Otherwise full
+            // text, which loses only the floor's matches.
+            let chunks_win = reading_chunks.as_ref().is_some_and(|c| c.0.meets(target));
             let chunks_short_of_labels = calibration.confidence.is_some()
                 && tranche < pool.len()
                 && reading_chunks
@@ -740,10 +739,18 @@ impl Scanner {
                 _ => reading_text,
             };
             full_text = text_wins || chunks_ruled_out;
-            // Settle on a certificate that prunes something (some row scores
-            // below its floor); one that only certifies pruning nothing keeps
-            // drawing while labels remain.
-            let prunes = outcome.1.values().any(|score| *score < outcome.0.threshold);
+            // Settle on a certificate that prunes something: some row still
+            // undecided (not in the store, not labelled) scores below its
+            // floor. One that only certifies pruning nothing keeps drawing
+            // while labels remain.
+            let labelled: HashSet<u64> = labels.iter().map(|(text, _)| doc_hash(text)).collect();
+            let prunes = undecided.iter().any(|hash| {
+                !labelled.contains(hash)
+                    && outcome
+                        .1
+                        .get(hash)
+                        .is_some_and(|score| *score < outcome.0.threshold)
+            });
             let settled = calibration.confidence.is_none() || (outcome.0.meets(target) && prunes);
             attempt = Some(outcome);
             if settled {
@@ -1128,8 +1135,15 @@ impl Scanner {
             };
             // Settle on a certificate that prunes something; pruning nothing
             // keeps drawing while labels remain.
-            let prunes =
-                population.iter().any(|score| *score < picked.index_floor) || picked.uses_scorer();
+            // Pruning means some row still undecided and unlabelled is cut.
+            let labelled: HashSet<u64> = labels.iter().map(|(text, _)| doc_hash(text)).collect();
+            let prunes = picked.uses_scorer()
+                || undecided.iter().any(|(hash, _)| {
+                    !labelled.contains(hash)
+                        && indexed.contains(hash)
+                        && per_doc_best.get(hash).copied().unwrap_or(f32::NEG_INFINITY)
+                            < picked.index_floor
+                });
             let settled = calibration.confidence.is_none() || (picked.meets(target) && prunes);
             choice = Some((picked, text_wins));
             if settled {
@@ -1404,6 +1418,11 @@ fn verify_misses(chunked: &HashMap<u64, Option<bool>>) -> HashSet<u64> {
         .map(|(hash, _)| *hash)
         .collect()
 }
+
+/// The share of a look's error budget that full-text verify's certificate
+/// gets; chunked verify gets the rest. Most goes to full text: on long
+/// documents chunks rarely keep enough matches to certify.
+pub const TEXT_SHARE: f64 = 0.8;
 
 /// The Utf8 view of an array [`Scanner::evaluate_texts`] produced.
 fn as_strings(array: &Arc<dyn Array>) -> &StringArray {

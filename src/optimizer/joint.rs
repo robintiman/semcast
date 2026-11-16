@@ -19,11 +19,13 @@
 //! Failed labels get the same worst case as a single floor's calibration: a
 //! failed document the pair would prune is a lost match, one it keeps is a
 //! kept non-match. The pair is picked with the sample that scores it, so a
-//! certified search tests each pair at `δ/m` over the `m` pairs it tries.
+//! certified search corrects over the index floors it tries, which come from
+//! the population's scores (fixed before any label); along the scorer floor
+//! recall is monotone at each index floor, so no correction is needed there.
 //! A sample with no known match prunes nothing, and no floor sits above the
 //! best known match's score, as for a single floor. Like the single floor's
-//! calibration, the caller looks again after each tranche of labels without
-//! correcting for the repeated looks.
+//! calibration, the caller looks again after each tranche of labels and
+//! tests each look at its share of the error budget.
 
 use crate::optimizer::calibrate::recall_lower_bound;
 
@@ -166,10 +168,15 @@ pub fn choose(
                 .collect(),
         )
     };
-    let index_floors = floors(|d| d.index);
+    // Index floors come from the population's own scores, which no label
+    // touched, so they are fixed before the sample is: one test per index
+    // floor. Along the scorer floor, at a fixed index floor, recall only
+    // falls as the floor rises, so floors drawn from the sample cost no
+    // correction there (as for a single floor). Hence Bonferroni over the
+    // index floors alone.
+    let index_floors = grid(population.to_vec());
     let scorer_floors = floors(|d| d.scorer);
-    let pairs = index_floors.len() * scorer_floors.len();
-    let alpha = confidence.map(|c| (1.0 - c) / pairs as f64);
+    let alpha = confidence.map(|c| (1.0 - c) / index_floors.len() as f64);
 
     let mut best: Option<JointChoice> = None;
     for &a in &index_floors {
@@ -369,15 +376,17 @@ mod tests {
     }
 
     #[test]
-    fn a_certified_search_corrects_for_the_pairs_it_tries() {
+    fn a_certified_search_corrects_over_the_index_floors() {
         let mut docs: Vec<SampledDoc> = (0..80).map(|_| doc(0.9, 0.9, true)).collect();
         docs.extend((0..80).map(|_| doc(0.1, 0.1, false)));
-        let population = vec![0.5; 160];
+        let population: Vec<f32> = docs.iter().map(|d| d.index.unwrap()).collect();
         let estimated = choose(0.9, None, &docs, &population, 0, 0.2);
         let certified = choose(0.9, Some(0.95), &docs, &population, 0, 0.2);
         assert!(estimated.meets(0.9));
-        // 80 of 80 kept: the bound at δ/4 over 4 pairs still clears 0.9.
+        // 80 of 80 kept: the bound at δ/3 over the three index floors (0.9,
+        // 0.1, -inf) still clears 0.9, and the index alone prunes the rest.
         assert!(certified.certified_recall.unwrap() >= 0.9, "{certified:?}");
-        assert!(certified.index_floor > f32::NEG_INFINITY);
+        assert_eq!(certified.index_floor, 0.9);
+        assert!(!certified.uses_scorer());
     }
 }

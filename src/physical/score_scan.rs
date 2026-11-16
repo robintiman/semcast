@@ -596,7 +596,11 @@ impl Scanner {
             );
             // Settle on a certificate that prunes something; one that only
             // certifies pruning nothing keeps drawing while labels remain.
-            let prunes = scores.values().any(|score| *score < attempt.threshold);
+            // Pruning means some row not yet labelled scores below the floor.
+            let labelled: HashSet<u64> = labels.iter().map(|(text, _)| doc_hash(text)).collect();
+            let prunes = scores
+                .iter()
+                .any(|(hash, score)| !labelled.contains(hash) && *score < attempt.threshold);
             let settled = calibration.confidence.is_none()
                 || (attempt.meets(calibration.target_recall) && prunes);
             calibrated = Some(attempt);

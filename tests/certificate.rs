@@ -219,14 +219,16 @@ async fn mixed_context(model: Arc<MockModel>, tail: usize) -> SessionContext {
 /// of settling every survivor on full text after one tranche.
 #[tokio::test]
 async fn chunks_above_the_target_keep_drawing_instead_of_switching() {
-    let ctx = mixed_context(model(), 24).await;
+    // Twelve of 600 matches keep their needle in the tail: chunks lose 2%,
+    // well inside the target even at the chunks' share of the budget.
+    let ctx = mixed_context(model(), 12).await;
     let (_, metrics) = run_query(
         &ctx,
         "SELECT id FROM docs WHERE body MEANS 'sync deadline' \
          WITH RECALL 0.9 WITH CONFIDENCE 0.9",
     )
     .await;
-    assert_eq!(count(&metrics, "calibration_full_text"), 0);
+    assert_eq!(count(&metrics, "calibration_full_text"), 0, "{metrics}");
     assert!(count(&metrics, "calibration_sampled_rows") > 64);
 }
 
