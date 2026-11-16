@@ -19,13 +19,16 @@
 //! Failed labels get the same worst case as a single floor's calibration: a
 //! failed document the pair would prune is a lost match, one it keeps is a
 //! kept non-match. The pair is picked with the sample that scores it, so a
-//! certified search tests each pair at `δ/m` over the `m` pairs it tries.
-//! A sample with no known match prunes nothing, and no floor sits above the
-//! best known match's score, as for a single floor. Like the single floor's
-//! calibration, the caller looks again after each tranche of labels without
-//! correcting for the repeated looks.
+//! certified search corrects over the index floors it tries, which come from
+//! every indexed input row's score, decided or not (fixed before any label or
+//! sample draw); along the scorer floor
+//! recall is monotone at each index floor, so no correction is needed there.
+//! A sample with no known match prunes nothing, and no scorer floor sits
+//! above the best known match's score, as for a single floor. Like the single floor's
+//! calibration, the caller looks again after each tranche of labels and
+//! tests each look at its share of the error budget.
 
-use crate::optimizer::calibrate::wilson_lower_bound;
+use crate::optimizer::calibrate::recall_lower_bound;
 
 /// How many floors per stage the search tries, at most: quantiles of the
 /// sampled matches' scores. Bounds the Bonferroni correction (at most
@@ -122,6 +125,8 @@ fn grid(mut values: Vec<f32>) -> Vec<f32> {
 
 /// Choose `(index floor, scorer floor)`.
 ///
+/// `grid_scores` are the index scores the candidate index floors come from:
+/// every indexed input row's, which no label or sample draw touches.
 /// `population` holds the index score of every indexed row the funnel will
 /// see (one per row), `unindexed` the rows it has never seen, which pass the
 /// index at any floor. `scorer_cost` is a scorer call's cost relative to a
@@ -131,6 +136,7 @@ pub fn choose(
     confidence: Option<f64>,
     docs: &[SampledDoc],
     population: &[f32],
+    grid_scores: &[f32],
     unindexed: usize,
     scorer_cost: f64,
 ) -> JointChoice {
@@ -166,10 +172,15 @@ pub fn choose(
                 .collect(),
         )
     };
-    let index_floors = floors(|d| d.index);
+    // Index floors come from every indexed input row's score, which no label
+    // or sample draw touched, so they are fixed before the sample is: one test per index
+    // floor. Along the scorer floor, at a fixed index floor, recall only
+    // falls as the floor rises, so floors drawn from the sample cost no
+    // correction there (as for a single floor). Hence Bonferroni over the
+    // index floors alone.
+    let index_floors = grid(grid_scores.to_vec());
     let scorer_floors = floors(|d| d.scorer);
-    let pairs = index_floors.len() * scorer_floors.len();
-    let alpha = confidence.map(|c| (1.0 - c) / pairs as f64);
+    let alpha = confidence.map(|c| (1.0 - c) / index_floors.len() as f64);
 
     let mut best: Option<JointChoice> = None;
     for &a in &index_floors {
@@ -191,7 +202,7 @@ pub fn choose(
                 if total == 0 {
                     1.0
                 } else {
-                    wilson_lower_bound(kept, total, alpha)
+                    recall_lower_bound(kept, total, alpha)
                 }
             });
             let choice = JointChoice {
@@ -249,7 +260,7 @@ pub fn choose(
                 if total == 0 {
                     1.0
                 } else {
-                    wilson_lower_bound(kept, total, alpha)
+                    recall_lower_bound(kept, total, alpha)
                 }
             }),
             scorer_calls: 0.0,
@@ -282,10 +293,10 @@ mod tests {
             ..doc(0.95, 0.9, true)
         });
         let population: Vec<f32> = (0..1000).map(|i| i as f32 / 1000.0).collect();
-        let certified = choose(0.9, Some(0.95), &docs, &population, 0, 0.2);
+        let certified = choose(0.9, Some(0.95), &docs, &population, &population, 0, 0.2);
         assert_eq!(certified.index_floor, f32::NEG_INFINITY);
         assert!(!certified.meets(0.9));
-        let estimated = choose(0.9, None, &docs, &[0.5; 1000], 0, 0.2);
+        let estimated = choose(0.9, None, &docs, &[0.5; 1000], &[0.5; 1000], 0, 0.2);
         assert_eq!(estimated.index_floor, f32::NEG_INFINITY);
         assert!(!estimated.uses_scorer());
     }
@@ -298,9 +309,21 @@ mod tests {
             ..doc(0.95, 0.95, true)
         });
         docs.extend((0..60).map(|_| doc(0.1, 0.1, false)));
-        let choice = choose(0.9, None, &docs, &[0.5; 101], 0, 0.2);
+        let choice = choose(0.9, None, &docs, &[0.5; 101], &[0.5; 101], 0, 0.2);
         assert!(choice.index_floor <= 0.6, "{choice:?}");
         assert!(choice.scorer_floor <= 0.6, "{choice:?}");
+    }
+
+    #[test]
+    fn index_floors_come_from_the_grid_scores_alone() {
+        // The sample would favour a 0.9 floor, but the grid (every indexed
+        // row's score, fixed before any label) offers only 0.1: the floor
+        // can't follow the sample there.
+        let mut docs: Vec<SampledDoc> = (0..40).map(|_| doc(0.9, 0.5, true)).collect();
+        docs.extend((0..60).map(|_| doc(0.1, 0.5, false)));
+        let population: Vec<f32> = docs.iter().map(|d| d.index.unwrap()).collect();
+        let choice = choose(0.9, None, &docs, &population, &[0.1], 0, 0.2);
+        assert!(choice.index_floor <= 0.1, "{choice:?}");
     }
 
     #[test]
@@ -310,7 +333,7 @@ mod tests {
         let mut docs: Vec<SampledDoc> = (0..40).map(|_| doc(0.9, 0.5, true)).collect();
         docs.extend((0..60).map(|_| doc(0.1, 0.5, false)));
         let population: Vec<f32> = docs.iter().map(|d| d.index.unwrap()).collect();
-        let choice = choose(0.9, None, &docs, &population, 0, 0.2);
+        let choice = choose(0.9, None, &docs, &population, &population, 0, 0.2);
         assert_eq!(choice.index_floor, 0.9);
         assert!(!choice.uses_scorer());
         assert_eq!(choice.verify_calls, 40.0);
@@ -323,7 +346,7 @@ mod tests {
         let mut docs: Vec<SampledDoc> = (0..40).map(|_| doc(0.5, 0.9, true)).collect();
         docs.extend((0..60).map(|_| doc(0.5, 0.1, false)));
         let population = vec![0.5; 100];
-        let choice = choose(0.9, None, &docs, &population, 0, 0.2);
+        let choice = choose(0.9, None, &docs, &population, &population, 0, 0.2);
         assert_eq!(choice.scorer_floor, 0.9);
         assert_eq!(choice.verify_calls, 40.0);
         assert_eq!(choice.scorer_calls, 100.0);
@@ -336,7 +359,7 @@ mod tests {
         let population = vec![0.5; 100];
         // At 0.7 a call, scoring 100 and verifying 40 (110) loses to
         // verifying 100.
-        let choice = choose(0.9, None, &docs, &population, 0, 0.7);
+        let choice = choose(0.9, None, &docs, &population, &population, 0, 0.7);
         assert!(!choice.uses_scorer());
     }
 
@@ -350,7 +373,7 @@ mod tests {
                 ..doc(0.9, 0.9, true)
             })
             .collect();
-        let choice = choose(0.9, None, &docs, &[0.9; 40], 0, 0.2);
+        let choice = choose(0.9, None, &docs, &[0.9; 40], &[0.9; 40], 0, 0.2);
         assert_eq!(choice.index_floor, f32::NEG_INFINITY);
         assert!(!choice.meets(0.9));
 
@@ -361,7 +384,7 @@ mod tests {
             ..doc(0.1, 0.9, true)
         });
         docs.extend((0..10).map(|_| doc(0.1, 0.1, false)));
-        let choice = choose(0.95, None, &docs, &[0.5; 20], 0, 0.2);
+        let choice = choose(0.95, None, &docs, &[0.5; 20], &[0.5; 20], 0, 0.2);
         assert!(
             choice.index_floor <= 0.1,
             "kept the failed document: {choice:?}"
@@ -369,15 +392,17 @@ mod tests {
     }
 
     #[test]
-    fn a_certified_search_corrects_for_the_pairs_it_tries() {
+    fn a_certified_search_corrects_over_the_index_floors() {
         let mut docs: Vec<SampledDoc> = (0..80).map(|_| doc(0.9, 0.9, true)).collect();
         docs.extend((0..80).map(|_| doc(0.1, 0.1, false)));
-        let population = vec![0.5; 160];
-        let estimated = choose(0.9, None, &docs, &population, 0, 0.2);
-        let certified = choose(0.9, Some(0.95), &docs, &population, 0, 0.2);
+        let population: Vec<f32> = docs.iter().map(|d| d.index.unwrap()).collect();
+        let estimated = choose(0.9, None, &docs, &population, &population, 0, 0.2);
+        let certified = choose(0.9, Some(0.95), &docs, &population, &population, 0, 0.2);
         assert!(estimated.meets(0.9));
-        // 80 of 80 kept: the bound at δ/4 over 4 pairs still clears 0.9.
+        // 80 of 80 kept: the bound at δ/3 over the three index floors (0.9,
+        // 0.1, -inf) still clears 0.9, and the index alone prunes the rest.
         assert!(certified.certified_recall.unwrap() >= 0.9, "{certified:?}");
-        assert!(certified.index_floor > f32::NEG_INFINITY);
+        assert_eq!(certified.index_floor, 0.9);
+        assert!(!certified.uses_scorer());
     }
 }

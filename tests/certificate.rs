@@ -162,7 +162,11 @@ async fn a_failed_label_chunks_would_reject_counts_as_a_miss() {
 }
 
 #[tokio::test]
-async fn a_certified_target_settles_on_full_text_without_the_whole_budget() {
+async fn an_index_that_cannot_prune_costs_no_more_than_verifying_everything() {
+    // Every document scores alike, so no floor prunes: calibration keeps
+    // labelling (a label is the full-text answer verify would pay for), and
+    // the whole query costs one call per row plus the chunk checks that ruled
+    // chunks out.
     let model = model();
     let ctx = tail_context(Arc::clone(&model), true).await;
     let (ids, metrics) = run_query(
@@ -174,9 +178,9 @@ async fn a_certified_target_settles_on_full_text_without_the_whole_budget() {
     assert_eq!(ids, (1..=150).collect::<Vec<_>>());
     assert_eq!(count(&metrics, "calibration_full_text"), 1);
     assert!(
-        count(&metrics, "calibration_sampled_rows") < 200,
-        "stopped once full text certified: {} labelled",
-        count(&metrics, "calibration_sampled_rows"),
+        model.completion_calls() <= 200 + count(&metrics, "calibration_chunk_checks"),
+        "{} calls for 200 rows",
+        model.completion_calls(),
     );
 }
 
@@ -215,13 +219,34 @@ async fn mixed_context(model: Arc<MockModel>, tail: usize) -> SessionContext {
 /// of settling every survivor on full text after one tranche.
 #[tokio::test]
 async fn chunks_above_the_target_keep_drawing_instead_of_switching() {
-    let ctx = mixed_context(model(), 24).await;
+    // Twelve of 600 matches keep their needle in the tail: chunks lose 2%,
+    // well inside the target even at the chunks' share of the budget.
+    let ctx = mixed_context(model(), 12).await;
     let (_, metrics) = run_query(
         &ctx,
         "SELECT id FROM docs WHERE body MEANS 'sync deadline' \
          WITH RECALL 0.9 WITH CONFIDENCE 0.9",
     )
     .await;
-    assert_eq!(count(&metrics, "calibration_full_text"), 0);
+    assert_eq!(count(&metrics, "calibration_full_text"), 0, "{metrics}");
     assert!(count(&metrics, "calibration_sampled_rows") > 64);
+}
+
+#[tokio::test]
+async fn chunk_checks_stop_once_chunks_are_ruled_out() {
+    // Every match's needle is in its tail: after the first tranche the
+    // chunks clearly can't keep enough matches, so no more are checked.
+    let model = model();
+    let ctx = tail_context(Arc::clone(&model), true).await;
+    let (_, metrics) = run_query(
+        &ctx,
+        "SELECT id FROM docs WHERE body MEANS 'sync deadline' \
+         WITH RECALL 0.9 WITH CONFIDENCE 0.9",
+    )
+    .await;
+    assert!(
+        count(&metrics, "calibration_chunk_checks") < 64,
+        "{metrics}"
+    );
+    assert_eq!(count(&metrics, "calibration_full_text"), 1);
 }

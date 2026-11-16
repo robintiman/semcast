@@ -368,9 +368,13 @@ scorer=… (floors chosen jointly)`.
 ```
 
 Requires a `WITH RECALL`. Turns the target from a point estimate on the sample
-into a bound certified for the population: the floor is the one whose Wilson
-lower bound clears the target, corrected across the floors considered because
-the same sample both picks and scores them.
+into a bound certified for the population: the floor is the highest whose
+exact (Clopper–Pearson) lower bound on recall clears the target. Recall only
+falls as the floor rises, so picking the floor from the same sample needs no
+correction; drawing more labels does, so each tranche is tested at a share
+of the confidence. A certified target thresholds raw similarity: the learned
+proxy halves the labels a bound can use, so it is tried only for an estimate,
+and only when it ranks better than similarity on the labels it trains on.
 
 Certifying costs more and prunes less — that is the trade. The sample grows a
 tranche at a time until the bound clears, and if it never does, the funnel

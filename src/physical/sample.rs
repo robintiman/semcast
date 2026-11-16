@@ -138,14 +138,19 @@ impl Labeler<'_> {
         prompt_version: &str,
     ) -> Vec<(K, Option<bool>)> {
         let model_id = self.model.id();
-        let mut answers = Vec::new();
+        // Answers in the order asked, whatever the cache held: a calibration
+        // that splits its labels (the learned proxy's halves) must split the
+        // same documents however warm the cache is.
+        let mut answers: Vec<Option<(K, Option<bool>)>> = Vec::new();
         let mut misses = Vec::new();
         let mut requests = Vec::new();
         let mut input_chars = Vec::new();
         for (key, input) in inputs {
             let cache_key = means_cache_key(self.condition, &input, &model_id, prompt_version);
             match self.cache.get(&cache_key) {
-                Some(CachedValue::Value(verdict)) => answers.push((key, Some(verdict == "yes"))),
+                Some(CachedValue::Value(verdict)) => {
+                    answers.push(Some((key, Some(verdict == "yes"))))
+                }
                 _ => {
                     input_chars.push(input.len());
                     requests.push(CompletionRequest {
@@ -155,7 +160,8 @@ impl Labeler<'_> {
                         schema: None,
                         logprobs: true,
                     });
-                    misses.push((key, cache_key));
+                    misses.push((answers.len(), key, cache_key));
+                    answers.push(None);
                 }
             }
         }
@@ -181,18 +187,23 @@ impl Labeler<'_> {
                     }),
             );
         }
-        for ((key, cache_key), completion) in misses.into_iter().zip(&completions) {
-            match completion
-                .as_ref()
-                .map(|c| (parse_verdict(&c.text), c.yes_probability))
-            {
-                Ok((Some(matched), yes_probability)) => {
-                    cache_verdict(self.cache, cache_key, matched, yes_probability);
-                    answers.push((key, Some(matched)));
-                }
-                Ok((None, _)) | Err(_) => answers.push((key, None)),
-            }
+        for ((slot, key, cache_key), completion) in misses.into_iter().zip(&completions) {
+            answers[slot] = Some(
+                match completion
+                    .as_ref()
+                    .map(|c| (parse_verdict(&c.text), c.yes_probability))
+                {
+                    Ok((Some(matched), yes_probability)) => {
+                        cache_verdict(self.cache, cache_key, matched, yes_probability);
+                        (key, Some(matched))
+                    }
+                    Ok((None, _)) | Err(_) => (key, None),
+                },
+            );
         }
         answers
+            .into_iter()
+            .map(|answer| answer.expect("every slot is answered"))
+            .collect()
     }
 }
