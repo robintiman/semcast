@@ -306,8 +306,13 @@ pub async fn reattach_semantic_index(
     // embedder): an unversioned id that isn't the session embedder's may
     // name a chat model, which says nothing of what embedded its vectors.
     // Rebuild it with the session's embedder, as a Lance-era entry is, and
-    // it is saved under that embedder's id.
-    if saved.embed_key != Some(EMBED_KEY_VERSION) && &embedder.embed_id().0 != embed_model {
+    // it is saved under that embedder's id. An unversioned entry already
+    // under the session embedder's id is reattached as it is, and stays
+    // unversioned: after a later embedder change it is rebuilt rather than
+    // refused, which costs an embed of its column but reads nothing wrong.
+    // An entry from a newer build (a higher version) falls through to the
+    // check below.
+    if saved.embed_key.is_none() && &embedder.embed_id().0 != embed_model {
         tracing::warn!(
             table = %saved.table,
             column = %saved.column,

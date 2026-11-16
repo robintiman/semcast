@@ -181,6 +181,11 @@ impl ModelProvider for FallbackProvider {
                 ids.push(id);
             }
         }
+        if ids.is_empty() {
+            // Nothing embeds, so no vector is ever keyed by this; name the
+            // chain so errors and EXPLAIN still read.
+            return self.id();
+        }
         ModelId(ids.join("+"))
     }
 
@@ -192,10 +197,14 @@ impl ModelProvider for FallbackProvider {
         self.embed_down_the_chain(texts, true).await
     }
 
-    /// The primary's preference. A fallback batches to whatever the model it
-    /// covers for asked for, which keeps one embed call one embed call.
+    /// The first embedder's preference. A fallback batches to whatever the
+    /// model it covers for asked for, which keeps one embed call one embed
+    /// call.
     fn embed_batch_size(&self) -> usize {
-        self.models[0].embed_batch_size()
+        self.embedders()
+            .next()
+            .unwrap_or(&self.models[0])
+            .embed_batch_size()
     }
 }
 
@@ -399,6 +408,8 @@ mod tests {
             chain.embed_queries(vec!["a".into()]).await.unwrap().len(),
             1
         );
-        assert!(!FallbackProvider::new(Arc::new(ChatOnly), vec![]).embeds());
+        let chat_only = FallbackProvider::new(Arc::new(ChatOnly), vec![]);
+        assert!(!chat_only.embeds());
+        assert_eq!(chat_only.embed_id(), ModelId("chat-only".into()));
     }
 }

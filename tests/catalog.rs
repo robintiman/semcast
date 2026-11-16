@@ -702,11 +702,17 @@ async fn an_index_saved_under_the_chat_models_id_is_rebuilt_once() {
             [legacy.to_string()],
         )
         .unwrap();
+    // A legacy entry's vectors are keyed by the chat model; drop them so the
+    // rebuild shows as embedding the column.
+    store.execute("DELETE FROM embeddings", []).unwrap();
     drop(store);
 
     let second = model();
     let ctx = disk.session(Arc::clone(&second) as _).await;
-    assert!(second.embed_calls() > 0, "rebuilt by embedding its column");
+    assert!(
+        second.embed_calls() > 1,
+        "rebuilt by embedding its column, not just the dimension probe"
+    );
     assert!(runtime(&ctx).index_for("tickets", "body").is_some());
     drop(ctx);
 
