@@ -207,20 +207,20 @@ def summarize(results: list[dict], args: argparse.Namespace, rows: int, index: d
         "|---|---|---|---|---|---|---|---|---|",
     ]
     for r in results:
-        if r.get("error"):
+        if r["recall"] is None:
             lines.append(f"| {r['clause']} | failed: {r['error'][:80]} |||||||| ")
             continue
         share = (
             f"{r['funnel_input_tokens'] / r['full_scan_input_tokens']:.0%}"
             if r["full_scan_input_tokens"]
-            else "n/a"
+            else f"n/a: {r['error']}"
         )
         lines.append(
             f"| {r['clause']} | {r['reference_matches']} | {r['funnel_rows']} | {r['recall']:.3f} | "
             f"{r['funnel_model_calls']} | {r['funnel_model_calls'] / rows:.0%} | "
             f"{r['funnel_input_tokens']} | {share} | {r['full_text']} |"
         )
-    met = sum(not r.get("error") and r["recall"] >= args.recall for r in results)
+    met = sum(r["recall"] is not None and r["recall"] >= args.recall for r in results)
     lines.append(
         f"\nIndex build: {index['seconds']:.0f} s, {index['embed_tokens']} embedding tokens "
         "(a full scan needs none)."
@@ -274,8 +274,10 @@ def main() -> None:
     duckdb.from_df(contracts).write_parquet(str(table))
     rows = len(contracts)
     setup = [
-        f"CREATE EXTERNAL TABLE contracts STORED AS PARQUET LOCATION '{table}'",
-        f"CREATE EXTERNAL TABLE contracts_plain STORED AS PARQUET LOCATION '{table}'",
+        # IF NOT EXISTS: a server restarted after a crash restores them from
+        # its store's catalog.
+        f"CREATE EXTERNAL TABLE IF NOT EXISTS contracts STORED AS PARQUET LOCATION '{table}'",
+        f"CREATE EXTERNAL TABLE IF NOT EXISTS contracts_plain STORED AS PARQUET LOCATION '{table}'",
     ]
     server = Server(args, setup)
     args.out.mkdir(parents=True, exist_ok=True)
@@ -330,6 +332,15 @@ def main() -> None:
                 "funnel_line": funnel.line,
                 "reference_line": reference.line,
             }
+            if error:
+                # Nothing measured: no number that could pass for one.
+                for key in ("recall", "full_scan_input_tokens", "reference_vs_lawyers_recall", "funnel_vs_lawyers_recall"):
+                    row[key] = None
+            elif row["full_scan_input_tokens"] == 0 and reference.ids:
+                row["error"] = (
+                    "no full-text tokens counted: has verify.rs's MEANS prompt changed? "
+                    f"(FULL_TEXT_PROMPT = {FULL_TEXT_PROMPT!r})"
+                )
             results.append(row)
             # Written after every clause, so a failure later keeps these.
             (args.out / "results.json").write_text(json.dumps(results, indent=2) + "\n")
@@ -342,6 +353,13 @@ def main() -> None:
         server.stop()
         proxy.stop()
 
+    other = proxy.snapshot()["other_in"]
+    if other:
+        print(
+            f"warning: {other} chat input tokens matched neither MEANS prompt; "
+            "check FULL_TEXT_PROMPT and CHUNKED_PROMPT against src/physical/verify.rs",
+            file=sys.stderr,
+        )
     summary = summarize(results, args, rows, index)
     (args.out / "summary.md").write_text(summary + "\n")
     print(summary)
