@@ -216,8 +216,9 @@ CREATE SEMANTIC INDEX ON <table>(<column>);
 Chunks each value, embeds the chunks, keeps the vectors in the store (or in
 memory without `--store`), and gives `MEANS`
 a cheap stage: one embedding call per query prunes non-candidates by vector
-similarity, and the verify model reads each survivor's top-3 chunks instead
-of the whole document. Optional for `MEANS` but highly recommended; required
+similarity, and the verify model reads only the survivors. Under `WITH
+RECALL` it may read each survivor's top-3 chunks instead of the whole
+document (see below). Optional for `MEANS` but highly recommended; required
 by `RELEVANCE TO`, `GROUP BY MEANING OF` and `SEMANTIC DISTINCT ON`.
 
 No `DROP` or `REFRESH` yet: run it again to rebuild after a load.
@@ -330,6 +331,8 @@ verify reads each row's best chunks, so calibration also asks that chunked
 question of every sampled match (one call each): a match it misses, or fails
 on, counts as lost. If chunks lose too many matches to meet the target,
 verify reads the full text for that query, and the progress notice says so.
+Without `WITH RECALL` nothing measures that loss, so verify always reads the
+full text.
 
 The target is the statement's. With several `MEANS` filters that can lose
 matches (an index or a scorer under each), each gets an equal share of the
