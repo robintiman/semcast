@@ -20,10 +20,15 @@
 //! repeat calibration doesn't pay for them twice). When chunks cannot meet
 //! the target and the full text does better, the scan tells verify (through
 //! [`ChunkEvidence`]) to read the full text instead, whose answers the labels
-//! are, leaving only the floor's losses to certify. Choosing between the two
-//! on one sample is two tests, so each is run at half the error budget —
-//! even when chunks miss nothing and the two coincide, which costs a few
-//! labels but keeps the argument a plain union bound.
+//! are, leaving only the floor's losses to certify. Full text and chunks are
+//! a fixed sequence rather than two tests: chunks lose more than full text
+//! at any floor, so they are adopted only when full text certifies too, and
+//! each runs at the full error budget of a look. Each look at the growing
+//! sample (a tranche) is a test, so a certified calibration runs each at a
+//! share of the budget; once the sample shows chunks can't keep enough
+//! matches, no more chunk checks are bought. A calibration that can only
+//! certify pruning nothing keeps drawing while labels remain: a label costs
+//! no more than the verify call it replaces.
 //!
 //! [`VerifyExec`]: crate::physical::VerifyExec
 
@@ -633,7 +638,7 @@ impl Scanner {
         let pool = self.sample_documents(buffered, calibration.label_budget())?;
         let mut labels: Vec<Label> = Vec::new();
         let mut labelled = 0;
-        let mut attempt: Option<(Calibration, HashMap<u64, f32>)> = None;
+        let mut attempt: Option<(Calibration, HashMap<u64, f32>, bool)> = None;
         let mut full_text = false;
         // What chunked verify answers for each sampled document that may be
         // a match (labelled yes, or failed) and has chunks to read: one it
@@ -642,10 +647,27 @@ impl Scanner {
         // Two pipelines are tried on one sample, chunked verify and full-text
         // verify, and the one that certifies is kept: each is tested at half
         // the error budget, so the certificate holds at the confidence asked.
-        let per_mode = CalibrationConfig {
-            confidence: calibration.confidence.map(|c| 1.0 - (1.0 - c) / 2.0),
+        // Each look at the growing sample is a test: at most `looks` of them,
+        // so each runs at a share of the error budget. Full text and chunks
+        // are a fixed sequence, not two tests: chunks lose more than full
+        // text at any floor, so they are adopted only when full text also
+        // certifies, and each runs at the look's full share.
+        let looks = match calibration.confidence {
+            Some(_) => calibration
+                .label_budget()
+                .div_ceil(calibration.sample_size)
+                .max(1),
+            None => 1,
+        };
+        let per_look = CalibrationConfig {
+            confidence: calibration
+                .confidence
+                .map(|c| 1.0 - (1.0 - c) / looks as f64),
             ..calibration.clone()
         };
+        // Once the sample shows chunked verify can't keep enough matches, no
+        // more chunk checks are bought.
+        let mut chunks_ruled_out = false;
         while labelled < pool.len() {
             let tranche = (labelled + calibration.sample_size).min(pool.len());
             let new_labels = self
@@ -653,6 +675,7 @@ impl Scanner {
                 .await;
             let to_check: Vec<(u64, Vec<String>)> = new_labels
                 .iter()
+                .filter(|_| !chunks_ruled_out)
                 .filter(|(_, label)| *label != Some(false))
                 .filter_map(|(text, _)| {
                     let hash = doc_hash(text);
@@ -667,7 +690,7 @@ impl Scanner {
 
             let calibrate = |misses: &HashSet<u64>| {
                 self.calibrate_over_best_proxy(
-                    &per_mode,
+                    &per_look,
                     &labels,
                     &per_doc_best,
                     &indexed,
@@ -675,28 +698,53 @@ impl Scanner {
                     misses,
                 )
             };
-            let reading_chunks = calibrate(&verify_misses(&chunked));
+            // Chunked verify keeps a sampled match only if the chunks say
+            // yes: when even an upper bound on that share is below the
+            // target, chunks can never certify.
+            if let Some(confidence) = per_look.confidence {
+                let checked = chunked.len();
+                let kept = chunked.values().filter(|v| **v == Some(true)).count();
+                if checked > 0
+                    && crate::optimizer::calibrate::recall_upper_bound(
+                        kept,
+                        checked,
+                        1.0 - confidence,
+                    ) < calibration.target_recall
+                {
+                    chunks_ruled_out = true;
+                }
+            }
             let reading_text = calibrate(&HashSet::new());
-            // Chunks when they meet the target, being cheaper; else full text
-            // when it does better. Labels are full-text verdicts, so reading
-            // the full text leaves only the floor's losses. A certified
-            // target whose chunks estimate above it is only short of labels:
-            // keep drawing rather than settle every survivor on full text.
+            let reading_chunks = (!chunks_ruled_out).then(|| calibrate(&verify_misses(&chunked)));
+            let target = calibration.target_recall;
+            // Chunks when they certify (and so does full text), being cheaper
+            // to verify. A certified target whose chunks estimate above it is
+            // only short of labels: keep drawing rather than settle on full
+            // text. Otherwise full text, which loses only the floor's matches.
+            let chunks_win = reading_chunks
+                .as_ref()
+                .is_some_and(|c| c.0.meets(target) && reading_text.0.meets(target));
             let chunks_short_of_labels = calibration.confidence.is_some()
                 && tranche < pool.len()
-                && reading_chunks.0.estimated_recall >= calibration.target_recall;
-            let text_wins = !reading_chunks.0.meets(calibration.target_recall)
+                && reading_chunks
+                    .as_ref()
+                    .is_some_and(|c| c.0.estimated_recall >= target);
+            let text_wins = !chunks_win
                 && !chunks_short_of_labels
-                && (reading_text.0.meets(calibration.target_recall)
-                    || recall_of(&reading_text.0) > recall_of(&reading_chunks.0));
-            let outcome = if text_wins {
-                reading_text
-            } else {
-                reading_chunks
+                && (reading_text.0.meets(target)
+                    || reading_chunks
+                        .as_ref()
+                        .is_none_or(|c| recall_of(&reading_text.0) > recall_of(&c.0)));
+            let outcome = match (text_wins, reading_chunks) {
+                (false, Some(chunks)) => chunks,
+                _ => reading_text,
             };
-            full_text = text_wins;
-            let settled =
-                calibration.confidence.is_none() || outcome.0.meets(calibration.target_recall);
+            full_text = text_wins || chunks_ruled_out;
+            // Settle on a certificate that prunes something (some row scores
+            // below its floor); one that only certifies pruning nothing keeps
+            // drawing while labels remain.
+            let prunes = outcome.1.values().any(|score| *score < outcome.0.threshold);
+            let settled = calibration.confidence.is_none() || (outcome.0.meets(target) && prunes);
             attempt = Some(outcome);
             if settled {
                 break;
@@ -714,7 +762,7 @@ impl Scanner {
                  verify reads the full text",
             );
         }
-        let (calibrated, scores) = match attempt {
+        let (calibrated, scores, proxy_used) = match attempt {
             Some(outcome) => outcome,
             // Nothing to label: no rows, or every one of them NULL.
             None => (
@@ -725,6 +773,7 @@ impl Scanner {
                     &SampledScores::default(),
                 ),
                 per_doc_best.clone(),
+                false,
             ),
         };
 
@@ -754,7 +803,13 @@ impl Scanner {
                 verify_misses(&chunked)
             };
             let (mut scored, mut always, mut lost) = (Vec::new(), 0, 0);
-            for (text, label) in &labels {
+            // A learned proxy is measured on the labels it wasn't fitted to.
+            let measured = if proxy_used {
+                &labels[labels.len() / 2..]
+            } else {
+                &labels[..]
+            };
+            for (text, label) in measured {
                 if *label != Some(true) {
                     continue;
                 }
@@ -795,17 +850,18 @@ impl Scanner {
         }))
     }
 
-    /// Calibrate over the best proxy the labels support: a logistic
-    /// regression fitted to *this* condition when there is enough evidence to
-    /// fit one, raw cosine similarity otherwise.
+    /// Calibrate over the best proxy the labels support, returning the
+    /// calibration, the per-document scores it was calibrated against (the
+    /// survivors must be decided on the same scale), and whether those are
+    /// the learned proxy's.
     ///
-    /// Returns the calibration and the per-document scores it was calibrated
-    /// against, since the survivors must be decided on the same scale.
-    ///
-    /// The labels are split in half — the fit sees one half, the threshold is
-    /// calibrated on the other. Calibrating on rows the model trained on would
-    /// measure the fit rather than the population, and the bound would be
-    /// certifying the wrong thing.
+    /// A certified target calibrates raw cosine over every label: fitting a
+    /// proxy halves the labels a bound can use, and choosing between proxy and
+    /// cosine by the labels that certify would be a second test. An estimate
+    /// uses a logistic proxy fitted to this condition only when it ranks
+    /// better than cosine, judged within the training half alone (fit on one
+    /// part, compared on the other), so the held-out half it is calibrated on
+    /// had no say in the choice.
     fn calibrate_over_best_proxy(
         &self,
         calibration: &CalibrationConfig,
@@ -814,7 +870,7 @@ impl Scanner {
         indexed: &HashSet<u64>,
         vectors: &HashMap<u64, crate::model::Embedding>,
         verify_misses: &HashSet<u64>,
-    ) -> (Calibration, HashMap<u64, f32>) {
+    ) -> (Calibration, HashMap<u64, f32>, bool) {
         let calibrate_with = |scores: &HashMap<u64, f32>, labels: &[Label]| {
             calibrate_threshold(
                 calibration.target_recall,
@@ -823,41 +879,87 @@ impl Scanner {
                 &score_labels(labels, scores, indexed, verify_misses),
             )
         };
+        let cosine = || {
+            (
+                calibrate_with(per_doc_best, labels),
+                per_doc_best.clone(),
+                false,
+            )
+        };
+        if calibration.confidence.is_some() {
+            return cosine();
+        }
 
         let (training, held_out) = labels.split_at(labels.len() / 2);
-        let examples: Vec<(&crate::model::Embedding, bool)> = training
-            .iter()
-            .filter_map(|(text, label)| Some((vectors.get(&doc_hash(text))?, (*label)?)))
-            .collect();
-
+        let examples = |labels: &[Label]| -> Vec<(&crate::model::Embedding, bool, u64)> {
+            labels
+                .iter()
+                .filter_map(|(text, label)| {
+                    let hash = doc_hash(text);
+                    Some((vectors.get(&hash)?, (*label)?, hash))
+                })
+                .collect()
+        };
+        let (fit_part, check_part) = training.split_at(training.len() / 2);
+        let fit_examples = examples(fit_part);
+        let check_examples = examples(check_part);
+        let wins = LearnedProxy::fit(
+            &fit_examples
+                .iter()
+                .map(|(v, l, _)| (*v, *l))
+                .collect::<Vec<_>>(),
+        )
+        .and_then(|proxy| {
+            let learned: Option<Vec<(f32, bool)>> = check_examples
+                .iter()
+                .map(|(v, l, _)| Some((proxy.score(v)?, *l)))
+                .collect();
+            let raw: Option<Vec<(f32, bool)>> = check_examples
+                .iter()
+                .map(|(_, l, hash)| Some((*per_doc_best.get(hash)?, *l)))
+                .collect();
+            Some(auc(&learned?)? > auc(&raw?)?)
+        })
+        .unwrap_or(false);
+        if !wins {
+            return cosine();
+        }
+        let training_examples = examples(training);
+        let Some(proxy) = LearnedProxy::fit(
+            &training_examples
+                .iter()
+                .map(|(v, l, _)| (*v, *l))
+                .collect::<Vec<_>>(),
+        ) else {
+            return cosine();
+        };
         // Every document the search returned needs a score on the new scale,
         // or it would be pruned for having no opinion rather than a low one.
-        if let Some(proxy) = LearnedProxy::fit(&examples) {
-            let learned: Option<HashMap<u64, f32>> = per_doc_best
-                .keys()
-                .map(|hash| Some((*hash, proxy.score(vectors.get(hash)?)?)))
-                .collect();
-            if let Some(learned) = learned {
+        let learned: Option<HashMap<u64, f32>> = per_doc_best
+            .keys()
+            .map(|hash| Some((*hash, proxy.score(vectors.get(hash)?)?)))
+            .collect();
+        match learned {
+            Some(learned) => {
                 tracing::debug!(
                     target: "semcast::calibrate",
                     condition = %self.condition,
-                    trained_on = examples.len(),
+                    trained_on = training_examples.len(),
                     calibrated_on = held_out.len(),
-                    "calibrating a learned proxy instead of raw similarity",
+                    "a learned proxy ranks better than raw similarity; calibrating it",
                 );
-                let calibrated = calibrate_with(&learned, held_out);
-                return (calibrated, learned);
+                (calibrate_with(&learned, held_out), learned, true)
             }
+            None => cosine(),
         }
-        // No fit: cosine over every label, since none of them trained anything.
-        (calibrate_with(per_doc_best, labels), per_doc_best.clone())
     }
 
     /// The two-stage funnel's calibration: index floor and scorer floor
     /// chosen together on one labeled sample (see [`crate::optimizer::joint`]).
     /// Like [`Scanner::calibrated_prefilter`], each sampled document that may
     /// match is also asked the chunked question verify will ask, and chunks
-    /// and full text are each tried at half the error budget. Thresholds the
+    /// and full text are tried as a fixed sequence at each look's share of
+    /// the error budget. Thresholds the
     /// raw cosine score: the learned proxy needs half the labels held out,
     /// and the scorer is what separates a weak index here.
     async fn joint_prefilter(
@@ -938,7 +1040,19 @@ impl Scanner {
             })
             .map(|text| doc_hash(text))
             .collect();
-        let per_mode = calibration.confidence.map(|c| 1.0 - (1.0 - c) / 2.0);
+        // As in the single-floor calibration: each look runs at a share of
+        // the error budget, and chunks are adopted only when full text also
+        // certifies (a fixed sequence, not two tests).
+        let looks = match calibration.confidence {
+            Some(_) => calibration
+                .label_budget()
+                .div_ceil(calibration.sample_size)
+                .max(1),
+            None => 1,
+        };
+        let per_mode = calibration
+            .confidence
+            .map(|c| 1.0 - (1.0 - c) / looks as f64);
         let mut labels: Vec<Label> = Vec::new();
         let mut chunked: HashMap<u64, Option<bool>> = HashMap::new();
         let mut sample_scores: HashMap<u64, f32> = HashMap::new();
@@ -998,20 +1112,25 @@ impl Scanner {
             // As in the single-floor calibration: chunks when they meet the
             // target; full text when it does better, unless chunks only lack
             // labels and more can be drawn.
+            let target = calibration.target_recall;
+            let chunks_win = reading_chunks.meets(target) && reading_text.meets(target);
             let chunks_short_of_labels = calibration.confidence.is_some()
                 && tranche < pool.len()
-                && reading_chunks.estimated_recall >= calibration.target_recall;
-            let text_wins = !reading_chunks.meets(calibration.target_recall)
+                && reading_chunks.estimated_recall >= target;
+            let text_wins = !chunks_win
                 && !chunks_short_of_labels
-                && (reading_text.meets(calibration.target_recall)
+                && (reading_text.meets(target)
                     || recall_of(&reading_text) > recall_of(&reading_chunks));
             let picked = if text_wins {
                 reading_text
             } else {
                 reading_chunks
             };
-            let settled =
-                calibration.confidence.is_none() || picked.meets(calibration.target_recall);
+            // Settle on a certificate that prunes something; pruning nothing
+            // keeps drawing while labels remain.
+            let prunes =
+                population.iter().any(|score| *score < picked.index_floor) || picked.uses_scorer();
+            let settled = calibration.confidence.is_none() || (picked.meets(target) && prunes);
             choice = Some((picked, text_wins));
             if settled {
                 break;
@@ -1209,6 +1328,31 @@ impl Scanner {
             stats_key: calibration.stats_key,
         }
     }
+}
+
+/// Area under the ROC curve of `scores` against labels (ties count half):
+/// how well a score ranks matches above non-matches. `None` without both.
+fn auc(scored: &[(f32, bool)]) -> Option<f64> {
+    let positives: Vec<f32> = scored.iter().filter(|(_, l)| *l).map(|(s, _)| *s).collect();
+    let negatives: Vec<f32> = scored
+        .iter()
+        .filter(|(_, l)| !*l)
+        .map(|(s, _)| *s)
+        .collect();
+    if positives.is_empty() || negatives.is_empty() {
+        return None;
+    }
+    let mut wins = 0.0;
+    for p in &positives {
+        for n in &negatives {
+            wins += match p.total_cmp(n) {
+                std::cmp::Ordering::Greater => 1.0,
+                std::cmp::Ordering::Equal => 0.5,
+                std::cmp::Ordering::Less => 0.0,
+            };
+        }
+    }
+    Some(wins / (positives.len() * negatives.len()) as f64)
 }
 
 /// The recall a calibration stands on: certified when it certifies,

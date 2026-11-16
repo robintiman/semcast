@@ -25,7 +25,7 @@
 //! calibration, the caller looks again after each tranche of labels without
 //! correcting for the repeated looks.
 
-use crate::optimizer::calibrate::wilson_lower_bound;
+use crate::optimizer::calibrate::recall_lower_bound;
 
 /// How many floors per stage the search tries, at most: quantiles of the
 /// sampled matches' scores. Bounds the Bonferroni correction (at most
@@ -191,7 +191,7 @@ pub fn choose(
                 if total == 0 {
                     1.0
                 } else {
-                    wilson_lower_bound(kept, total, alpha)
+                    recall_lower_bound(kept, total, alpha)
                 }
             });
             let choice = JointChoice {
@@ -249,7 +249,7 @@ pub fn choose(
                 if total == 0 {
                     1.0
                 } else {
-                    wilson_lower_bound(kept, total, alpha)
+                    recall_lower_bound(kept, total, alpha)
                 }
             }),
             scorer_calls: 0.0,

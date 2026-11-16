@@ -578,18 +578,27 @@ impl Scanner {
         let mut labels: Vec<Label> = Vec::new();
         let mut labelled = 0;
         let mut calibrated = None;
+        // Each look at the growing sample is a test, at a share of the error
+        // budget (see `optimizer::calibrate`).
+        let looks = self.label_budget().div_ceil(calibration.sample_size).max(1);
+        let per_look = calibration
+            .confidence
+            .map(|c| 1.0 - (1.0 - c) / looks as f64);
         while labelled < pool.len() {
             let tranche = (labelled + calibration.sample_size).min(pool.len());
             labels.extend(labeler.label(&pool[labelled..tranche]).await);
             labelled = tranche;
             let attempt = calibrate_threshold(
                 calibration.target_recall,
-                calibration.confidence,
+                per_look,
                 DEFAULT_SCORER_FLOOR,
                 &sampled_scores(&labels, scores),
             );
-            let settled =
-                calibration.confidence.is_none() || attempt.meets(calibration.target_recall);
+            // Settle on a certificate that prunes something; one that only
+            // certifies pruning nothing keeps drawing while labels remain.
+            let prunes = scores.values().any(|score| *score < attempt.threshold);
+            let settled = calibration.confidence.is_none()
+                || (attempt.meets(calibration.target_recall) && prunes);
             calibrated = Some(attempt);
             if settled {
                 break;

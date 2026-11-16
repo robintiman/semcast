@@ -13,16 +13,20 @@
 //!   the target *on the sample*. Cheap and unbiased, but a sample of three
 //!   positives will happily report 0.9 — the number is an estimate and the
 //!   plan says so.
-//! - **Certified** (`WITH RECALL … WITH CONFIDENCE c`). The floor is the one
-//!   whose Wilson lower bound on recall clears the target at confidence `c`,
-//!   so the guarantee holds for the population and not just the rows that
-//!   happened to be drawn. Strictly more conservative: it prunes less, and on
-//!   a sample too small to certify anything it prunes nothing at all rather
-//!   than reporting a number it cannot defend.
+//! - **Certified** (`WITH RECALL … WITH CONFIDENCE c`). The floor is the
+//!   highest whose exact (Clopper–Pearson) lower bound on recall clears the
+//!   target at confidence `c`, so the guarantee holds for the population and
+//!   not just the rows that happened to be drawn. Strictly more conservative:
+//!   it prunes less, and on a sample too small to certify anything it prunes
+//!   nothing at all rather than reporting a number it cannot defend.
 //!
-//! The bound is Bonferroni-corrected across the candidate floors, because the
-//! floor is chosen using the same sample that scores it — testing every
-//! candidate at the full confidence would certify one of them by luck.
+//! The floor is picked with the same sample that scores it, yet needs no
+//! correction across candidate floors: recall only falls as the floor rises,
+//! and so does its bound, so if any floor above the population's safe one
+//! certified, the lowest unsafe floor (one fixed value) would certify too,
+//! which happens with probability at most `1 - c`. What does need correcting
+//! is looking again as more labels arrive: callers that draw in tranches
+//! test each look at `(1 - c) / looks`.
 //!
 //! What gets thresholded is [`crate::optimizer::proxy`]'s business: raw
 //! similarity, or a classifier fitted to these same labels. Either way the
@@ -174,7 +178,7 @@ pub fn calibrate_threshold(
         sampled_rows: scores.sampled,
         estimated_recall: kept as f64 / total as f64,
         certified_recall: confidence
-            .map(|confidence| wilson_lower_bound(kept, total, 1.0 - confidence)),
+            .map(|confidence| recall_lower_bound(kept, total, 1.0 - confidence)),
     }
 }
 
@@ -238,12 +242,9 @@ fn point_estimate_floor(
     }
 }
 
-/// The highest floor whose Wilson lower bound on recall clears the target.
-///
-/// Every distinct positive score is a candidate floor, and each is tested at
-/// `δ/m` rather than `δ` so the whole search holds at `1 - δ` — the floor is
-/// picked with the same sample that scores it, and without the correction one
-/// of `m` candidates would clear the bar by luck.
+/// The highest floor whose exact lower bound on recall clears the target, at
+/// the full `1 - confidence`: no correction across floors is needed (see the
+/// module docs), since recall and its bound only fall as the floor rises.
 ///
 /// `None` when no candidate certifies.
 fn certified_floor(
@@ -264,94 +265,66 @@ fn certified_floor(
     if candidates.is_empty() {
         return None;
     }
-    let alpha = (1.0 - confidence) / candidates.len() as f64;
+    let alpha = 1.0 - confidence;
 
     // Highest floor first: the first that certifies prunes the most.
     candidates.into_iter().find(|floor| {
         let (kept, total) = recall_at(*floor, positive, scores);
-        wilson_lower_bound(kept, total, alpha) >= target_recall
+        recall_lower_bound(kept, total, alpha) >= target_recall
     })
 }
 
-/// One-sided lower confidence bound on a binomial proportion, Wilson score.
-///
-/// Chosen over the textbook normal approximation because it stays inside
-/// `[0, 1]` and stays sane at `k == n` — which is exactly where a small
-/// calibration sample lives, and where the normal interval would claim a
-/// bound of 1.0 from three observations.
-pub(crate) fn wilson_lower_bound(successes: usize, trials: usize, alpha: f64) -> f64 {
-    if trials == 0 {
+/// Exact one-sided lower confidence bound on a binomial proportion
+/// (Clopper–Pearson): the `p` at which seeing `successes` or more of
+/// `trials` has probability `alpha`. Never above the point estimate, 0 with
+/// nothing observed, and below 1 even when every trial succeeded.
+pub(crate) fn recall_lower_bound(successes: usize, trials: usize, alpha: f64) -> f64 {
+    if trials == 0 || successes == 0 {
         return 0.0;
     }
-    let n = trials as f64;
-    let p = successes as f64 / n;
-    let z = normal_quantile(1.0 - alpha);
-    let z2 = z * z;
-    let center = p + z2 / (2.0 * n);
-    let margin = z * (p * (1.0 - p) / n + z2 / (4.0 * n * n)).sqrt();
-    ((center - margin) / (1.0 + z2 / n)).clamp(0.0, 1.0)
+    // P(X >= k) rises with p: bisect for the p where it equals alpha.
+    let (mut low, mut high) = (0.0f64, successes as f64 / trials as f64);
+    for _ in 0..100 {
+        let mid = 0.5 * (low + high);
+        if upper_tail(successes, trials, mid) < alpha {
+            low = mid;
+        } else {
+            high = mid;
+        }
+    }
+    low
 }
 
-/// Inverse standard-normal CDF — Acklam's rational approximation, accurate to
-/// roughly 1.15e-9 over `(0, 1)`, which is far past what a threshold search
-/// over a few hundred labels can notice.
-///
-/// The coefficients are transcribed from the published approximation rather
-/// than rounded to the shortest literal that round-trips, so they can be
-/// checked against the source; `excessive_precision` is allowed for that
-/// reason, not overlooked.
-#[allow(clippy::excessive_precision)]
-fn normal_quantile(p: f64) -> f64 {
-    const A: [f64; 6] = [
-        -3.969683028665376e+01,
-        2.209460984245205e+02,
-        -2.759285104469687e+02,
-        1.383577518672690e+02,
-        -3.066479806614716e+01,
-        2.506628277459239e+00,
-    ];
-    const B: [f64; 5] = [
-        -5.447609879822406e+01,
-        1.615858368580409e+02,
-        -1.556989798598866e+02,
-        6.680131188771972e+01,
-        -1.328068155288572e+01,
-    ];
-    const C: [f64; 6] = [
-        -7.784894002430293e-03,
-        -3.223964580411365e-01,
-        -2.400758277161838e+00,
-        -2.549732539343734e+00,
-        4.374664141464968e+00,
-        2.938163982698783e+00,
-    ];
-    const D: [f64; 4] = [
-        7.784695709041462e-03,
-        3.224671290700398e-01,
-        2.445134137142996e+00,
-        3.754408661907416e+00,
-    ];
-    /// Where the central rational approximation gives way to the tail one.
-    const BREAK: f64 = 0.02425;
+/// Exact one-sided upper confidence bound on a binomial proportion.
+pub(crate) fn recall_upper_bound(successes: usize, trials: usize, alpha: f64) -> f64 {
+    if trials == 0 || successes == trials {
+        return 1.0;
+    }
+    1.0 - recall_lower_bound(trials - successes, trials, alpha)
+}
 
+/// `P(X >= k)` for `X ~ Binomial(n, p)`, summed in log space.
+fn upper_tail(k: usize, n: usize, p: f64) -> f64 {
     if p <= 0.0 {
-        return f64::NEG_INFINITY;
+        return if k == 0 { 1.0 } else { 0.0 };
     }
     if p >= 1.0 {
-        return f64::INFINITY;
+        return 1.0;
     }
-    if !(BREAK..=1.0 - BREAK).contains(&p) {
-        // Tails, mirrored around the median.
-        let upper = p > 0.5;
-        let q = (-2.0 * if upper { 1.0 - p } else { p }.ln()).sqrt();
-        let x = (((((C[0] * q + C[1]) * q + C[2]) * q + C[3]) * q + C[4]) * q + C[5])
-            / ((((D[0] * q + D[1]) * q + D[2]) * q + D[3]) * q + 1.0);
-        return if upper { -x } else { x };
+    let (ln_p, ln_q) = (p.ln(), (1.0 - p).ln());
+    let ln_factorial = |m: usize| (1..=m).map(|i| (i as f64).ln()).sum::<f64>();
+    let ln_n = ln_factorial(n);
+    let mut ln_k = ln_factorial(k);
+    let mut ln_rest = ln_factorial(n - k);
+    let mut total = 0.0;
+    for i in k..=n {
+        if i > k {
+            ln_k += (i as f64).ln();
+            ln_rest -= ((n - i + 1) as f64).ln();
+        }
+        total += (ln_n - ln_k - ln_rest + i as f64 * ln_p + (n - i) as f64 * ln_q).exp();
     }
-    let q = p - 0.5;
-    let r = q * q;
-    (((((A[0] * r + A[1]) * r + A[2]) * r + A[3]) * r + A[4]) * r + A[5]) * q
-        / (((((B[0] * r + B[1]) * r + B[2]) * r + B[3]) * r + B[4]) * r + 1.0)
+    total.min(1.0)
 }
 
 #[cfg(test)]
@@ -584,6 +557,20 @@ mod tests {
     mod certified {
         use super::*;
 
+        /// Thirty matches, every one at a different score, all kept at the
+        /// lowest: an exact bound certifies 0.9 at 95% from 30 of 30, with no
+        /// correction for the thirty floors it could have picked.
+        #[test]
+        fn many_distinct_floors_cost_no_correction() {
+            let positives: Vec<f32> = (0..30).map(|i| 0.5 + i as f32 * 0.01).collect();
+            let calibration = calibrate_threshold(0.9, Some(0.95), 0.35, &scores(&positives));
+            assert!(calibration.meets(0.9), "{calibration:?}");
+            assert!(
+                (calibration.threshold - 0.5).abs() < 1e-6,
+                "the floor keeps every match: {calibration:?}"
+            );
+        }
+
         /// The headline property: certifying never keeps fewer true matches
         /// than estimating, because it must defend the number against the
         /// sample size rather than read it off.
@@ -697,60 +684,45 @@ mod tests {
     mod statistics {
         use super::*;
 
-        /// Textbook one-sided critical values.
+        /// Known Clopper–Pearson values: 10 of 10 at 95% is 0.05^(1/10).
         #[test]
-        fn normal_quantile_matches_known_values() {
-            for (p, expected) in [
-                (0.90, 1.281_551_6),
-                (0.95, 1.644_853_6),
-                (0.975, 1.959_964_0),
-                (0.99, 2.326_347_9),
-                (0.999, 3.090_232_3),
-            ] {
-                let z = normal_quantile(p);
-                assert!(
-                    (z - expected).abs() < 1e-6,
-                    "quantile({p}) = {z}, expected {expected}",
-                );
-            }
-        }
-
-        #[test]
-        fn normal_quantile_is_symmetric_about_the_median() {
-            assert!(normal_quantile(0.5).abs() < 1e-12);
-            for p in [0.001, 0.02, 0.2, 0.4] {
-                let (low, high) = (normal_quantile(p), normal_quantile(1.0 - p));
-                assert!((low + high).abs() < 1e-6, "{low} vs {high}");
-            }
+        fn the_exact_bound_matches_known_values() {
+            let bound = recall_lower_bound(10, 10, 0.05);
+            assert!((bound - 0.05f64.powf(0.1)).abs() < 1e-9, "{bound}");
+            // 29 of 29 is the fewest perfect matches that certify 0.9 at 95%.
+            assert!(recall_lower_bound(29, 29, 0.05) >= 0.9);
+            assert!(recall_lower_bound(28, 28, 0.05) < 0.9);
         }
 
         /// A perfect sample still cannot certify 1.0 — the whole point of a
         /// bound over a point estimate.
         #[test]
         fn a_perfect_small_sample_does_not_certify_certainty() {
-            let bound = wilson_lower_bound(3, 3, 0.05);
+            let bound = recall_lower_bound(3, 3, 0.05);
             assert!(bound > 0.0 && bound < 1.0, "3/3 certified {bound}");
             assert!(
-                wilson_lower_bound(300, 300, 0.05) > bound,
+                recall_lower_bound(300, 300, 0.05) > bound,
                 "more evidence must certify more",
             );
         }
 
         #[test]
-        fn the_bound_never_exceeds_the_point_estimate() {
+        fn the_bounds_bracket_the_point_estimate() {
             for (k, n) in [(0, 10), (1, 10), (5, 10), (9, 10), (10, 10), (50, 100)] {
-                let bound = wilson_lower_bound(k, n, 0.05);
+                let low = recall_lower_bound(k, n, 0.05);
+                let high = recall_upper_bound(k, n, 0.05);
+                let estimate = k as f64 / n as f64;
                 assert!(
-                    bound <= k as f64 / n as f64 + 1e-12,
-                    "{k}/{n} bound {bound} exceeded the estimate",
+                    low <= estimate + 1e-12 && estimate <= high + 1e-12,
+                    "{k}/{n}"
                 );
-                assert!((0.0..=1.0).contains(&bound), "{k}/{n} bound {bound}");
+                assert!((0.0..=1.0).contains(&low) && (0.0..=1.0).contains(&high));
             }
         }
 
         #[test]
         fn an_empty_sample_certifies_nothing() {
-            assert_eq!(wilson_lower_bound(0, 0, 0.05), 0.0);
+            assert_eq!(recall_lower_bound(0, 0, 0.05), 0.0);
         }
     }
 }
