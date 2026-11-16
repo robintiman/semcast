@@ -1010,6 +1010,7 @@ impl Scanner {
         let strings: Vec<&StringArray> = arrays.iter().map(as_strings).collect();
         let mut seen: HashSet<u64> = HashSet::new();
         let mut undecided: Vec<(u64, &str)> = Vec::new();
+        let mut grid_scores: Vec<f32> = Vec::new();
         for array in &strings {
             for row in 0..array.len() {
                 if !array.is_valid(row) {
@@ -1022,8 +1023,21 @@ impl Scanner {
                     .as_deref()
                     .and_then(|s| s.verdict(text))
                     .is_some();
-                if seen.insert(hash) && !known {
-                    undecided.push((hash, text));
+                if seen.insert(hash) {
+                    // Every indexed row's score, decided or not: the joint
+                    // grid's index floors, which must not depend on which
+                    // rows a sample (this one or an earlier) drew.
+                    if indexed.contains(&hash) {
+                        grid_scores.push(
+                            per_doc_best
+                                .get(&hash)
+                                .copied()
+                                .unwrap_or(f32::NEG_INFINITY),
+                        );
+                    }
+                    if !known {
+                        undecided.push((hash, text));
+                    }
                 }
             }
         }
@@ -1048,8 +1062,8 @@ impl Scanner {
             .map(|text| doc_hash(text))
             .collect();
         // As in the single-floor calibration: each look runs at a share of
-        // the error budget, and chunks are adopted only when full text also
-        // certifies (a fixed sequence, not two tests).
+        // the error budget, split between full text and chunks
+        // ([`TEXT_SHARE`]): two claims about different floors.
         let looks = match calibration.confidence {
             Some(_) => calibration
                 .label_budget()
@@ -1057,9 +1071,11 @@ impl Scanner {
                 .max(1),
             None => 1,
         };
-        let per_mode = calibration
-            .confidence
-            .map(|c| 1.0 - (1.0 - c) / looks as f64);
+        let per_mode = |share: f64| {
+            calibration
+                .confidence
+                .map(|c| 1.0 - (1.0 - c) * share / looks as f64)
+        };
         let mut labels: Vec<Label> = Vec::new();
         let mut chunked: HashMap<u64, Option<bool>> = HashMap::new();
         let mut sample_scores: HashMap<u64, f32> = HashMap::new();
@@ -1103,11 +1119,17 @@ impl Scanner {
                 )
             };
             let pick = |chunk_misses: bool| {
+                let share = if chunk_misses {
+                    1.0 - TEXT_SHARE
+                } else {
+                    TEXT_SHARE
+                };
                 joint::choose(
                     calibration.target_recall,
-                    per_mode,
+                    per_mode(share),
                     &docs(chunk_misses),
                     &population,
+                    &grid_scores,
                     unindexed,
                     joint::SCORER_COST,
                 )
@@ -1120,7 +1142,7 @@ impl Scanner {
             // target; full text when it does better, unless chunks only lack
             // labels and more can be drawn.
             let target = calibration.target_recall;
-            let chunks_win = reading_chunks.meets(target) && reading_text.meets(target);
+            let chunks_win = reading_chunks.meets(target);
             let chunks_short_of_labels = calibration.confidence.is_some()
                 && tranche < pool.len()
                 && reading_chunks.estimated_recall >= target;
@@ -1210,6 +1232,7 @@ impl Scanner {
                         None,
                         &docs,
                         &population,
+                        &grid_scores,
                         unindexed,
                         joint::SCORER_COST,
                     );
