@@ -241,7 +241,8 @@ CASE WHEN <text_column> MEANS '<condition>' THEN ... -- a label
 
 The same operator, used to label rather than to filter. Every condition over
 one column is fused into **one model call per row**, so a three-branch `CASE`
-costs what a one-branch one does. `CASE` semantics are unchanged:
+costs what a one-branch one does (under a [decider](#decider), one call per
+condition; `EXPLAIN`'s physical plan shows the bill). `CASE` semantics are unchanged:
 first-match-wins, `ELSE`, and a failed row falls through instead of failing the
 query.
 

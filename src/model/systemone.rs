@@ -93,7 +93,13 @@ impl SystemOneProvider {
                     )));
                 }
             }
-            (None, [id]) if !id.is_empty() => (file(id), id.clone()),
+            // Named as `--decider-model` would name it, so adding the flag
+            // later keeps the stored verdicts.
+            (None, [id]) if !id.is_empty() => {
+                let name = file(id);
+                let name = name.strip_suffix(":latest").unwrap_or(&name).to_owned();
+                (name, id.clone())
+            }
             (None, [] | [_]) => {
                 return Err(SemcastError::Model(format!(
                     "{} serves no model",

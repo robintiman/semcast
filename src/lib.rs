@@ -360,7 +360,8 @@ impl SemcastContextBuilder {
     /// ([`SystemOneProvider`]), which answers yes/no with a probability and
     /// cannot write; under one, a `CASE` asks each condition on its own
     /// instead of fusing them. It gets its own cap on requests in flight
-    /// ([`with_decider_max_in_flight`]).
+    /// ([`with_decider_max_in_flight`]). Fallback models do not cover it: a
+    /// row the decider fails is a failed row.
     ///
     /// [`SystemOneProvider`]: crate::model::SystemOneProvider
     /// [`with_decider_max_in_flight`]: Self::with_decider_max_in_flight
