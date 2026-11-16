@@ -25,7 +25,8 @@
 //! across the cuts, and each piece is normalized before the mean. Every word
 //! of every chunk counts toward its vector. A store that embedded chunks
 //! before this keeps their cut vectors (they are keyed by text, which did
-//! not change); dropping the store's `embeddings` rows re-embeds them.
+//! not change); drop its `embeddings` rows and refresh or recreate the index
+//! to re-embed them.
 //!
 //! Needs an Ollama that knows `truncate` and `shift` (0.40 does); an older
 //! one ignores them and cuts silently.
