@@ -280,6 +280,23 @@ impl ModelProvider for Scheduler {
         self.inner.embed(texts).await
     }
 
+    fn embed_id(&self) -> ModelId {
+        self.inner.embed_id()
+    }
+
+    fn embeds(&self) -> bool {
+        self.inner.embeds()
+    }
+
+    async fn embed_queries(&self, texts: Vec<String>) -> Result<Vec<Embedding>> {
+        let _permit = self
+            .permits
+            .acquire()
+            .await
+            .expect("the scheduler never closes its semaphore");
+        self.inner.embed_queries(texts).await
+    }
+
     fn embed_batch_size(&self) -> usize {
         self.inner.embed_batch_size()
     }
@@ -560,5 +577,21 @@ mod tests {
     async fn the_id_is_the_inner_models() {
         let scheduler = Scheduler::new(Arc::new(MockModel::default()), 1);
         assert_eq!(scheduler.id(), ModelId("mock".to_owned()));
+    }
+
+    /// The scheduler is the session's model to every operator: it must pass
+    /// the embedder's id and the query side through, not the defaults.
+    #[tokio::test]
+    async fn forwards_the_embedder_and_its_queries() {
+        let model = Arc::new(
+            MockModel::default()
+                .with_id("chat")
+                .with_embed_id("embedder"),
+        );
+        let scheduler = Scheduler::new(Arc::clone(&model) as _, 1);
+        assert_eq!(scheduler.embed_id(), ModelId("embedder".into()));
+        assert!(scheduler.embeds());
+        scheduler.embed_queries(vec!["q".into()]).await.unwrap();
+        assert_eq!(model.query_embed_calls(), 1);
     }
 }

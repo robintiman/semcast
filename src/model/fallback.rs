@@ -47,6 +47,45 @@ impl FallbackProvider {
         );
         Self { models, id }
     }
+
+    /// The links that can embed, in order.
+    fn embedders(&self) -> impl Iterator<Item = &Arc<dyn ModelProvider>> {
+        self.models.iter().filter(|model| model.embeds())
+    }
+
+    /// Each embedder in turn until one embeds the whole batch.
+    async fn embed_down_the_chain(
+        &self,
+        texts: Vec<String>,
+        queries: bool,
+    ) -> Result<Vec<Embedding>> {
+        let embedders: Vec<&Arc<dyn ModelProvider>> = self.embedders().collect();
+        let mut last_error = None;
+        for (rank, model) in embedders.iter().enumerate() {
+            let embedded = if queries {
+                model.embed_queries(texts.clone()).await
+            } else {
+                model.embed(texts.clone()).await
+            };
+            match embedded {
+                Ok(embeddings) => return Ok(embeddings),
+                Err(error) => {
+                    if rank + 1 < embedders.len() {
+                        tracing::warn!(
+                            target: "semcast::model",
+                            failed = %model.id(),
+                            next = %embedders[rank + 1].id(),
+                            error = %error,
+                            "falling back to the next embedder",
+                        );
+                    }
+                    last_error = Some(error);
+                }
+            }
+        }
+        Err(last_error
+            .unwrap_or_else(|| SemcastError::Model("no embedder answered the batch".into())))
+    }
 }
 
 #[async_trait]
@@ -127,32 +166,45 @@ impl ModelProvider for FallbackProvider {
     /// `Result` for the whole batch, so there are no individual failures to
     /// route and the next model re-embeds everything.
     async fn embed(&self, texts: Vec<String>) -> Result<Vec<Embedding>> {
-        let mut last_error = None;
-        for (rank, model) in self.models.iter().enumerate() {
-            match model.embed(texts.clone()).await {
-                Ok(embeddings) => return Ok(embeddings),
-                Err(error) => {
-                    if rank + 1 < self.models.len() {
-                        tracing::warn!(
-                            target: "semcast::model",
-                            failed = %model.id(),
-                            next = %self.models[rank + 1].id(),
-                            error = %error,
-                            "falling back to the next embedder",
-                        );
-                    }
-                    last_error = Some(error);
-                }
-            }
-        }
-        Err(last_error
-            .unwrap_or_else(|| SemcastError::Model("no embedder answered the batch".into())))
+        self.embed_down_the_chain(texts, false).await
     }
 
-    /// The primary's preference. A fallback batches to whatever the model it
-    /// covers for asked for, which keeps one embed call one embed call.
+    /// Names every embedder in the chain, as [`id`](Self::id) names every
+    /// chat model: any of them may have made a vector. A link that cannot
+    /// embed made none, and a repeated embedder is named once, so neither
+    /// changes the key.
+    fn embed_id(&self) -> ModelId {
+        let mut ids: Vec<String> = Vec::new();
+        for model in self.embedders() {
+            let id = model.embed_id().0;
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        if ids.is_empty() {
+            // Nothing embeds, so no vector is ever keyed by this; name the
+            // chain so errors and EXPLAIN still read.
+            return self.id();
+        }
+        ModelId(ids.join("+"))
+    }
+
+    fn embeds(&self) -> bool {
+        self.embedders().next().is_some()
+    }
+
+    async fn embed_queries(&self, texts: Vec<String>) -> Result<Vec<Embedding>> {
+        self.embed_down_the_chain(texts, true).await
+    }
+
+    /// The first embedder's preference. A fallback batches to whatever the
+    /// model it covers for asked for, which keeps one embed call one embed
+    /// call.
     fn embed_batch_size(&self) -> usize {
-        self.models[0].embed_batch_size()
+        self.embedders()
+            .next()
+            .unwrap_or(&self.models[0])
+            .embed_batch_size()
     }
 }
 
@@ -311,5 +363,53 @@ mod tests {
             vec![Flaky::new("secondary", "x"), Flaky::new("tertiary", "x")],
         );
         assert_eq!(chain.id(), ModelId("primary+secondary+tertiary".into()));
+    }
+
+    /// A chat-only link (Anthropic): it cannot embed.
+    #[derive(Debug)]
+    struct ChatOnly;
+
+    #[async_trait]
+    impl ModelProvider for ChatOnly {
+        fn id(&self) -> ModelId {
+            ModelId("chat-only".into())
+        }
+        async fn complete(&self, requests: Vec<CompletionRequest>) -> Vec<Result<Completion>> {
+            requests
+                .iter()
+                .map(|_| Err(SemcastError::Model("down".into())))
+                .collect()
+        }
+        fn embeds(&self) -> bool {
+            false
+        }
+        async fn embed(&self, _: Vec<String>) -> Result<Vec<Embedding>> {
+            panic!("a chat-only link is never asked to embed")
+        }
+    }
+
+    /// The chain's embedder id names only the links that embed, each
+    /// embedder once, so a chat-only fallback or a second link on the same
+    /// embedder leaves stored vectors where they are.
+    #[tokio::test]
+    async fn the_chain_embeds_and_is_named_by_its_embedders_only() {
+        use crate::model::MockModel;
+        let link = |chat: &str| -> Arc<dyn ModelProvider> {
+            Arc::new(MockModel::default().with_id(chat).with_embed_id("nomic"))
+        };
+        let chain = FallbackProvider::new(
+            Arc::new(ChatOnly),
+            vec![link("qwen"), Arc::new(ChatOnly), link("gemma")],
+        );
+        assert_eq!(chain.embed_id(), ModelId("nomic".into()));
+        assert!(chain.embeds());
+        assert_eq!(chain.embed(vec!["a".into()]).await.unwrap().len(), 1);
+        assert_eq!(
+            chain.embed_queries(vec!["a".into()]).await.unwrap().len(),
+            1
+        );
+        let chat_only = FallbackProvider::new(Arc::new(ChatOnly), vec![]);
+        assert!(!chat_only.embeds());
+        assert_eq!(chat_only.embed_id(), ModelId("chat-only".into()));
     }
 }

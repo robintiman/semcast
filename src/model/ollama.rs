@@ -29,6 +29,7 @@ use crate::{Result, SemcastError};
 pub const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
 pub const DEFAULT_CHAT_MODEL: &str = "qwen3.8:27b";
 pub const DEFAULT_EMBED_MODEL: &str = "nomic-embed-text";
+
 /// Context length requested by default, in tokens: room for a document of
 /// about 120k characters (nine CUAD contracts in ten). Raise it with
 /// `--ollama-num-ctx` for longer ones, up to the model's own limit; memory
@@ -78,6 +79,31 @@ impl OllamaProvider {
     pub fn with_embed_model(mut self, embed_model: impl Into<String>) -> Self {
         self.embed_model = embed_model.into();
         self
+    }
+
+    /// One `/api/embed` call.
+    async fn embed_texts(&self, texts: Vec<String>) -> Result<Vec<Embedding>> {
+        let response = super::send_with_retry("ollama", || {
+            self.client
+                .post(format!("{}/api/embed", self.base_url))
+                .json(&EmbedRequest {
+                    model: &self.embed_model,
+                    input: &texts,
+                })
+        })
+        .await?;
+        let embed: EmbedResponse = response
+            .json()
+            .await
+            .map_err(|e| SemcastError::Model(format!("invalid ollama embed response: {e}")))?;
+        if embed.embeddings.len() != texts.len() {
+            return Err(SemcastError::Model(format!(
+                "ollama returned {} embeddings for {} inputs",
+                embed.embeddings.len(),
+                texts.len()
+            )));
+        }
+        Ok(embed.embeddings)
     }
 
     /// Request this context length, in tokens (see the module docs).
@@ -190,27 +216,18 @@ impl ModelProvider for OllamaProvider {
     }
 
     async fn embed(&self, texts: Vec<String>) -> Result<Vec<Embedding>> {
-        let response = super::send_with_retry("ollama", || {
-            self.client
-                .post(format!("{}/api/embed", self.base_url))
-                .json(&EmbedRequest {
-                    model: &self.embed_model,
-                    input: &texts,
-                })
-        })
-        .await?;
-        let embed: EmbedResponse = response
-            .json()
-            .await
-            .map_err(|e| SemcastError::Model(format!("invalid ollama embed response: {e}")))?;
-        if embed.embeddings.len() != texts.len() {
-            return Err(SemcastError::Model(format!(
-                "ollama returned {} embeddings for {} inputs",
-                embed.embeddings.len(),
-                texts.len()
-            )));
-        }
-        Ok(embed.embeddings)
+        self.embed_texts(texts).await
+    }
+
+    /// The embed model, not the chat model: it made the vectors.
+    ///
+    /// Queries and documents are embedded alike. nomic-embed-text's model
+    /// card asks for `search_query: ` / `search_document: ` prefixes, but on
+    /// CUAD (509 contracts, 5 clauses) they ranked worse on every clause
+    /// (AUC 0.64 to 0.84 against 0.67 to 0.85 without). Adding prefixes
+    /// later changes every vector, so it must change this id.
+    fn embed_id(&self) -> ModelId {
+        ModelId(format!("ollama/{}", self.embed_model))
     }
 }
 
@@ -319,6 +336,80 @@ struct EmbedResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One `/api/embed` exchange: answers one vector per input and hands
+    /// back the request body.
+    async fn embed_server() -> (String, tokio::task::JoinHandle<serde_json::Value>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let served = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 4096];
+            let body = loop {
+                let n = socket.read(&mut buf).await.unwrap();
+                request.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&request).to_string();
+                if let Some(end) = text.find("\r\n\r\n") {
+                    let length: usize = text[..end]
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= end + 4 + length {
+                        break serde_json::from_slice::<serde_json::Value>(
+                            &request[end + 4..end + 4 + length],
+                        )
+                        .unwrap();
+                    }
+                }
+            };
+            let inputs = body["input"].as_array().unwrap().len();
+            let answer =
+                serde_json::json!({ "embeddings": vec![vec![1.0_f32]; inputs] }).to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{answer}",
+                answer.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            body
+        });
+        (url, served)
+    }
+
+    #[tokio::test]
+    async fn queries_and_documents_are_embedded_alike() {
+        for queries in [false, true] {
+            let (url, served) = embed_server().await;
+            let ollama = OllamaProvider::new("qwen3.8:27b").with_base_url(&url);
+            let texts = vec!["non-compete".to_owned()];
+            if queries {
+                ollama.embed_queries(texts).await.unwrap();
+            } else {
+                ollama.embed(texts).await.unwrap();
+            }
+            let body = served.await.unwrap();
+            assert_eq!(body["model"], "nomic-embed-text");
+            assert_eq!(body["input"], serde_json::json!(["non-compete"]));
+        }
+    }
+
+    /// Vectors are keyed by the embedder, not the chat model: changing
+    /// `--model` keeps them, changing `--embed-model` does not.
+    #[test]
+    fn the_embedder_has_its_own_id() {
+        let ollama = OllamaProvider::new("qwen3.8:27b");
+        assert_eq!(ollama.id(), ModelId("ollama/qwen3.8:27b".into()));
+        assert_eq!(ollama.embed_id(), ModelId("ollama/nomic-embed-text".into()));
+        assert_eq!(
+            ollama.with_embed_model("mxbai-embed-large").embed_id(),
+            ModelId("ollama/mxbai-embed-large".into())
+        );
+    }
 
     #[test]
     fn an_answer_cut_by_the_context_is_not_used() {

@@ -92,7 +92,32 @@ pub trait ModelProvider: std::fmt::Debug + Send + Sync {
 
     async fn complete(&self, requests: Vec<CompletionRequest>) -> Vec<Result<Completion>>;
 
+    /// Embed documents: what an index stores and searches.
     async fn embed(&self, texts: Vec<String>) -> Result<Vec<Embedding>>;
+
+    /// The model behind [`embed`](Self::embed), which keys every stored
+    /// vector. A provider that chats with one model and embeds with another
+    /// must name the embedder here, or vectors outlive a chat model change
+    /// under the wrong name (and a new embedder reads the old one's).
+    fn embed_id(&self) -> ModelId {
+        self.id()
+    }
+
+    /// Whether [`embed`](Self::embed) can answer at all. A chat-only
+    /// provider (Anthropic) says no, so a fallback chain leaves it out of
+    /// the chain's [`embed_id`](Self::embed_id) and never asks it to embed.
+    fn embeds(&self) -> bool {
+        true
+    }
+
+    /// Embed search queries, to compare against [`embed`](Self::embed)'s
+    /// documents. Some embedders were trained to embed the two sides
+    /// differently (Voyage's `input_type`); the default embeds them alike.
+    /// A provider wrapping another must forward this and
+    /// [`embed_id`](Self::embed_id), or it silently drops them.
+    async fn embed_queries(&self, texts: Vec<String>) -> Result<Vec<Embedding>> {
+        self.embed(texts).await
+    }
 
     /// Preferred number of texts per embed request. The index groups chunks
     /// into windows of this size before calling [`embed`](Self::embed), so a

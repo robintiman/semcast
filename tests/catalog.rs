@@ -664,3 +664,64 @@ async fn a_view_over_an_in_memory_table_is_not_saved() {
     run(&first, "CREATE VIEW nested AS SELECT * FROM direct").await;
     assert_eq!(disk.entries(), vec![], "neither view would restore");
 }
+
+/// An index saved before vectors were keyed by their embedder holds the
+/// chat model's id. Restoring it rebuilds it once and saves it under the
+/// embedder's, so the restart after that embeds nothing.
+#[tokio::test]
+async fn an_index_saved_under_the_chat_models_id_is_rebuilt_once() {
+    let disk = Disk::new();
+    let model = || {
+        Arc::new(
+            MockModel::answering_yes_to(["furious"])
+                .with_id("chat")
+                .with_embed_id("embedder"),
+        )
+    };
+    let first = disk.session(model()).await;
+    run(&first, &disk.create_tickets()).await;
+    run(&first, "CREATE SEMANTIC INDEX ON tickets(body)").await;
+    drop(first);
+    // What v0.4.1 saved: the chat model's id, no key version.
+    let store = rusqlite::Connection::open(disk.store()).unwrap();
+    let definition: String = store
+        .query_row(
+            "SELECT definition FROM catalog WHERE kind = 'semantic_index'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut legacy: serde_json::Value = serde_json::from_str(&definition).unwrap();
+    assert_eq!(legacy["embed_model"], "embedder");
+    assert_eq!(legacy["embed_key"], 1);
+    legacy["embed_model"] = "chat".into();
+    legacy.as_object_mut().unwrap().remove("embed_key");
+    store
+        .execute(
+            "UPDATE catalog SET definition = ?1 WHERE kind = 'semantic_index'",
+            [legacy.to_string()],
+        )
+        .unwrap();
+    // A legacy entry's vectors are keyed by the chat model; drop them so the
+    // rebuild shows as embedding the column.
+    store.execute("DELETE FROM embeddings", []).unwrap();
+    drop(store);
+
+    let second = model();
+    let ctx = disk.session(Arc::clone(&second) as _).await;
+    assert!(
+        second.embed_calls() > 1,
+        "rebuilt by embedding its column, not just the dimension probe"
+    );
+    assert!(runtime(&ctx).index_for("tickets", "body").is_some());
+    drop(ctx);
+
+    let third = model();
+    let ctx = disk.session(Arc::clone(&third) as _).await;
+    assert_eq!(
+        third.embed_calls(),
+        0,
+        "saved under the embedder's id: reattached"
+    );
+    assert!(runtime(&ctx).index_for("tickets", "body").is_some());
+}

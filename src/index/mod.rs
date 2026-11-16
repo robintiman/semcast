@@ -199,7 +199,8 @@ pub async fn create_semantic_index(
         let saved = SavedIndex {
             table: table.to_owned(),
             column: column.to_owned(),
-            embed_model: Some(embedder.id().0),
+            embed_model: Some(embedder.embed_id().0),
+            embed_key: Some(EMBED_KEY_VERSION),
             dim: Some(dim),
             chunk_max_tokens: Some(options.chunk.max_tokens),
             chunk_overlap_tokens: Some(options.chunk.overlap_tokens),
@@ -222,6 +223,11 @@ pub async fn create_semantic_index(
     Ok(index)
 }
 
+/// Saved with every index whose `embed_model` is the embedder's
+/// [`embed_id`](crate::model::ModelProvider::embed_id). Earlier builds saved
+/// the chat model's id there, and their vectors are rebuilt on restore.
+const EMBED_KEY_VERSION: u32 = 1;
+
 /// What the durable catalog keeps of a semantic index: enough to reopen its
 /// stored chunks without embedding anything. An entry written by a build
 /// that kept indexes in Lance has a `path` and none of the chunking fields;
@@ -232,6 +238,11 @@ struct SavedIndex {
     column: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     embed_model: Option<String>,
+    /// [`EMBED_KEY_VERSION`] for an entry whose `embed_model` names the
+    /// embedder; absent from one saved before, whose `embed_model` was the
+    /// chat model's id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    embed_key: Option<u32>,
     /// The dimension of the index's vectors.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     dim: Option<usize>,
@@ -290,13 +301,46 @@ pub async fn reattach_semantic_index(
         )
         .await;
     };
-    if &embedder.id().0 != embed_model {
+    // Builds before the embedder had an id of its own saved the chat
+    // model's (an Ollama session) or the embedder's (Voyage, a separate
+    // embedder): an unversioned id that isn't the session embedder's may
+    // name a chat model, which says nothing of what embedded its vectors.
+    // Rebuild it with the session's embedder, as a Lance-era entry is, and
+    // it is saved under that embedder's id. An unversioned entry already
+    // under the session embedder's id is reattached as it is, and stays
+    // unversioned: after a later embedder change it is rebuilt rather than
+    // refused, which costs an embed of its column but reads nothing wrong.
+    // An entry from a newer build (a higher version) falls through to the
+    // check below.
+    if saved.embed_key.is_none() && &embedder.embed_id().0 != embed_model {
+        tracing::warn!(
+            table = %saved.table,
+            column = %saved.column,
+            "semantic index saved before vectors were keyed by their embedder; rebuilding it \
+             from its column"
+        );
+        return create_semantic_index(
+            ctx,
+            &saved.table,
+            &saved.column,
+            IndexOptions {
+                embedder: None,
+                chunk: ChunkConfig {
+                    max_tokens,
+                    overlap_tokens,
+                },
+                search,
+            },
+        )
+        .await;
+    }
+    if &embedder.embed_id().0 != embed_model {
         return Err(SemcastError::Index(format!(
             "the semantic index on {}({}) was built with embedder {embed_model}, but the \
              session embeds with {}; recreate it with CREATE SEMANTIC INDEX",
             saved.table,
             saved.column,
-            embedder.id().0
+            embedder.embed_id().0
         )));
     }
     let name = crate::catalog::index_name(&saved.table, &saved.column);

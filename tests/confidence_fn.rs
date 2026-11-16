@@ -483,6 +483,14 @@ impl<M: ModelProvider> ModelProvider for Counting<M> {
     async fn embed(&self, texts: Vec<String>) -> Result<Vec<Embedding>> {
         self.inner.embed(texts).await
     }
+
+    fn embed_id(&self) -> ModelId {
+        self.inner.embed_id()
+    }
+
+    async fn embed_queries(&self, texts: Vec<String>) -> Result<Vec<Embedding>> {
+        self.inner.embed_queries(texts).await
+    }
 }
 
 /// A provider that reports no probabilities, like one without logprobs.
@@ -511,6 +519,14 @@ impl ModelProvider for Unscored {
 
     async fn embed(&self, texts: Vec<String>) -> Result<Vec<Embedding>> {
         self.0.embed(texts).await
+    }
+
+    fn embed_id(&self) -> ModelId {
+        self.0.embed_id()
+    }
+
+    async fn embed_queries(&self, texts: Vec<String>) -> Result<Vec<Embedding>> {
+        self.0.embed_queries(texts).await
     }
 }
 

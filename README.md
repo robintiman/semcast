@@ -106,7 +106,10 @@ Set `--store semcast.db` to keep state across restarts:
 * **Definitions.** Databases, schemas, external tables, views, semantic types,
   semantic indexes and semantic columns come back.
 * **Indexes** come back without re-embedding: their vectors are kept in the
-  same file. Set `--jobs-dir` to a directory that outlives the temp dir to
+  same file, keyed by the embedding model, so changing `--model` keeps them
+  and changing `--embed-model` needs a new `CREATE SEMANTIC INDEX`. An index
+  saved by v0.4.1 or earlier, which keyed them by the chat model, is rebuilt
+  once on restore. Set `--jobs-dir` to a directory that outlives the temp dir to
   keep job results too.
 * **Not kept:** in-memory tables (`CREATE TABLE ... AS`) and the views and
   indexes over them.
