@@ -226,7 +226,7 @@ async fn indexed_query_plans_the_funnel_and_prunes() {
     assert!(display.contains("best-effort"), "plan:\n{display}");
     // No recall target, so nothing measures what chunks would lose:
     // verify reads the survivors' full text.
-    assert!(!display.contains("chunks per doc"), "plan:\n{display}");
+    assert!(!display.contains("chunks"), "plan:\n{display}");
 
     let embeds_before = model.embed_calls();
     assert_eq!(matching_ids(&ctx, query).await, vec![1]);
@@ -316,9 +316,21 @@ async fn plain_means_verifies_the_full_document() {
         long_doc.len(),
     );
 
-    // The full-text verdict is stored: re-running costs zero new calls.
+    // The full-text verdict is stored: re-running costs zero new calls,
+    // and so does a label over the same question, which reads only
+    // full-text verdicts (a chunked one would not answer it).
     let calls = model.completion_calls();
     assert_eq!(matching_ids(&ctx, query).await, vec![1]);
+    let labels = semcast::sql(
+        &ctx,
+        "SELECT transcript MEANS 'offline sync' AS hit FROM meetings",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+    assert_eq!(labels.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
     assert_eq!(model.completion_calls(), calls);
 }
 

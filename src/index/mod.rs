@@ -81,7 +81,8 @@ pub struct SearchParams {
     pub fetch_k: usize,
     /// Minimum cosine similarity for a chunk to count as a hit.
     pub score_floor: f32,
-    /// Chunks per document handed to the verify stage as evidence.
+    /// Chunks per document handed to the verify stage as evidence (under
+    /// `WITH RECALL`; plain `MEANS` verifies on full text).
     pub chunks_per_doc: usize,
 }
 

@@ -142,8 +142,8 @@ WHERE held_at >= CAST('2026-01-01' AS TIMESTAMP)
 
 A question asked before is answered from the store first: every row whose
 verdict is stored skips the model, a stored match is never pruned by the index,
-and a stored full-text answer beats the excerpt-based check an index would
-otherwise run. `EXPLAIN` shows the lookup (`StoreLookupExec: ask=…`), and the progress
+and a stored full-text answer beats the excerpt-based check an index under
+`WITH RECALL` would otherwise run. `EXPLAIN` shows the lookup (`StoreLookupExec: ask=…`), and the progress
 notice says how many rows the store answered.
 
 `EXPLAIN` also prices each `MEANS` filter before it runs: on its verify line,

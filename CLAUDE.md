@@ -132,9 +132,10 @@ calibration labels are recorded into the same evidence as they land.
 
 The index scan and verify also share a planning-time `ChunkEvidence` channel: the scan fills it with each surviving
 document's top chunks, verify reads it per row, keyed by `doc_hash` so it survives
-repartitioning. Only under `WITH RECALL`, which makes the scan calibrate its
-own threshold at execution time (`src/optimizer/calibrate.rs`) by labeling a
-sample and measures what chunks lose; plain `MEANS` verifies on full text.
+repartitioning. Verify reads that evidence only under `WITH RECALL`, which
+calibrates the scan's threshold at execution time (`src/optimizer/calibrate.rs`)
+by labeling a sample and measures what chunks lose; plain `MEANS` verifies on
+full text.
 
 With no index but a scorer (`SemcastContextBuilder::with_scorer`, a second
 chat model) and `WITH RECALL`, the planner builds `ScoreScanExec → VerifyExec`

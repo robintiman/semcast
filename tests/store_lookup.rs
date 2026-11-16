@@ -106,8 +106,8 @@ async fn a_stored_non_match_costs_nothing_downstream() {
     let ctx = meetings(Arc::clone(&model), None).await;
     assert_eq!(ids(&ctx, QUERY).await, [1]);
     assert_eq!(model.completion_calls(), 2);
-    // An index that keeps everything: verify would read meeting 2's chunks
-    // and ask again under the chunked prompt, but its full-text "no" is known.
+    // An index that keeps everything: verify would ask about meeting 2
+    // again, but its full-text "no" is known.
     index_with_floor(&ctx, f32::NEG_INFINITY).await;
     assert_eq!(ids(&ctx, QUERY).await, [1]);
     assert_eq!(model.completion_calls(), 2);
