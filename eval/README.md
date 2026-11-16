@@ -94,3 +94,29 @@ with care:
 - A failed step reports nothing, though the calls it sent were spent and
   later steps find their answers stored. The summary line flags failed steps.
 - With `--scorer`, scorer calls and hits count as questions too.
+
+## CUAD recall
+
+```sh
+cargo build --release
+uv run --project eval eval/cuad_recall.py --data data/cuad --model gemma4:e4b
+```
+
+Does `WITH RECALL r WITH CONFIDENCE c` hold end to end on CUAD (509
+contracts, 5 clauses from 5.5% to 73% selectivity), and at what cost? For
+each clause, a `MEANS … WITH RECALL` over an indexed copy of the contracts
+(the funnel) runs first, on a fresh store. Then the same `MEANS` over an
+unindexed copy asks about every contract's full text (the reference the
+promise is about), reusing the funnel's full-text labels. Data from
+`scripts/` (see `data/cuad`). `--limit N` is a smoke run over N contracts.
+
+Recall is the share of the reference's matches the funnel returned. Cost is
+counted twice:
+
+- model calls, from the funnel NOTICE, against one per contract;
+- input tokens, counted by a proxy the script puts between semcast and Ollama
+  from Ollama's own `prompt_eval_count`. The full-scan baseline is estimated
+  from the run's own tokens per character, times every contract's length.
+
+The lawyers' labels are scored too, for context only: the promise is about
+the model's own full-text answers. Results go to `results/cuad_recall/`.
