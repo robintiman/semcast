@@ -9,7 +9,7 @@
 //!
 //! Run with: `cargo run --example complaints`
 //!
-//! Needs a running Ollama with both models pulled: gemma4:e4b answers `MEANS`
+//! Needs a running Ollama with both models pulled: qwen3.8:27b answers `MEANS`
 //! and constrained extraction, nomic-embed-text builds the semantic index. The
 //! full funnel runs: cheap filter → a calibrated index pre-filter under
 //! `WITH RECALL 0.9` → chunk-fed verify.
@@ -26,7 +26,8 @@ use semcast::semcast_context;
 #[tokio::main]
 async fn main() -> datafusion::error::Result<()> {
     semcast::telemetry::init();
-    let model: Arc<dyn ModelProvider> = Arc::new(OllamaProvider::new("gemma4:e4b")); // embeds with nomic-embed-text
+    let model: Arc<dyn ModelProvider> =
+        Arc::new(OllamaProvider::new(semcast::model::DEFAULT_CHAT_MODEL)); // embeds with nomic-embed-text
     let ctx = semcast_context(model);
 
     // Mount the CSV as an external table; paths resolve from the repo root.

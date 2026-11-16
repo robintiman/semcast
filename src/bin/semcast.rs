@@ -39,7 +39,7 @@ struct ServeArgs {
     #[arg(long, value_enum, default_value_t = CompletionProvider::Ollama)]
     provider: CompletionProvider,
     /// Chat model used to verify MEANS predicates. Defaults per provider:
-    /// claude-haiku-4-5 for `anthropic`, gemma4:e4b for `ollama`.
+    /// claude-haiku-4-5 for `anthropic`, qwen3.8:27b for `ollama`.
     #[arg(long)]
     model: Option<String>,
     /// Small Ollama chat model that pre-filters a MEANS no semantic index

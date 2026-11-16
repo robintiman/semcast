@@ -1,7 +1,7 @@
 //! Live end-to-end tests against a local Ollama server. Ignored by default:
 //!
 //! ```sh
-//! ollama pull gemma4:e4b        # or export SEMCAST_OLLAMA_MODEL=<model>
+//! ollama pull qwen3.8:27b       # or export SEMCAST_OLLAMA_MODEL=<model>
 //! ollama pull nomic-embed-text  # embeddings, for the index test
 //! cargo test --test live_ollama -- --ignored --nocapture
 //! ```
@@ -14,7 +14,8 @@ use semcast::{IndexOptions, create_semantic_index, semcast_context};
 #[tokio::test]
 #[ignore = "requires a running Ollama server with a pulled model"]
 async fn means_filter_against_live_ollama() {
-    let model = std::env::var("SEMCAST_OLLAMA_MODEL").unwrap_or_else(|_| "gemma4:e4b".to_owned());
+    let model = std::env::var("SEMCAST_OLLAMA_MODEL")
+        .unwrap_or_else(|_| semcast::model::DEFAULT_CHAT_MODEL.to_owned());
     let ctx = semcast_context(Arc::new(OllamaProvider::new(model)));
 
     ctx.sql(
@@ -55,9 +56,10 @@ async fn means_filter_against_live_ollama() {
 /// Real embeddings end-to-end: build a semantic index with nomic-embed-text,
 /// plan the funnel, and verify the right row survives it.
 #[tokio::test]
-#[ignore = "requires a running Ollama server with gemma4:e4b and nomic-embed-text pulled"]
+#[ignore = "requires a running Ollama server with the default chat model and nomic-embed-text pulled"]
 async fn semantic_index_funnel_against_live_ollama() {
-    let model = std::env::var("SEMCAST_OLLAMA_MODEL").unwrap_or_else(|_| "gemma4:e4b".to_owned());
+    let model = std::env::var("SEMCAST_OLLAMA_MODEL")
+        .unwrap_or_else(|_| semcast::model::DEFAULT_CHAT_MODEL.to_owned());
     let ctx = semcast_context(Arc::new(OllamaProvider::new(model)));
 
     ctx.sql(
@@ -112,9 +114,10 @@ async fn semantic_index_funnel_against_live_ollama() {
 /// `WITH RECALL` end-to-end: the scan labels a sample with the live model
 /// and calibrates its floor before pruning.
 #[tokio::test]
-#[ignore = "requires a running Ollama server with gemma4:e4b and nomic-embed-text pulled"]
+#[ignore = "requires a running Ollama server with the default chat model and nomic-embed-text pulled"]
 async fn calibrated_funnel_against_live_ollama() {
-    let model = std::env::var("SEMCAST_OLLAMA_MODEL").unwrap_or_else(|_| "gemma4:e4b".to_owned());
+    let model = std::env::var("SEMCAST_OLLAMA_MODEL")
+        .unwrap_or_else(|_| semcast::model::DEFAULT_CHAT_MODEL.to_owned());
     let ctx = semcast_context(Arc::new(OllamaProvider::new(model)));
 
     ctx.sql(
@@ -173,9 +176,10 @@ async fn calibrated_funnel_against_live_ollama() {
 /// `RELEVANCE TO` end-to-end: real embeddings pick the candidates, a real
 /// model scores them, and the best match sorts first.
 #[tokio::test]
-#[ignore = "requires a running Ollama server with gemma4:e4b and nomic-embed-text pulled"]
+#[ignore = "requires a running Ollama server with the default chat model and nomic-embed-text pulled"]
 async fn rank_against_live_ollama() {
-    let model = std::env::var("SEMCAST_OLLAMA_MODEL").unwrap_or_else(|_| "gemma4:e4b".to_owned());
+    let model = std::env::var("SEMCAST_OLLAMA_MODEL")
+        .unwrap_or_else(|_| semcast::model::DEFAULT_CHAT_MODEL.to_owned());
     let ctx = semcast_context(Arc::new(OllamaProvider::new(model)));
 
     ctx.sql(
@@ -245,9 +249,10 @@ async fn rank_against_live_ollama() {
 /// Classify end-to-end: a three-branch `CASE` costs one real model call per
 /// row, and each row lands in the branch it belongs to.
 #[tokio::test]
-#[ignore = "requires a running Ollama server with gemma4:e4b and nomic-embed-text pulled"]
+#[ignore = "requires a running Ollama server with the default chat model and nomic-embed-text pulled"]
 async fn classify_against_live_ollama() {
-    let model = std::env::var("SEMCAST_OLLAMA_MODEL").unwrap_or_else(|_| "gemma4:e4b".to_owned());
+    let model = std::env::var("SEMCAST_OLLAMA_MODEL")
+        .unwrap_or_else(|_| semcast::model::DEFAULT_CHAT_MODEL.to_owned());
     let ctx = semcast_context(Arc::new(OllamaProvider::new(model)));
 
     ctx.sql(
@@ -308,9 +313,10 @@ async fn classify_against_live_ollama() {
 /// Clustering end-to-end: real embeddings group two obvious themes apart, and
 /// a real model names each group.
 #[tokio::test]
-#[ignore = "requires a running Ollama server with gemma4:e4b and nomic-embed-text pulled"]
+#[ignore = "requires a running Ollama server with the default chat model and nomic-embed-text pulled"]
 async fn cluster_against_live_ollama() {
-    let model = std::env::var("SEMCAST_OLLAMA_MODEL").unwrap_or_else(|_| "gemma4:e4b".to_owned());
+    let model = std::env::var("SEMCAST_OLLAMA_MODEL")
+        .unwrap_or_else(|_| semcast::model::DEFAULT_CHAT_MODEL.to_owned());
     let ctx = semcast_context(Arc::new(OllamaProvider::new(model)));
 
     ctx.sql(
@@ -387,9 +393,10 @@ async fn cluster_against_live_ollama() {
 /// Dedupe end-to-end: real embeddings collapse three phrasings of one
 /// complaint, and spend no model calls doing it.
 #[tokio::test]
-#[ignore = "requires a running Ollama server with gemma4:e4b and nomic-embed-text pulled"]
+#[ignore = "requires a running Ollama server with the default chat model and nomic-embed-text pulled"]
 async fn semantic_distinct_against_live_ollama() {
-    let model = std::env::var("SEMCAST_OLLAMA_MODEL").unwrap_or_else(|_| "gemma4:e4b".to_owned());
+    let model = std::env::var("SEMCAST_OLLAMA_MODEL")
+        .unwrap_or_else(|_| semcast::model::DEFAULT_CHAT_MODEL.to_owned());
     let ctx = semcast_context(Arc::new(OllamaProvider::new(model)));
 
     ctx.sql(
@@ -465,7 +472,8 @@ async fn semantic_distinct_against_live_ollama() {
 async fn confidence_against_live_ollama() {
     use datafusion::arrow::array::{Array, Float64Array};
 
-    let model = std::env::var("SEMCAST_OLLAMA_MODEL").unwrap_or_else(|_| "gemma4:e4b".to_owned());
+    let model = std::env::var("SEMCAST_OLLAMA_MODEL")
+        .unwrap_or_else(|_| semcast::model::DEFAULT_CHAT_MODEL.to_owned());
     let ctx = semcast_context(Arc::new(OllamaProvider::new(model)));
     ctx.sql(
         "CREATE TABLE tickets AS SELECT * FROM (VALUES
@@ -505,11 +513,11 @@ async fn confidence_against_live_ollama() {
 
 /// The scorer role against real logprobs: a second Ollama model scores every
 /// row, the session model labels a sample and verifies the rows above the
-/// calibrated floor. Defaults to gemma4:e4b for both; to see a cheap scorer
-/// spare a bigger model:
+/// calibrated floor. Defaults to the default chat model for both; to see a
+/// cheap scorer spare the bigger default:
 ///
 /// ```sh
-/// SEMCAST_OLLAMA_MODEL=gemma4:31b SEMCAST_OLLAMA_SCORER=gemma4:e4b \
+/// SEMCAST_OLLAMA_SCORER=gemma4:e4b \
 ///   cargo test --test live_ollama scorer -- --ignored --nocapture
 /// ```
 #[tokio::test]
@@ -517,7 +525,8 @@ async fn confidence_against_live_ollama() {
 async fn scorer_against_live_ollama() {
     use datafusion::arrow::array::Int64Array;
 
-    let model = std::env::var("SEMCAST_OLLAMA_MODEL").unwrap_or_else(|_| "gemma4:e4b".to_owned());
+    let model = std::env::var("SEMCAST_OLLAMA_MODEL")
+        .unwrap_or_else(|_| semcast::model::DEFAULT_CHAT_MODEL.to_owned());
     let scorer = std::env::var("SEMCAST_OLLAMA_SCORER").unwrap_or_else(|_| model.clone());
     let ctx = semcast::SemcastContextBuilder::new(Arc::new(OllamaProvider::new(model)))
         .with_scorer(Arc::new(OllamaProvider::new(scorer)))
@@ -571,7 +580,8 @@ async fn scorer_against_live_ollama() {
 #[ignore = "requires a running Ollama server with a pulled model"]
 async fn long_document_is_refused_or_read_whole() {
     use semcast::model::{CompletionRequest, ModelProvider, OllamaProvider};
-    let model = std::env::var("SEMCAST_OLLAMA_MODEL").unwrap_or_else(|_| "gemma4:e4b".to_owned());
+    let model = std::env::var("SEMCAST_OLLAMA_MODEL")
+        .unwrap_or_else(|_| semcast::model::DEFAULT_CHAT_MODEL.to_owned());
     // The answer is on the first page; ~20k tokens of filler follow it.
     let input = format!(
         "The secret word is PELICAN.\n{}",

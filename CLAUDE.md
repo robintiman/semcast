@@ -31,7 +31,7 @@ uv run --project eval eval/sembench.py      # SemBench against a local server; s
 
 Building needs no system tools beyond Rust (CI still installs `protoc`, which
 Lance needed, until `release.yml` is regenerated with `dist`). Live tests read `SEMCAST_OLLAMA_MODEL` (default
-`gemma4:e4b`), `ANTHROPIC_API_KEY`, `VOYAGE_API_KEY`.
+`qwen3.8:27b`), `ANTHROPIC_API_KEY`, `VOYAGE_API_KEY`.
 
 Releases go through `./scripts/release.sh <version>` (try `--dry-run` first) — it
 owns both the `Cargo.toml` bump and the tag so the two cannot disagree. Never bump
