@@ -20,7 +20,8 @@
 //! failed document the pair would prune is a lost match, one it keeps is a
 //! kept non-match. The pair is picked with the sample that scores it, so a
 //! certified search corrects over the index floors it tries, which come from
-//! the population's scores (fixed before any label); along the scorer floor
+//! every indexed input row's score, decided or not (fixed before any label or
+//! sample draw); along the scorer floor
 //! recall is monotone at each index floor, so no correction is needed there.
 //! A sample with no known match prunes nothing, and no scorer floor sits
 //! above the best known match's score, as for a single floor. Like the single floor's
@@ -171,8 +172,8 @@ pub fn choose(
                 .collect(),
         )
     };
-    // Index floors come from the population's own scores, which no label
-    // touched, so they are fixed before the sample is: one test per index
+    // Index floors come from every indexed input row's score, which no label
+    // or sample draw touched, so they are fixed before the sample is: one test per index
     // floor. Along the scorer floor, at a fixed index floor, recall only
     // falls as the floor rises, so floors drawn from the sample cost no
     // correction there (as for a single floor). Hence Bonferroni over the
