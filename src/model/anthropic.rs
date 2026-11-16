@@ -244,6 +244,7 @@ mod tests {
             max_tokens: 8,
             schema: None,
             logprobs: false,
+            ask: None,
         };
         let body = request_body("claude-haiku-4-5", &request);
         assert_eq!(body["model"], "claude-haiku-4-5");
@@ -260,6 +261,7 @@ mod tests {
             max_tokens: 2048,
             schema: Some(schema.clone()),
             logprobs: false,
+            ask: None,
         };
         let body = request_body("claude-haiku-4-5", &request);
         assert_eq!(body["output_config"]["format"]["type"], "json_schema");

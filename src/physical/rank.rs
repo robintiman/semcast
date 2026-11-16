@@ -409,6 +409,7 @@ impl Ranker {
                     max_tokens: 32,
                     schema: Some(score_schema()),
                     logprobs: false,
+                    ask: None,
                 });
                 pending.push((hash, input));
             }

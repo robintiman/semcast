@@ -38,6 +38,7 @@ pub struct SemcastQueryPlanner {
     model: Arc<dyn ModelProvider>,
     cache: Arc<dyn SemanticCache>,
     scorer: Option<(Arc<dyn ModelProvider>, Arc<ScorerHealth>)>,
+    decider: Option<Arc<dyn ModelProvider>>,
 }
 
 impl SemcastQueryPlanner {
@@ -46,7 +47,17 @@ impl SemcastQueryPlanner {
             model,
             cache,
             scorer: None,
+            decider: None,
         }
+    }
+
+    /// A model that answers every `MEANS` question (verify, calibration
+    /// labels, `CASE` and `CONFIDENCE()`) instead of the session model, which
+    /// keeps everything generative. A decision model fits: it answers yes/no
+    /// and cannot write.
+    pub fn with_decider(mut self, decider: Option<Arc<dyn ModelProvider>>) -> Self {
+        self.decider = decider;
+        self
     }
 
     /// A cheap model whose P("yes") pre-filters an unindexed `MEANS` under
@@ -69,6 +80,7 @@ impl QueryPlanner for SemcastQueryPlanner {
                 model: Arc::clone(&self.model),
                 cache: Arc::clone(&self.cache),
                 scorer: self.scorer.clone(),
+                decider: self.decider.clone(),
             },
         )]);
         let plan = planner
@@ -90,6 +102,14 @@ struct SemcastExtensionPlanner {
     model: Arc<dyn ModelProvider>,
     cache: Arc<dyn SemanticCache>,
     scorer: Option<(Arc<dyn ModelProvider>, Arc<ScorerHealth>)>,
+    decider: Option<Arc<dyn ModelProvider>>,
+}
+
+impl SemcastExtensionPlanner {
+    /// Who answers a `MEANS` question: the decider if the session has one.
+    fn means_model(&self) -> &Arc<dyn ModelProvider> {
+        self.decider.as_ref().unwrap_or(&self.model)
+    }
 }
 
 #[async_trait]
@@ -116,7 +136,7 @@ impl ExtensionPlanner for SemcastExtensionPlanner {
                 Arc::clone(&physical_inputs[0]),
                 Arc::clone(&text),
                 filter.condition.clone(),
-                self.model.id(),
+                self.means_model().id(),
                 Arc::clone(&self.cache),
                 Arc::clone(&store),
             ));
@@ -132,7 +152,7 @@ impl ExtensionPlanner for SemcastExtensionPlanner {
                     target_recall,
                     confidence: filter.confidence,
                     sample_size: DEFAULT_CALIBRATION_SAMPLE,
-                    model: Arc::clone(&self.model),
+                    model: Arc::clone(self.means_model()),
                     cache: Arc::clone(&self.cache),
                 });
                 let evidence = Arc::new(ChunkEvidence::default());
@@ -153,7 +173,7 @@ impl ExtensionPlanner for SemcastExtensionPlanner {
                         scan,
                         text,
                         filter.condition.clone(),
-                        Arc::clone(&self.model),
+                        Arc::clone(self.means_model()),
                         Arc::clone(&self.cache),
                         evidence,
                         params.chunks_per_doc,
@@ -166,12 +186,12 @@ impl ExtensionPlanner for SemcastExtensionPlanner {
             // a target there is nothing to calibrate against, and the scorer
             // stays out of the way.
             let mut input = looked_up;
-            // A scorer that is the session model would save nothing, and
-            // under one id its answers are the session model's verdicts.
+            // A scorer that is the verify model would save nothing, and
+            // under one id its answers are that model's verdicts.
             let scorer = self
                 .scorer
                 .as_ref()
-                .filter(|(scorer, _)| scorer.id() != self.model.id());
+                .filter(|(scorer, _)| scorer.id() != self.means_model().id());
             if let (Some((scorer, health)), Some(target_recall)) = (scorer, filter.recall) {
                 input = Arc::new(
                     ScoreScanExec::new(
@@ -184,7 +204,7 @@ impl ExtensionPlanner for SemcastExtensionPlanner {
                             target_recall,
                             confidence: filter.confidence,
                             sample_size: DEFAULT_CALIBRATION_SAMPLE,
-                            model: Arc::clone(&self.model),
+                            model: Arc::clone(self.means_model()),
                             cache: Arc::clone(&self.cache),
                         },
                     )
@@ -196,7 +216,7 @@ impl ExtensionPlanner for SemcastExtensionPlanner {
                     input,
                     text,
                     filter.condition.clone(),
-                    Arc::clone(&self.model),
+                    Arc::clone(self.means_model()),
                     Arc::clone(&self.cache),
                 )
                 .with_store_evidence(store),
@@ -266,16 +286,21 @@ impl ExtensionPlanner for SemcastExtensionPlanner {
                 .as_ref()
                 .map(|guard| planner.create_physical_expr(guard, schema, session_state))
                 .transpose()?;
-            return Ok(Some(Arc::new(SemClassifyExec::new(
+            let mut exec = SemClassifyExec::new(
                 Arc::clone(&physical_inputs[0]),
                 text,
                 classify.conditions.clone(),
                 guard,
                 classify.output,
                 classify.column_names(),
-                Arc::clone(&self.model),
+                Arc::clone(self.means_model()),
                 Arc::clone(&self.cache),
-            )?)));
+            )?;
+            // A decider answers one yes/no question, not a fused JSON object.
+            if self.decider.is_some() {
+                exec = exec.one_question_per_call();
+            }
+            return Ok(Some(Arc::new(exec)));
         }
         if let Some(rank) = node.as_any().downcast_ref::<SemRankNode>() {
             let text = planner.create_physical_expr(

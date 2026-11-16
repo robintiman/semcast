@@ -3,12 +3,13 @@
 //!
 //! The scorer is a second, smaller chat model asked the verify question with
 //! logprobs, so its score is the probability it would say yes. It reads
-//! every row; the session model then verifies only those scoring at or above
+//! every row; the verify model (the decider if the session has one, else the
+//! session model) then verifies only those scoring at or above
 //! a floor. The floor is not a guess: it is calibrated per query on a random
-//! sample labeled by the session model, exactly like the index scan's
+//! sample labeled by the verify model, exactly like the index scan's
 //! (`WITH RECALL`, certified under `WITH CONFIDENCE`). Without a recall
 //! target the planner never builds this stage — a `MEANS` keeps meaning
-//! what the session model says, row for row.
+//! what the verify model says, row for row.
 //!
 //! A row the scorer gives no probability passes through to verify: missing
 //! evidence costs a call, never a row. Scores are cached under the scorer's
@@ -41,14 +42,14 @@ use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 
 use crate::index::doc_hash;
-use crate::model::{CompletionRequest, ModelProvider};
+use crate::model::ModelProvider;
 use crate::optimizer::calibrate::{Calibration, SampledScores, calibrate_threshold};
 use crate::physical::index_scan::CalibrationConfig;
 use crate::physical::sample::{Label, Labeler, draw_sample};
 use crate::physical::store_lookup::StoreEvidence;
 use crate::physical::verify::{
-    MEANS_PROMPT_VERSION, cache_verdict, cached_score, means_cache_key, merged_calls,
-    parse_verdict, synthesize_means_prompt,
+    MEANS_PROMPT_VERSION, cache_verdict, cached_score, means_cache_key, means_request,
+    merged_calls, parse_verdict,
 };
 
 /// The floor when the sample holds no known match to set one by: none. The
@@ -91,7 +92,7 @@ impl ScorerHealth {
 }
 
 /// Prunes rows whose scorer P("yes") falls below a floor calibrated to the
-/// recall target, ahead of the session model's verify.
+/// recall target, ahead of the verify model.
 #[derive(Debug)]
 pub struct ScoreScanExec {
     input: Arc<dyn ExecutionPlan>,
@@ -376,7 +377,6 @@ impl Scanner {
     /// where it has one. A document with no usable probability is absent.
     async fn score(&self, texts: &[&StringArray], sampled: &HashSet<u64>) -> HashMap<u64, f32> {
         let scorer_id = self.scorer.id();
-        let prompt = synthesize_means_prompt(&self.condition);
         let mut scores = HashMap::new();
         let mut asked: HashSet<u64> = HashSet::new();
         let mut pending = Vec::new();
@@ -404,13 +404,7 @@ impl Scanner {
                         }
                     }
                     None => {
-                        requests.push(CompletionRequest {
-                            system: prompt.clone(),
-                            input: text.to_owned(),
-                            max_tokens: 8,
-                            schema: None,
-                            logprobs: true,
-                        });
+                        requests.push(means_request(&self.condition, text.to_owned(), false));
                         pending.push((hash, key));
                     }
                 }
@@ -471,7 +465,7 @@ impl Scanner {
         scores
     }
 
-    /// The floor: label a random sample with the session model and set it
+    /// The floor: label a random sample with the verify model and set it
     /// at the recall target, one tranche at a time when certifying.
     /// Returns the calibration and the labels it was drawn from.
     fn label_budget(&self) -> usize {

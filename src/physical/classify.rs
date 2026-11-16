@@ -4,8 +4,12 @@
 //! the same text become a single model call, which is why a three-branch
 //! `CASE` costs what a one-branch `CASE` costs. The fusion is an optimization
 //! only: each boolean answers exactly the question `VerifyExec` would ask, and
-//! a row that needs just one answer is sent the verify prompt byte-for-byte,
-//! so it shares that stage's cache entries outright.
+//! a row that needs just one answer is sent the verify request itself, so it
+//! shares that stage's cache entries outright.
+//!
+//! Under a decider (a decision model, which cannot write the fused JSON
+//! answer) nothing is fused: every condition is its own verify request, one
+//! call per row per condition (`one_question_per_call`).
 //!
 //! `CONFIDENCE(text MEANS 'condition')` runs here too, as a one-condition
 //! node whose column is the model's P("yes") rather than the verdict. It asks
@@ -46,7 +50,7 @@ use crate::model::{CompletionRequest, ModelId, ModelProvider};
 use crate::physical::extract::parse_json_object;
 use crate::physical::verify::{
     MEANS_PROMPT_VERSION, cache_unscored, cache_verdict, cached_score, means_cache_key,
-    parse_verdict, synthesize_means_prompt,
+    means_request, parse_verdict,
 };
 
 /// Version of the *fused* prompt — the one that asks about several conditions
@@ -115,6 +119,10 @@ pub struct SemClassifyExec {
     output: ClassifyOutput,
     model: Arc<dyn ModelProvider>,
     cache: Arc<dyn SemanticCache>,
+    /// Ask about several conditions in one fused call. Off for a model that
+    /// only answers one yes/no question at a time; see
+    /// [`one_question_per_call`](Self::one_question_per_call).
+    fuse: bool,
     output_schema: SchemaRef,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
@@ -156,10 +164,20 @@ impl SemClassifyExec {
             output,
             model,
             cache,
+            fuse: true,
             output_schema,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         })
+    }
+
+    /// Send every condition as its own verify-shaped question instead of
+    /// fusing a row's conditions into one JSON answer — for a decision model,
+    /// which cannot write one. Each verdict then shares its cache entry with
+    /// a `WHERE ... MEANS` over the same text.
+    pub fn one_question_per_call(mut self) -> Self {
+        self.fuse = false;
+        self
     }
 
     fn column_names(&self) -> Vec<String> {
@@ -187,15 +205,19 @@ impl DisplayAs for SemClassifyExec {
                 self.model.id()
             )?,
         }
+        if !self.fuse && self.conditions.len() > 1 {
+            write!(f, " unfused")?;
+        }
         if self.guard.is_some() {
             write!(f, " gated")?;
         }
-        // Know the bill before you run: the fusion is why this is one call per
-        // row rather than one per condition.
+        // Know the bill before you run: fused, one call per row; unfused,
+        // one per row per condition.
+        let per_row = if self.fuse { 1 } else { self.conditions.len() };
         match self
             .input
             .partition_statistics(None)
-            .map(|stats| stats.num_rows)
+            .map(|stats| stats.num_rows.map(|rows| rows * per_row))
         {
             Ok(Precision::Exact(rows)) => write!(f, "   ≤{rows} model calls"),
             Ok(Precision::Inexact(rows)) => write!(f, "   ~{rows} model calls"),
@@ -221,7 +243,7 @@ impl ExecutionPlan for SemClassifyExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(Self::new(
+        let mut exec = Self::new(
             Arc::clone(&children[0]),
             Arc::clone(&self.text),
             self.conditions.clone(),
@@ -230,7 +252,9 @@ impl ExecutionPlan for SemClassifyExec {
             self.column_names(),
             Arc::clone(&self.model),
             Arc::clone(&self.cache),
-        )?))
+        )?;
+        exec.fuse = self.fuse;
+        Ok(Arc::new(exec))
     }
 
     fn execute(
@@ -246,6 +270,7 @@ impl ExecutionPlan for SemClassifyExec {
             model_id: self.model.id(),
             model: Arc::clone(&self.model),
             cache: Arc::clone(&self.cache),
+            fuse: self.fuse,
             output_schema: Arc::clone(&self.output_schema),
             model_calls: MetricBuilder::new(&self.metrics).counter("model_calls", partition),
             model_calls_merged: MetricBuilder::new(&self.metrics)
@@ -298,6 +323,7 @@ struct Classifier {
     model_id: ModelId,
     model: Arc<dyn ModelProvider>,
     cache: Arc<dyn SemanticCache>,
+    fuse: bool,
     output_schema: SchemaRef,
     model_calls: Count,
     /// Of `model_calls`, those the scheduler answered from an identical
@@ -448,9 +474,11 @@ impl Classifier {
             }
             let text = texts.value(row);
 
+            // Unfused, every condition is asked alone, under the verify key.
+            let asked = if self.fuse { self.conditions.len() } else { 1 };
             let mut pending = Vec::new();
             for (branch, condition) in self.conditions.iter().enumerate() {
-                match self.cached(condition, text, self.conditions.len()) {
+                match self.cached(condition, text, asked) {
                     Some(verdict) => {
                         self.cache_hits.add(1);
                         verdicts[branch][row] = Some(verdict);
@@ -461,12 +489,20 @@ impl Classifier {
             if pending.is_empty() {
                 continue;
             }
-            requests.push(self.request(text, &pending));
-            pending_rows.push(PendingRow {
-                row,
-                text: text.to_owned(),
-                pending,
-            });
+            // One call for the row's pending conditions, or one call each.
+            let calls: Vec<Vec<usize>> = if self.fuse {
+                vec![pending]
+            } else {
+                pending.into_iter().map(|branch| vec![branch]).collect()
+            };
+            for pending in calls {
+                requests.push(self.request(text, &pending));
+                pending_rows.push(PendingRow {
+                    row,
+                    text: text.to_owned(),
+                    pending,
+                });
+            }
         }
         // Counted as sent, so progress shows calls while they run; merges
         // are known only once they answer.
@@ -475,12 +511,25 @@ impl Classifier {
         self.model_calls_merged
             .add(crate::physical::verify::merged_calls(&completions));
         debug_assert_eq!(completions.len(), pending_rows.len());
+        // A row with no answer at all is a failed row; one that got some of
+        // its answers has failed branches. Unfused, a row's conditions come
+        // back in several calls, so tally per row before counting.
+        let mut tally: Vec<(usize, usize)> = vec![(0, 0); rows];
         for (pending_row, completion) in pending_rows.iter().zip(&completions) {
-            let Ok(completion) = completion.as_ref() else {
-                self.rows_failed.add(1);
-                continue;
+            let asked = pending_row.pending.len();
+            let failed = match completion.as_ref() {
+                Ok(completion) => self.apply(pending_row, completion, &mut verdicts),
+                Err(_) => asked,
             };
-            self.apply(pending_row, completion, &mut verdicts);
+            tally[pending_row.row].0 += asked;
+            tally[pending_row.row].1 += failed;
+        }
+        for (asked, failed) in tally {
+            if failed > 0 && failed == asked {
+                self.rows_failed.add(1);
+            } else {
+                self.branches_failed.add(failed);
+            }
         }
 
         let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
@@ -505,13 +554,7 @@ impl Classifier {
     /// text. Two or more take the fused prompt and a JSON schema.
     fn request(&self, text: &str, pending: &[usize]) -> CompletionRequest {
         if let [branch] = pending {
-            return CompletionRequest {
-                system: synthesize_means_prompt(&self.conditions[*branch]),
-                input: text.to_owned(),
-                max_tokens: 8,
-                schema: None,
-                logprobs: true,
-            };
+            return means_request(&self.conditions[*branch], text.to_owned(), false);
         }
         let conditions: Vec<&str> = pending
             .iter()
@@ -523,18 +566,19 @@ impl Classifier {
             max_tokens: CLASSIFY_MAX_TOKENS,
             schema: Some(classify_schema(conditions.len())),
             logprobs: false,
+            ask: None,
         }
     }
 
     /// Decode one row's answer and cache each verdict it yielded. Conditions
     /// are cached individually, so editing one branch of a `CASE` leaves the
-    /// others warm.
+    /// others warm. Returns how many of the conditions got no answer.
     fn apply(
         &self,
         pending_row: &PendingRow,
         completion: &crate::model::Completion,
         verdicts: &mut [Vec<Option<bool>>],
-    ) {
+    ) -> usize {
         let answer = completion.text.as_str();
         let decoded: Vec<Option<bool>> = if pending_row.pending.len() == 1 {
             vec![parse_verdict(answer)]
@@ -546,13 +590,10 @@ impl Classifier {
                 None => vec![None; pending_row.pending.len()],
             }
         };
-        if decoded.iter().all(Option::is_none) {
-            self.rows_failed.add(1);
-            return;
-        }
+        let mut failed = 0;
         for (&branch, verdict) in pending_row.pending.iter().zip(decoded) {
             let Some(verdict) = verdict else {
-                self.branches_failed.add(1);
+                failed += 1;
                 continue;
             };
             verdicts[branch][pending_row.row] = Some(verdict);
@@ -575,16 +616,17 @@ impl Classifier {
                 yes_probability,
             );
         }
+        failed
     }
 
     fn cached(&self, condition: &str, text: &str, asked: usize) -> Option<bool> {
         // Try the entry this request would write first, then the verify
         // stage's: a one-condition classify and a WHERE ... MEANS produce the
         // same key, so either can satisfy the other.
-        for key in [
-            self.cache_key(condition, text, asked),
-            means_cache_key(condition, text, &self.model_id, MEANS_PROMPT_VERSION),
-        ] {
+        // Asked alone, the two are one key.
+        let own = (asked > 1).then(|| self.cache_key(condition, text, asked));
+        let verify = means_cache_key(condition, text, &self.model_id, MEANS_PROMPT_VERSION);
+        for key in own.into_iter().chain([verify]) {
             if let Some(CachedValue::Value(verdict)) = self.cache.get(&key) {
                 return Some(verdict == "yes");
             }

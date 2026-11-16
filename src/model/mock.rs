@@ -294,6 +294,7 @@ mod tests {
             max_tokens: 64,
             schema,
             logprobs: false,
+            ask: None,
         }
     }
 

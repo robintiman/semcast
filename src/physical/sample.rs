@@ -9,10 +9,10 @@ use std::collections::HashMap;
 
 use crate::cache::{CachedValue, SemanticCache};
 use crate::index::doc_hash;
-use crate::model::{CompletionRequest, ModelProvider};
+use crate::model::ModelProvider;
 use crate::physical::verify::{
-    MEANS_PROMPT_VERSION, cache_verdict, means_cache_key, merged_calls, parse_verdict,
-    synthesize_means_prompt,
+    MEANS_PROMPT_VERSION, cache_verdict, means_cache_key, means_request, merged_calls,
+    parse_verdict,
 };
 
 /// A sampled document and its label: `Some(matched)`, or `None` when the
@@ -66,7 +66,8 @@ pub(crate) fn draw_sample(texts: &[&StringArray], sample_size: usize) -> Vec<Str
         .collect()
 }
 
-/// Ground-truth labels: the session model reads each document's full text —
+/// Ground-truth labels: the verify model (the decider if the session has
+/// one, else the session model) reads each document's full text —
 /// the definition of `MEANS`.
 pub(crate) struct Labeler<'a> {
     /// The funnel's store evidence, told every label as it lands, so later
@@ -92,7 +93,6 @@ impl Labeler<'_> {
     /// document was never drawn. Failures are not cached, so the next
     /// calibration retries them.
     pub(crate) async fn label(&self, sample: &[String]) -> Vec<Label> {
-        let prompt = synthesize_means_prompt(self.condition);
         let model_id = self.model.id();
         let mut labels = Vec::new();
         let mut misses = Vec::new();
@@ -109,13 +109,7 @@ impl Labeler<'_> {
                 }
                 _ => {
                     misses.push(text);
-                    requests.push(CompletionRequest {
-                        system: prompt.clone(),
-                        input: text.clone(),
-                        max_tokens: 8,
-                        schema: None,
-                        logprobs: true,
-                    });
+                    requests.push(means_request(self.condition, text.clone(), false));
                 }
             }
         }

@@ -291,6 +291,8 @@ pub struct SemcastContextBuilder {
     fallbacks: Vec<Arc<dyn ModelProvider>>,
     embedder: Option<Arc<dyn ModelProvider>>,
     scorer: Option<Arc<dyn ModelProvider>>,
+    decider: Option<Arc<dyn ModelProvider>>,
+    decider_max_in_flight: usize,
     cache: Arc<dyn SemanticCache>,
     index_root: Option<std::path::PathBuf>,
     information_schema: bool,
@@ -306,6 +308,8 @@ impl SemcastContextBuilder {
             fallbacks: Vec::new(),
             embedder: None,
             scorer: None,
+            decider: None,
+            decider_max_in_flight: crate::model::DEFAULT_DECIDER_MAX_IN_FLIGHT,
             cache: Arc::new(InMemoryCache::default()),
             index_root: None,
             information_schema: false,
@@ -346,6 +350,31 @@ impl SemcastContextBuilder {
     /// own cap on requests in flight.
     pub fn with_scorer(mut self, scorer: Arc<dyn ModelProvider>) -> Self {
         self.scorer = Some(scorer);
+        self
+    }
+
+    /// A model that answers every `MEANS` question in place of the session
+    /// model: verify, `WITH RECALL` calibration labels, `CASE ... MEANS` and
+    /// `CONFIDENCE()`. The session model keeps everything generative (`CAST`,
+    /// cluster labels, reranking). Meant for a decision model
+    /// ([`SystemOneProvider`]), which answers yes/no with a probability and
+    /// cannot write; under one, a `CASE` asks each condition on its own
+    /// instead of fusing them. It gets its own cap on requests in flight
+    /// ([`with_decider_max_in_flight`]).
+    ///
+    /// [`SystemOneProvider`]: crate::model::SystemOneProvider
+    /// [`with_decider_max_in_flight`]: Self::with_decider_max_in_flight
+    pub fn with_decider(mut self, decider: Arc<dyn ModelProvider>) -> Self {
+        self.decider = Some(decider);
+        self
+    }
+
+    /// Cap the requests in flight to the decider (default
+    /// [`DEFAULT_DECIDER_MAX_IN_FLIGHT`]): what its server has slots for.
+    ///
+    /// [`DEFAULT_DECIDER_MAX_IN_FLIGHT`]: crate::model::DEFAULT_DECIDER_MAX_IN_FLIGHT
+    pub fn with_decider_max_in_flight(mut self, requests: usize) -> Self {
+        self.decider_max_in_flight = requests;
         self
     }
 
@@ -420,6 +449,12 @@ impl SemcastContextBuilder {
         let scorer: Option<Arc<dyn ModelProvider>> = self
             .scorer
             .map(|scorer| Arc::new(crate::model::Scheduler::new(scorer, self.max_in_flight)) as _);
+        let decider: Option<Arc<dyn ModelProvider>> = self.decider.map(|decider| {
+            Arc::new(crate::model::Scheduler::new(
+                decider,
+                self.decider_max_in_flight,
+            )) as _
+        });
         if let Some(root) = self.index_root {
             runtime = runtime.with_index_root(root);
         }
@@ -453,7 +488,9 @@ impl SemcastContextBuilder {
             .with_optimizer_rule(Arc::new(ClusterRewriteRule))
             .with_optimizer_rule(Arc::new(DistinctRewriteRule))
             .with_query_planner(Arc::new(
-                SemcastQueryPlanner::new(model, self.cache).with_scorer(scorer),
+                SemcastQueryPlanner::new(model, self.cache)
+                    .with_scorer(scorer)
+                    .with_decider(decider),
             ))
             .build();
         let ctx = SessionContext::new_with_state(state);

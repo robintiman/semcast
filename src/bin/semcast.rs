@@ -6,7 +6,9 @@ use std::sync::Arc;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use semcast::SemcastContextBuilder;
-use semcast::model::{AnthropicProvider, ModelProvider, OllamaProvider, VoyageProvider};
+use semcast::model::{
+    AnthropicProvider, ModelProvider, OllamaProvider, SystemOneProvider, VoyageProvider,
+};
 use semcast::server::{JobRegistry, QueryEngine, jobs, serve};
 
 #[derive(Parser)]
@@ -48,6 +50,23 @@ struct ServeArgs {
     /// target. Off if unset.
     #[arg(long)]
     scorer_model: Option<String>,
+    /// A decision model that answers every MEANS question (verify, CASE,
+    /// CONFIDENCE) in place of the main model, which keeps CAST and the
+    /// rest: the address of a server with a System One endpoint, such as
+    /// llama.cpp's `llama-server` serving Span-02. Off if unset.
+    #[arg(long)]
+    decider_url: Option<String>,
+    /// The decision model to ask at --decider-url. Needed when the server
+    /// serves several (Ollama); llama-server serves one.
+    #[arg(long, requires = "decider_url")]
+    decider_model: Option<String>,
+    /// Most requests in flight to the decider: what its server has slots for.
+    #[arg(
+        long,
+        requires = "decider_url",
+        default_value_t = semcast::model::DEFAULT_DECIDER_MAX_IN_FLIGHT
+    )]
+    decider_max_in_flight: usize,
     /// Ollama embedding model used by semantic indexes
     /// (with `--embed-provider ollama`).
     #[arg(long, default_value = semcast::model::DEFAULT_EMBED_MODEL)]
@@ -154,6 +173,17 @@ async fn main() -> std::io::Result<()> {
         builder = builder.with_scorer(Arc::new(
             OllamaProvider::new(scorer).with_base_url(&args.ollama_url),
         ));
+    }
+    if let Some(url) = &args.decider_url {
+        // Asks the server which model it serves, so an unreachable decider
+        // fails here too, and its verdicts are cached under that model.
+        let decider = SystemOneProvider::connect(url, args.decider_model.as_deref())
+            .await
+            .map_err(|e| std::io::Error::other(format!("decider at {url}: {e}")))?;
+        tracing::info!("semcast: MEANS is answered by {}", decider.id());
+        builder = builder
+            .with_decider(Arc::new(decider))
+            .with_decider_max_in_flight(args.decider_max_in_flight);
     }
     if let Some(dir) = &args.index_dir {
         builder = builder.with_index_root(dir);

@@ -276,6 +276,7 @@ impl Extractor {
                         .map_err(DataFusionError::from)?,
                 ),
                 logprobs: false,
+                ask: None,
             });
             pending.push(PendingRow {
                 row,

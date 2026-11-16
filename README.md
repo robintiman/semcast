@@ -44,6 +44,9 @@ Pick a provider:
   to index. Select with `--provider anthropic`.
 * **Voyage** — `export VOYAGE_API_KEY=...`; hosted embeddings for the semantic
   index. Select with `--embed-provider voyage`.
+* **A decider** (optional) — a decision model such as
+  [Span-02](https://huggingface.co/respanai/span-02) answers every `MEANS`
+  in place of the main model. See [Decider](#decider).
 
 ### Installation
 
@@ -86,6 +89,9 @@ Flags of `semcast serve`:
 | `--provider` | `ollama` | completions: `ollama` or `anthropic` |
 | `--model` | per provider | `gemma4:e4b` (Ollama), `claude-haiku-4-5` (Anthropic) |
 | `--scorer-model` | off | small Ollama model that pre-filters an unindexed `MEANS` under [`WITH RECALL`](#with-recall) |
+| `--decider-url` | off | server whose decision model answers every `MEANS`; see [Decider](#decider) |
+| `--decider-model` | the server's one model | which decision model to ask; needed when the server has several (Ollama) |
+| `--decider-max-in-flight` | `4` | requests in flight to the decider; match its server's slots |
 | `--embed-provider` | `ollama` | embeddings: `ollama` or `voyage` |
 | `--embed-model` | `nomic-embed-text` | Ollama embedding model |
 | `--voyage-model` | `voyage-4-large` | Voyage embedding model |
@@ -95,6 +101,32 @@ Flags of `semcast serve`:
 | `--jobs-dir` | temp dir | batch job state and results |
 | `--max-in-flight` | `8` | model requests in flight across all queries; a separate embedder gets its own cap; identical requests are sent once |
 | `--max-concurrent-jobs` | `4` | `SUBMIT`ted jobs running at once |
+
+### Decider
+
+A decision model answers a yes/no question with a probability and writes
+nothing. With `--decider-url`, it answers every `MEANS` (filters, `CASE`,
+`CONFIDENCE()`, `WITH RECALL` labels); `--model` keeps `CAST`, cluster labels
+and reranking.
+
+```sh
+llama-server -m span02-mxfp4.gguf --port 8090 -np 4 -c 16384 -b 4096 -ub 4096
+semcast serve --decider-url http://127.0.0.1:8090
+```
+
+* Any server with a System One endpoint (`POST /v1/systemone`) works:
+  llama.cpp's `llama-server`, or Ollama with one of its
+  [decision models](https://ollama.com/search?c=decision)
+  (`--decider-url http://localhost:11434 --decider-model d3`).
+* `-ub` and a slot's context (`-c` / `-np`) must cover the longest text asked
+  about: a longer one fails its row. An indexed filter sends excerpts; labels,
+  `CASE` and `CONFIDENCE()` send the whole text.
+* `-np` is the server's slot count; give `--decider-max-in-flight` the same.
+* A `CASE` over several conditions asks each on its own, not in one call.
+* Verdicts are stored under the decider's model name, apart from `--model`'s.
+
+On CUAD, Span-02 through llama.cpp scored F1 0.72 / 0.66 (test / dev) as the
+verify model against `gemma4:e4b`'s 0.68 / 0.63, at similar speed.
 
 ### Persistence
 

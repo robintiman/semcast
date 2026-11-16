@@ -21,6 +21,7 @@ cargo test --test means                     # one integration test file
 cargo test --test means -- name_of_test     # one test
 cargo test --test live_ollama -- --ignored  # live, needs a running Ollama
 cargo test --test live_voyage -- --ignored  # live, needs VOYAGE_API_KEY
+cargo test --test live_systemone -- --ignored  # live, needs llama-server with a decision model
 
 cargo fmt --all --check                     # CI gate
 cargo clippy --all-targets -- -D warnings   # CI gate
@@ -31,7 +32,8 @@ uv run --project eval eval/sembench.py      # SemBench against a local server; s
 
 Building needs a system `protoc` (lance's `prost-build`); CI installs it via
 `arduino/setup-protoc`. Live tests read `SEMCAST_OLLAMA_MODEL` (default
-`gemma4:e4b`), `ANTHROPIC_API_KEY`, `VOYAGE_API_KEY`.
+`gemma4:e4b`), `ANTHROPIC_API_KEY`, `VOYAGE_API_KEY`, `SEMCAST_SYSTEMONE_URL`
+(default `http://127.0.0.1:8090`), `SEMCAST_SYSTEMONE_MODEL` (Ollama only).
 
 Releases go through `./scripts/release.sh <version>` (try `--dry-run` first) — it
 owns both the `Cargo.toml` bump and the tag so the two cannot disagree. Never bump
@@ -67,6 +69,20 @@ session model (and any separate embedder) in a `model::Scheduler` — one cap on
 requests in flight for the session model, fallbacks included, and one for a
 separate embedder, with identical in-flight requests merged. `enable_url_table()`
 must stay the last call — it consumes and rebuilds the context.
+
+### Two model roles
+
+`SemcastContextBuilder::with_decider` (`--decider-url`) gives the session a
+second model for every `MEANS` question: `SemcastExtensionPlanner::means_model`
+hands it to the store lookup, verify, calibration labels and `SemClassify`;
+extract, cluster and rank keep the session model. It is meant for a decision
+model (`model::SystemOneProvider`, `/v1/systemone` on llama.cpp or Ollama), which answers
+yes/no with a probability and cannot write: it reads `CompletionRequest::ask`
+(the condition, in parts) and words the question itself, and refuses a request
+without one. Under a decider `SemClassifyExec` asks each condition alone
+(`one_question_per_call`) instead of fusing them into a JSON answer. Build
+every `MEANS` request with `verify::means_request`, which sets `ask`; a
+request without it loses its rows under a decider.
 
 ### Two parse surfaces, and why `semcast::sql()` exists
 

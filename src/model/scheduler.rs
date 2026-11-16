@@ -235,8 +235,13 @@ fn error_text(error: SemcastError) -> String {
     }
 }
 
-/// Every field that can change the answer.
+/// Every field that can change the answer. `ask` restates `system` for a
+/// generative model, but it is all a decision model reads.
 fn request_key(request: &CompletionRequest) -> u128 {
+    let (condition, excerpts) = match &request.ask {
+        Some(ask) => (ask.condition.as_str(), 1 + u8::from(ask.excerpts)),
+        None => ("", 0),
+    };
     let schema = request
         .schema
         .as_ref()
@@ -248,6 +253,8 @@ fn request_key(request: &CompletionRequest) -> u128 {
         &request.max_tokens.to_le_bytes(),
         schema.as_bytes(),
         &[u8::from(request.logprobs)],
+        condition.as_bytes(),
+        &[excerpts],
     ])
 }
 
@@ -299,6 +306,7 @@ mod tests {
             max_tokens: 4,
             schema: None,
             logprobs: false,
+            ask: None,
         }
     }
 

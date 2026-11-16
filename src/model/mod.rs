@@ -6,13 +6,16 @@
 //! and free — the eval harness (roadmap step 5) baseline; [`OllamaProvider`]
 //! runs local models (and embeddings, for the index); [`AnthropicProvider`]
 //! is the hosted option for verify-quality answers; [`VoyageProvider`] is the
-//! hosted option for embeddings (its inverse: no completions).
+//! hosted option for embeddings (its inverse: no completions);
+//! [`SystemOneProvider`] is a decision model that answers yes/no questions
+//! and nothing else — the session's optional decider.
 
 mod anthropic;
 mod fallback;
 mod mock;
 mod ollama;
 mod scheduler;
+mod systemone;
 mod voyage;
 
 pub use anthropic::{AnthropicProvider, DEFAULT_ANTHROPIC_MODEL, DEFAULT_ANTHROPIC_URL};
@@ -20,6 +23,7 @@ pub use fallback::FallbackProvider;
 pub use mock::MockModel;
 pub use ollama::{DEFAULT_CHAT_MODEL, DEFAULT_EMBED_MODEL, DEFAULT_OLLAMA_URL, OllamaProvider};
 pub use scheduler::{DEFAULT_MAX_IN_FLIGHT, Scheduler, SchedulerStats};
+pub use systemone::{DEFAULT_DECIDER_MAX_IN_FLIGHT, SystemOneProvider};
 pub use voyage::{DEFAULT_VOYAGE_MODEL, DEFAULT_VOYAGE_URL, VoyageProvider};
 
 use std::time::{Duration, SystemTime};
@@ -57,6 +61,23 @@ pub struct CompletionRequest {
     /// first token's log-probabilities — for yes/no prompts (`MEANS`). A
     /// provider that can't report them answers without one.
     pub logprobs: bool,
+    /// Set when the request is one `MEANS` yes/no question: the same
+    /// question `system` words for a generative model, in parts, for a
+    /// decision model that words it its own way. `system` and `input` alone
+    /// still say everything a generative provider needs.
+    pub ask: Option<YesNoAsk>,
+}
+
+/// A `MEANS` question about `input`, for providers that answer typed
+/// questions instead of prompts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct YesNoAsk {
+    /// The normalized `MEANS` condition.
+    pub condition: String,
+    /// `input` is the document's best chunks joined by
+    /// [`CHUNK_SEPARATOR`](crate::physical::verify::CHUNK_SEPARATOR), not
+    /// the whole text.
+    pub excerpts: bool,
 }
 
 #[derive(Debug, Clone)]

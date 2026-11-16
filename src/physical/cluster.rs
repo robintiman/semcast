@@ -363,6 +363,7 @@ impl Grouper {
                 max_tokens: LABEL_MAX_TOKENS,
                 schema: Some(label_schema()),
                 logprobs: false,
+                ask: None,
             });
             pending.push((cluster, key));
         }

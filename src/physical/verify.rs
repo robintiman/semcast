@@ -25,7 +25,7 @@ use futures::TryStreamExt;
 
 use crate::cache::{CacheKey, CachedValue, SemanticCache};
 use crate::index::doc_hash;
-use crate::model::{CompletionRequest, ModelId, ModelProvider};
+use crate::model::{CompletionRequest, ModelId, ModelProvider, YesNoAsk};
 use crate::physical::index_scan::ChunkEvidence;
 use crate::physical::store_lookup::StoreEvidence;
 
@@ -63,6 +63,27 @@ pub fn synthesize_means_prompt_chunked(condition: &str) -> String {
          Predicate: {condition}\n\n\
          Do the excerpts show the document satisfies the predicate?"
     )
+}
+
+/// The one `MEANS` question every stage asks: the prompt for a generative
+/// model and the same question in parts ([`YesNoAsk`]) for a decision model,
+/// built together so neither can be forgotten or disagree.
+pub fn means_request(condition: &str, input: String, chunked: bool) -> CompletionRequest {
+    CompletionRequest {
+        system: if chunked {
+            synthesize_means_prompt_chunked(condition)
+        } else {
+            synthesize_means_prompt(condition)
+        },
+        input,
+        max_tokens: 8,
+        schema: None,
+        logprobs: true,
+        ask: Some(YesNoAsk {
+            condition: condition.to_owned(),
+            excerpts: chunked,
+        }),
+    }
 }
 
 /// Filters input batches by asking the model whether each row's text meets
@@ -235,8 +256,6 @@ impl ExecutionPlan for VerifyExec {
         let verifier = Arc::new(Verifier {
             text: Arc::clone(&self.text),
             condition: self.condition.clone(),
-            prompt: synthesize_means_prompt(&self.condition),
-            chunked_prompt: synthesize_means_prompt_chunked(&self.condition),
             model_id: self.model.id(),
             model: Arc::clone(&self.model),
             cache: Arc::clone(&self.cache),
@@ -271,8 +290,6 @@ struct Verifier {
     store: Option<Arc<StoreEvidence>>,
     text: Arc<dyn PhysicalExpr>,
     condition: String,
-    prompt: String,
-    chunked_prompt: String,
     model_id: ModelId,
     model: Arc<dyn ModelProvider>,
     cache: Arc<dyn SemanticCache>,
@@ -317,13 +334,13 @@ impl Verifier {
             // the full text. The cache keys the input and the prompt version
             // actually sent, so the two kinds of verdict never collide — not
             // even for a one-chunk document, whose input is the same.
-            let (input, prompt, chunked) = match self
+            let (input, chunked) = match self
                 .evidence
                 .as_deref()
                 .and_then(|evidence| evidence.chunks_for(doc_hash(text)))
             {
-                Some(chunks) => (chunks.join(CHUNK_SEPARATOR), &self.chunked_prompt, true),
-                None => (text.to_owned(), &self.prompt, false),
+                Some(chunks) => (chunks.join(CHUNK_SEPARATOR), true),
+                None => (text.to_owned(), false),
             };
             if let Some(CachedValue::Value(verdict)) =
                 self.cache.get(&self.cache_key(&input, chunked))
@@ -332,13 +349,7 @@ impl Verifier {
                 *keep_row = verdict == "yes";
                 continue;
             }
-            requests.push(CompletionRequest {
-                system: prompt.clone(),
-                input: input.clone(),
-                max_tokens: 8,
-                schema: None,
-                logprobs: true,
-            });
+            requests.push(means_request(&self.condition, input.clone(), chunked));
             pending.push((row, input, chunked));
         }
         // Counted as sent, so progress shows calls while they run; merges

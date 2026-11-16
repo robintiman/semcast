@@ -7,8 +7,8 @@
 //!
 //! The node materializes one boolean column per condition and the `CASE`
 //! stays where it was, referencing those columns. Conditions over the same
-//! text are fused into a single model call per row, which is an optimization
-//! only: every column still answers exactly the question the same `MEANS`
+//! text are fused into a single model call per row (unless a decider answers
+//! them, one call each), which is an optimization only: every column still answers exactly the question the same `MEANS`
 //! would ask in a `WHERE`.
 //!
 //! `CONFIDENCE(text MEANS 'condition')` gets a node of its own with one

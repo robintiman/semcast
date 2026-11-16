@@ -74,6 +74,7 @@ async fn mock_model_is_deterministic() {
         max_tokens: 4,
         schema: None,
         logprobs: false,
+        ask: None,
     };
 
     let answers = model

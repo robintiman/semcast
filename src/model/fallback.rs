@@ -225,6 +225,7 @@ mod tests {
                 max_tokens: 8,
                 schema: None,
                 logprobs: false,
+                ask: None,
             })
             .collect()
     }
