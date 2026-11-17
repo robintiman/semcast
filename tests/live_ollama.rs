@@ -610,3 +610,41 @@ async fn long_document_is_refused_or_read_whole() {
         answer.text
     );
 }
+
+/// A chunk that tokenizes past the embedder's context (form-filler runs do)
+/// is embedded whole, in halves, not cut: a clause at its end, which a cut
+/// would drop, still moves its vector toward a query about it.
+///
+/// ```sh
+/// cargo test --test live_ollama -- --ignored an_over_long_chunk
+/// ```
+#[tokio::test]
+#[ignore = "requires a running Ollama server with nomic-embed-text pulled"]
+async fn an_over_long_chunk_is_embedded_whole() {
+    use semcast::model::ModelProvider;
+    let ollama = OllamaProvider::new(semcast::model::DEFAULT_CHAT_MODEL);
+    // ~400 words, but the dotted leaders push it far past 2048 tokens; the
+    // clause about audits sits at the end, where a cut would drop it.
+    let filler = "SECTION.................................................... ".repeat(300);
+    let clause = "The licensor may audit the licensee's books and records once a year.";
+    let chunk = format!("{filler}{clause}");
+    let vectors = ollama
+        .embed(vec![chunk, clause.to_owned(), filler.clone()])
+        .await
+        .expect("an over-long chunk embeds instead of failing the batch");
+    let cosine = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
+    let norm = vectors[0].iter().map(|x| x * x).sum::<f32>();
+    assert!((norm - 1.0).abs() < 1e-3, "unit length: {norm}");
+    let query = ollama
+        .embed_queries(vec!["audit rights".to_owned()])
+        .await
+        .unwrap();
+    let (whole, filler) = (
+        cosine(&query[0], &vectors[0]),
+        cosine(&query[0], &vectors[2]),
+    );
+    assert!(
+        whole > filler,
+        "the clause at the end counts: whole {whole:.3}, filler alone {filler:.3}"
+    );
+}
