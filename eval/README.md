@@ -94,3 +94,38 @@ with care:
 - A failed step reports nothing, though the calls it sent were spent and
   later steps find their answers stored. The summary line flags failed steps.
 - With `--scorer`, scorer calls and hits count as questions too.
+
+## CUAD recall
+
+```sh
+cargo build --release
+uv run --project eval eval/cuad_recall.py --model gemma4:e4b
+```
+
+Does `WITH RECALL r WITH CONFIDENCE c` hold end to end on CUAD (509
+contracts, 5 clauses from 5.5% to 73% selectivity), and at what cost? For
+each clause, a `MEANS … WITH RECALL` over an indexed copy of the contracts
+(the funnel) runs first, on a fresh store. Then the same `MEANS` over an
+unindexed copy asks about every contract's full text (the reference the
+promise is about), reusing the funnel's full-text labels.
+
+`--data` (default `data/cuad`) holds CUAD v1 as three files:
+`contracts.json` (one `{"id", "text"}` per line), `clauses.csv` (`clause`,
+`prompt`: the `MEANS` condition) and `clause_labels.csv` (`id`, `clause`,
+`present`: the lawyers' labels). `--limit N` is a smoke run over the first N
+contracts. Ollama only: `--ollama-url` is the upstream, and the default
+`--num-ctx` of 131072 fits every CUAD contract.
+
+Recall is the share of the reference's matches the funnel returned. Cost is
+counted twice:
+
+- model calls, from the funnel NOTICE, against one per contract;
+- input tokens, from Ollama's own `prompt_eval_count`, counted by a proxy the
+  script puts between semcast and Ollama. A full scan's tokens are measured:
+  the funnel's full-text calls and the reference's together ask every
+  answerable contract once. Index embedding tokens are reported apart.
+
+Seconds depend on Ollama's prompt cache: a re-run over the same contracts is
+much faster than the first. The lawyers' labels are scored too, for context
+only. Results go to `results/cuad_recall/`, rewritten after every clause; a
+failed statement is recorded and the run goes on.
