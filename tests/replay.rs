@@ -91,11 +91,11 @@ async fn a_replay_reruns_the_recorded_funnel_exactly() {
         "the replay asked what the recording paid for"
     );
     assert!(
-        log.contains("\"chunked\":true"),
+        log.contains("\"kind\":\"chunked\""),
         "chunk checks were replayed"
     );
     assert!(
-        log.contains("\"chunked\":false"),
+        log.contains("\"kind\":\"full\""),
         "full-text labels were replayed"
     );
 }

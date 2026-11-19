@@ -149,6 +149,8 @@ strings.
 Cost is priced in input characters (system prompt plus input), which tokens
 track: on the 2026-11-17 run the shares of a full scan matched the measured
 token shares to the percent. A request the recording lacks fails its row and
-is counted as a miss, for example a chunk set the run never asked. A replay
-with misses is not exact, and the summary says so. Replaying the run it
-recorded reproduces every funnel line, row and call.
+is counted as a miss: a chunk set the run never asked, a row the run itself
+failed on (failures aren't stored), or a prompt other than a single yes/no
+`MEANS`. A replay with misses is not exact, and the summary says so.
+Replaying the run it recorded reproduces every funnel line, row and call.
+Results go to `results/cuad_recall/replay/` unless `--out` is given.

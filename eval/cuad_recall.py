@@ -23,7 +23,7 @@ CUAD's lawyer labels are scored too, for context: the promise is about the
 model's own full-text answers, not the lawyers'.
 
 Replay (`--replay STORE`) reruns the same statements against an earlier
-run's store instead of a model, in minutes and for free:
+run's store instead of a model, in seconds and for free:
 
     uv run --project eval eval/cuad_recall.py --model gemma4:e4b \
         --replay data/cuad_runs/2026-11-17/store.db
@@ -32,8 +32,10 @@ The server answers every MEANS request from the recording
 (`--provider replay`) and starts from a copy of it with the answers removed
 and the vectors kept, so the funnel runs as it would cold and the index
 build embeds nothing. Cost is priced in input characters, which tokens
-track; a request the recording lacks (a chunk set the run never asked) fails
-its row and is reported as a miss, and a replay with misses is not exact.
+track; a request the recording lacks (a chunk set the run never asked, or a
+row the run itself failed on) fails its row and is reported as a miss, and a
+replay with misses is not exact. Results go to `--out`/replay unless `--out`
+is given, so a replay never overwrites a live run's.
 Ollama must still be running, for the few query embeddings.
 """
 
@@ -185,7 +187,8 @@ class ReplayMeter:
         if self.log.exists():
             for line in self.log.read_text().splitlines():
                 request = json.loads(line)
-                counts["chunked_in" if request["chunked"] else "full_text_in"] += request["chars"]
+                field = {"full": "full_text_in", "chunked": "chunked_in"}.get(request["kind"], "other_in")
+                counts[field] += request["chars"]
                 counts["misses"] += not request["answered"]
         return counts
 
@@ -205,15 +208,19 @@ def prepare_replay(recording: Path, work: Path) -> tuple[Path, Path]:
     copies = []
     for name in ("recording.db", "store.db"):
         copy = work / name
-        for suffix in ("", "-wal", "-shm"):
+        for suffix in ("", "-wal"):
             source = Path(f"{recording}{suffix}")
             if source.exists():
                 shutil.copyfile(source, f"{copy}{suffix}")
         copies.append(copy)
     oracle, store = copies
-    with sqlite3.connect(store) as db:
-        for table in REPLAY_CLEARED:
-            db.execute(f"DELETE FROM {table}")
+    db = sqlite3.connect(store)
+    try:
+        with db:
+            for table in REPLAY_CLEARED:
+                db.execute(f"DELETE FROM {table}")
+    finally:
+        db.close()
     return oracle, store
 
 
@@ -315,7 +322,7 @@ def main() -> None:
     parser.add_argument("--provider", default="ollama", choices=["ollama"])
     parser.add_argument("--ollama-url", default="http://localhost:11434")
     parser.add_argument("--server", type=Path, default=REPO / "target" / "release" / "semcast")
-    parser.add_argument("--out", type=Path, default=REPO / "eval" / "results" / "cuad_recall")
+    parser.add_argument("--out", type=Path, help="default eval/results/cuad_recall, /replay under it for --replay")
     parser.add_argument(
         "--replay",
         type=Path,
@@ -326,6 +333,10 @@ def main() -> None:
         parser.error("--replay needs --model, the model the recording asked")
     if args.replay and not args.replay.exists():
         parser.error(f"{args.replay} is missing")
+    if args.out is None:
+        args.out = REPO / "eval" / "results" / "cuad_recall"
+        if args.replay:
+            args.out /= "replay"
     if not args.server.exists():
         parser.error(f"{args.server} is missing; run cargo build --release")
 

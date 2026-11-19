@@ -11,14 +11,17 @@
 //!
 //! A request the recording doesn't hold (a chunk set the original run never
 //! asked, a condition it never ran) fails its row, as a model error would,
-//! and is counted: a replay with misses is not exact. Only yes/no `MEANS`
-//! prompts are answered; the provider doesn't embed, so a session pairs it
-//! with a live embedder.
+//! and is counted: a replay with misses is not exact. So is a row the
+//! recorded run failed on, since a failed answer was never stored. Only
+//! single yes/no `MEANS` prompts are answered: anything else (a fused
+//! multi-condition `CASE`, extraction, ranking) fails and counts as a miss
+//! too. The provider doesn't embed, so a session pairs it with a live
+//! embedder.
 //!
 //! Each request is appended to an optional log, one JSON object per line
-//! (`{"chunked":false,"chars":51234,"answered":true}`), which is how the
-//! harness prices a replay: by input characters, the measure that tokens
-//! track.
+//! (`{"kind":"full","chars":51234,"answered":true}`, `kind` one of `full`,
+//! `chunked` and `unsupported`), which is how the harness prices a replay:
+//! by input characters, the measure that tokens track.
 
 use std::fs::File;
 use std::io::Write;
@@ -75,9 +78,12 @@ impl ReplayProvider {
     }
 
     fn answer(&self, request: &CompletionRequest) -> Result<Completion> {
+        let chars = request.system.len() + request.input.len();
         let Some((condition, chunked)) = parse_means_prompt(&request.system) else {
+            self.record("unsupported", chars, false);
+            self.misses.fetch_add(1, Ordering::Relaxed);
             return Err(SemcastError::Model(
-                "replay answers only MEANS yes/no prompts".to_owned(),
+                "replay answers only single MEANS yes/no prompts".to_owned(),
             ));
         };
         let version = if chunked {
@@ -97,13 +103,12 @@ impl ReplayProvider {
             }
             _ => None,
         };
-        let chars = request.system.len() + request.input.len();
-        self.record(chunked, chars, verdict.is_some());
+        let kind = if chunked { "chunked" } else { "full" };
+        self.record(kind, chars, verdict.is_some());
         let Some(verdict) = verdict else {
             self.misses.fetch_add(1, Ordering::Relaxed);
             return Err(SemcastError::Model(format!(
-                "replay: no recorded answer for this {} request",
-                if chunked { "chunked" } else { "full-text" }
+                "replay: no recorded answer for this {kind} request"
             )));
         };
         let yes_probability = if request.logprobs {
@@ -120,9 +125,9 @@ impl ReplayProvider {
         })
     }
 
-    fn record(&self, chunked: bool, chars: usize, answered: bool) {
+    fn record(&self, kind: &str, chars: usize, answered: bool) {
         let Some(log) = &self.log else { return };
-        let line = format!("{{\"chunked\":{chunked},\"chars\":{chars},\"answered\":{answered}}}\n");
+        let line = format!("{{\"kind\":\"{kind}\",\"chars\":{chars},\"answered\":{answered}}}\n");
         let mut file = log.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Err(error) = file.write_all(line.as_bytes()) {
             tracing::warn!("replay log: {error}");
@@ -212,16 +217,24 @@ mod tests {
         );
         assert!(answers[2].is_err(), "never recorded");
         assert!(answers[3].is_err(), "not a MEANS prompt");
-        assert_eq!(replay.misses(), 1);
+        assert_eq!(
+            replay.misses(),
+            2,
+            "the unrecorded and the unsupported request"
+        );
 
         let lines: Vec<serde_json::Value> = std::fs::read_to_string(&log)
             .unwrap()
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        assert_eq!(lines.len(), 3, "one line per MEANS request");
-        assert_eq!(lines[1]["chunked"], true);
+        assert_eq!(lines.len(), 4, "one line per request");
+        assert_eq!(lines[1]["kind"], "chunked");
         assert_eq!(lines[2]["answered"], false);
+        assert_eq!(
+            (&lines[3]["kind"], &lines[3]["answered"]),
+            (&"unsupported".into(), &false.into())
+        );
         let sent = synthesize_means_prompt(" is  angry").len() + "I am furious".len();
         assert_eq!(lines[0]["chars"], sent);
     }

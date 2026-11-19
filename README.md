@@ -86,7 +86,7 @@ Flags of `semcast serve`:
 | `--host` | `127.0.0.1` | listen address |
 | `--port` | `5433` | leaves a local Postgres on 5432 alone |
 | `--provider` | `ollama` | completions: `ollama`, `anthropic`, or `replay` (answers `MEANS` from an earlier run's store, for evals; see [`eval/README.md`](eval/README.md#replay)) |
-| `--model` | per provider | `qwen3.8:27b` (Ollama), `claude-haiku-4-5` (Anthropic) |
+| `--model` | per provider | `qwen3.8:27b` (Ollama), `claude-haiku-4-5` (Anthropic); required with `replay`: the recorded model's id |
 | `--scorer-model` | off | small Ollama model that pre-filters an unindexed `MEANS` under [`WITH RECALL`](#with-recall) |
 | `--embed-provider` | `ollama` | embeddings: `ollama` or `voyage` |
 | `--embed-model` | `nomic-embed-text` | Ollama embedding model |
