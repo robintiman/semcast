@@ -459,7 +459,8 @@ def main() -> None:
         proxy.stop()
 
     other = proxy.snapshot().get("other_in", 0)
-    if other:
+    # A replay counts these as misses already, in the summary.
+    if other and not args.replay:
         print(
             f"warning: {other} chat input tokens matched neither MEANS prompt; "
             "check FULL_TEXT_PROMPT and CHUNKED_PROMPT against src/physical/verify.rs",
