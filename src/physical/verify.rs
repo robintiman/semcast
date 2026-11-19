@@ -75,6 +75,27 @@ pub fn synthesize_means_prompt_chunked(condition: &str) -> String {
     )
 }
 
+/// The condition a synthesized `MEANS` prompt asks, and whether it is the
+/// chunked variant: the inverse of [`synthesize_means_prompt`] and
+/// [`synthesize_means_prompt_chunked`]. `None` for any other prompt. A
+/// replay ([`crate::model::ReplayProvider`]) finds a request's stored answer
+/// by it.
+pub fn parse_means_prompt(system: &str) -> Option<(&str, bool)> {
+    const MARK: &str = "\u{0}condition\u{0}";
+    [
+        (synthesize_means_prompt(MARK), false),
+        (synthesize_means_prompt_chunked(MARK), true),
+    ]
+    .into_iter()
+    .find_map(|(template, chunked)| {
+        let (head, tail) = template
+            .split_once(MARK)
+            .expect("the template holds the mark");
+        let condition = system.strip_prefix(head)?.strip_suffix(tail)?;
+        Some((condition, chunked))
+    })
+}
+
 /// Filters input batches by asking the model whether each row's text meets
 /// the condition. Ground truth for `MEANS` — every cheaper stage upstream is
 /// an approximation of what this operator computes.
@@ -767,5 +788,24 @@ mod yes_probability_cache_tests {
         assert_eq!(cached_score(&cache, &key()).flatten(), None);
         cache_verdict(&cache, key(), false, None);
         assert_eq!(cached_score(&cache, &key()).flatten(), None);
+    }
+}
+
+#[cfg(test)]
+mod prompt_tests {
+    use super::*;
+
+    #[test]
+    fn a_means_prompt_parses_back_to_its_condition() {
+        let condition = "mentions a refund\n\nor a {chargeback}: yes";
+        assert_eq!(
+            parse_means_prompt(&synthesize_means_prompt(condition)),
+            Some((condition, false))
+        );
+        assert_eq!(
+            parse_means_prompt(&synthesize_means_prompt_chunked(condition)),
+            Some((condition, true))
+        );
+        assert_eq!(parse_means_prompt("Extract the fields."), None);
     }
 }

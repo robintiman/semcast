@@ -6,13 +6,15 @@
 //! and free — the eval harness (roadmap step 5) baseline; [`OllamaProvider`]
 //! runs local models (and embeddings, for the index); [`AnthropicProvider`]
 //! is the hosted option for verify-quality answers; [`VoyageProvider`] is the
-//! hosted option for embeddings (its inverse: no completions).
+//! hosted option for embeddings (its inverse: no completions);
+//! [`ReplayProvider`] answers `MEANS` from a recorded store, for evals.
 
 mod anthropic;
 mod fallback;
 mod mock;
 mod ollama;
 pub mod pricing;
+mod replay;
 mod scheduler;
 mod voyage;
 
@@ -23,6 +25,7 @@ pub use ollama::{
     DEFAULT_CHAT_MODEL, DEFAULT_EMBED_MODEL, DEFAULT_NUM_CTX as DEFAULT_OLLAMA_NUM_CTX,
     DEFAULT_OLLAMA_URL, OllamaProvider,
 };
+pub use replay::ReplayProvider;
 pub use scheduler::{DEFAULT_MAX_IN_FLIGHT, Scheduler, SchedulerStats};
 pub use voyage::{DEFAULT_VOYAGE_MODEL, DEFAULT_VOYAGE_URL, VoyageProvider};
 

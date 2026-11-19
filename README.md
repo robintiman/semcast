@@ -85,7 +85,7 @@ Flags of `semcast serve`:
 |------|---------|---|
 | `--host` | `127.0.0.1` | listen address |
 | `--port` | `5433` | leaves a local Postgres on 5432 alone |
-| `--provider` | `ollama` | completions: `ollama` or `anthropic` |
+| `--provider` | `ollama` | completions: `ollama`, `anthropic`, or `replay` (answers `MEANS` from an earlier run's store, for evals; see [`eval/README.md`](eval/README.md#replay)) |
 | `--model` | per provider | `qwen3.8:27b` (Ollama), `claude-haiku-4-5` (Anthropic) |
 | `--scorer-model` | off | small Ollama model that pre-filters an unindexed `MEANS` under [`WITH RECALL`](#with-recall) |
 | `--embed-provider` | `ollama` | embeddings: `ollama` or `voyage` |
@@ -97,6 +97,7 @@ Flags of `semcast serve`:
 | `--jobs-dir` | temp dir | batch job state and results |
 | `--max-in-flight` | `8` | model requests in flight across all queries; a separate embedder gets its own cap; identical requests are sent once |
 | `--max-concurrent-jobs` | `4` | `SUBMIT`ted jobs running at once |
+| `--replay-store`, `--replay-log` | off | with `--provider replay`: the recorded store (pass a copy; `--model` is its model id, e.g. `ollama/gemma4:e4b`), and a JSON line per request |
 
 ### Persistence
 

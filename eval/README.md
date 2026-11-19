@@ -129,3 +129,26 @@ Seconds depend on Ollama's prompt cache: a re-run over the same contracts is
 much faster than the first. The lawyers' labels are scored too, for context
 only. Results go to `results/cuad_recall/`, rewritten after every clause; a
 failed statement is recorded and the run goes on.
+
+### Replay
+
+```sh
+uv run --project eval eval/cuad_recall.py --model gemma4:e4b \
+    --replay data/cuad_runs/2026-11-17/store.db
+```
+
+Reruns the same statements against an earlier run's `store.db` instead of a
+model: seconds instead of hours, no model cost, the same answers. Use it to
+measure a funnel change. The server (`--provider replay`) answers each
+`MEANS` request from the recording, keyed exactly as verify keys it, and
+starts from a copy of the recording with every answer, statistic and
+definition removed, so the funnel runs as it would cold. The vectors are
+kept, so the index build embeds nothing; Ollama still embeds the few query
+strings.
+
+Cost is priced in input characters (system prompt plus input), which tokens
+track: on the 2026-11-17 run the shares of a full scan matched the measured
+token shares to the percent. A request the recording lacks fails its row and
+is counted as a miss, for example a chunk set the run never asked. A replay
+with misses is not exact, and the summary says so. Replaying the run it
+recorded reproduces every funnel line, row and call.

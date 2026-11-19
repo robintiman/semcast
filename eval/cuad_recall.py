@@ -21,6 +21,20 @@ contract once.
 
 CUAD's lawyer labels are scored too, for context: the promise is about the
 model's own full-text answers, not the lawyers'.
+
+Replay (`--replay STORE`) reruns the same statements against an earlier
+run's store instead of a model, in minutes and for free:
+
+    uv run --project eval eval/cuad_recall.py --model gemma4:e4b \
+        --replay data/cuad_runs/2026-11-17/store.db
+
+The server answers every MEANS request from the recording
+(`--provider replay`) and starts from a copy of it with the answers removed
+and the vectors kept, so the funnel runs as it would cold and the index
+build embeds nothing. Cost is priced in input characters, which tokens
+track; a request the recording lacks (a chunk set the run never asked) fails
+its row and is reported as a miss, and a replay with misses is not exact.
+Ollama must still be running, for the few query embeddings.
 """
 
 from __future__ import annotations
@@ -29,6 +43,8 @@ import argparse
 import csv
 import json
 import re
+import shutil
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -152,6 +168,55 @@ class TokenProxy:
         self.server.shutdown()
 
 
+class ReplayMeter:
+    """Prices a replay: input characters per request, from the provider's log.
+
+    Same fields as [`TokenProxy`], counted in characters for chat; embedding
+    tokens still come from the proxy, which forwards them to Ollama.
+    """
+
+    def __init__(self, log: Path, proxy: TokenProxy) -> None:
+        self.log = log
+        self.proxy = proxy
+
+    def snapshot(self) -> dict[str, int]:
+        counts = self.proxy.snapshot()
+        counts["misses"] = 0
+        if self.log.exists():
+            for line in self.log.read_text().splitlines():
+                request = json.loads(line)
+                counts["chunked_in" if request["chunked"] else "full_text_in"] += request["chars"]
+                counts["misses"] += not request["answered"]
+        return counts
+
+    def stop(self) -> None:
+        self.proxy.stop()
+
+
+# What a replay deletes from its copy of the recording: every answer and
+# what was learned from them, and the definitions, which the run recreates.
+# Kept: the vectors (`embeddings`), so the index build embeds nothing.
+REPLAY_CLEARED = ("verdicts", "ask_stats", "prune_curves", "catalog", "index_chunks")
+
+
+def prepare_replay(recording: Path, work: Path) -> tuple[Path, Path]:
+    """Copy the recording twice: the answers the provider reads, and the
+    session store, cleared of answers."""
+    copies = []
+    for name in ("recording.db", "store.db"):
+        copy = work / name
+        for suffix in ("", "-wal", "-shm"):
+            source = Path(f"{recording}{suffix}")
+            if source.exists():
+                shutil.copyfile(source, f"{copy}{suffix}")
+        copies.append(copy)
+    oracle, store = copies
+    with sqlite3.connect(store) as db:
+        for table in REPLAY_CLEARED:
+            db.execute(f"DELETE FROM {table}")
+    return oracle, store
+
+
 def done_line(notices: list[str]) -> str:
     return " ".join(line for line in notices if "funnel done" in line)
 
@@ -167,15 +232,15 @@ class Statement:
         self.ids: set[str] = set()
         self.line = ""
         self.seconds = 0.0
-        self.tokens: dict[str, int] = dict.fromkeys(TokenProxy.FIELDS, 0)
+        self.tokens: dict[str, int] = {}
         self.error: str | None = None
 
     @property
     def input_tokens(self) -> int:
-        return self.tokens["full_text_in"] + self.tokens["chunked_in"] + self.tokens["other_in"]
+        return sum(self.tokens.get(key, 0) for key in ("full_text_in", "chunked_in", "other_in"))
 
 
-def run(server: Server, proxy: TokenProxy, sql: str) -> Statement:
+def run(server: Server, proxy: TokenProxy | ReplayMeter, sql: str) -> Statement:
     """Run `sql` on a fresh connection; a failure is recorded, not raised."""
     result = Statement()
     before = proxy.snapshot()
@@ -197,13 +262,14 @@ def run(server: Server, proxy: TokenProxy, sql: str) -> Statement:
         result.error = str(error).strip()
     result.seconds = time.monotonic() - started
     after = proxy.snapshot()
-    result.tokens = {key: after[key] - before[key] for key in TokenProxy.FIELDS}
+    result.tokens = {key: after[key] - before[key] for key in after}
     return result
 
 
 def summarize(results: list[dict], args: argparse.Namespace, rows: int, index: dict) -> str:
+    unit = "Input chars" if args.replay else "Input tokens"
     lines = [
-        f"| Clause | Matches | Funnel rows | Recall | Calls | Of {rows} | Input tokens | Of full scan | Full text |",
+        f"| Clause | Matches | Funnel rows | Recall | Calls | Of {rows} | {unit} | Of full scan | Full text |",
         "|---|---|---|---|---|---|---|---|---|",
     ]
     for r in results:
@@ -221,6 +287,12 @@ def summarize(results: list[dict], args: argparse.Namespace, rows: int, index: d
             f"{r['funnel_input_tokens']} | {share} | {r['full_text']} |"
         )
     met = sum(r["recall"] is not None and r["recall"] >= args.recall for r in results)
+    if args.replay:
+        misses = sum(r["replay_misses"] for r in results)
+        lines.append(
+            f"\nReplay of {args.replay}: {misses} requests the recording lacked"
+            + (" (exact)." if not misses else ", each a failed row: not exact.")
+        )
     lines.append(
         f"\nIndex build: {index['seconds']:.0f} s, {index['embed_tokens']} embedding tokens "
         "(a full scan needs none)."
@@ -244,18 +316,34 @@ def main() -> None:
     parser.add_argument("--ollama-url", default="http://localhost:11434")
     parser.add_argument("--server", type=Path, default=REPO / "target" / "release" / "semcast")
     parser.add_argument("--out", type=Path, default=REPO / "eval" / "results" / "cuad_recall")
+    parser.add_argument(
+        "--replay",
+        type=Path,
+        help="an earlier run's store.db: answer from it instead of a model (see above)",
+    )
     args = parser.parse_args()
+    if args.replay and not args.model:
+        parser.error("--replay needs --model, the model the recording asked")
+    if args.replay and not args.replay.exists():
+        parser.error(f"{args.replay} is missing")
     if not args.server.exists():
         parser.error(f"{args.server} is missing; run cargo build --release")
 
     args.connect = None
     args.work = Path(tempfile.mkdtemp(prefix="cuad-recall-"))
-    proxy = TokenProxy(args.ollama_url)
+    proxy: TokenProxy | ReplayMeter = TokenProxy(args.ollama_url)
     args.server_arg = [
         f"--store={args.work / 'store.db'}",
         f"--ollama-num-ctx={args.num_ctx}",
         f"--ollama-url={proxy.url}",
     ]
+    if args.replay:
+        oracle, _ = prepare_replay(args.replay, args.work)
+        log = args.work / "replay.jsonl"
+        proxy = ReplayMeter(log, proxy)
+        # Keys carry the provider's model id; the recording's is Ollama's.
+        args.provider, args.model = "replay", f"ollama/{args.model}"
+        args.server_arg += [f"--replay-store={oracle}", f"--replay-log={log}"]
 
     with open(args.data / "clauses.csv") as file:
         prompts = {r["clause"]: r["prompt"] for r in csv.DictReader(file)}
@@ -286,7 +374,7 @@ def main() -> None:
         built = run(server, proxy, "CREATE SEMANTIC INDEX ON contracts(body)")
         if built.error:
             sys.exit(f"index build failed: {built.error}")
-        index = {"seconds": built.seconds, "embed_tokens": built.tokens["embed_in"]}
+        index = {"seconds": built.seconds, "embed_tokens": built.tokens.get("embed_in", 0)}
         print(f"index built in {built.seconds:.0f} s, {index['embed_tokens']} embedding tokens", flush=True)
 
         target = f"WITH RECALL {args.recall} WITH CONFIDENCE {args.confidence}"
@@ -297,7 +385,8 @@ def main() -> None:
             funnels[clause] = funnel
             print(
                 f"funnel    {clause}: {len(funnel.ids)} rows, {funnel.seconds:.0f} s, "
-                f"{funnel.input_tokens} input tokens | {funnel.error or funnel.line}",
+                f"{funnel.input_tokens} input {'chars' if args.replay else 'tokens'} | "
+                f"{funnel.error or funnel.line}",
                 flush=True,
             )
         for clause in args.clauses:
@@ -316,13 +405,18 @@ def main() -> None:
                 "funnel_labels": number(r"(\d+) rows labeled", funnel.line),
                 "funnel_seconds": round(funnel.seconds),
                 "funnel_input_tokens": funnel.input_tokens,
-                "funnel_full_text_tokens": funnel.tokens["full_text_in"],
-                "funnel_chunked_tokens": funnel.tokens["chunked_in"],
-                "funnel_output_tokens": funnel.tokens["out"],
-                "funnel_embed_tokens": funnel.tokens["embed_in"],
+                "funnel_full_text_tokens": funnel.tokens.get("full_text_in", 0),
+                "funnel_chunked_tokens": funnel.tokens.get("chunked_in", 0),
+                "funnel_output_tokens": funnel.tokens.get("out", 0),
+                "funnel_embed_tokens": funnel.tokens.get("embed_in", 0),
                 # Every answerable contract asked once on its full text: the
                 # funnel's full-text calls, and the reference's for the rest.
-                "full_scan_input_tokens": funnel.tokens["full_text_in"] + reference.tokens["full_text_in"],
+                "full_scan_input_tokens": (
+                    funnel.tokens.get("full_text_in", 0) + reference.tokens.get("full_text_in", 0)
+                ),
+                # A replay prices in characters, not tokens; see the docstring.
+                "unit": "chars" if args.replay else "tokens",
+                "replay_misses": funnel.tokens.get("misses", 0) + reference.tokens.get("misses", 0),
                 "full_text": "verify reads full text" in funnel.line,
                 "reference_errors": number(r"(\d+) dropped", reference.line),
                 "funnel_errors": number(r"(\d+) dropped", funnel.line),
@@ -353,7 +447,7 @@ def main() -> None:
         server.stop()
         proxy.stop()
 
-    other = proxy.snapshot()["other_in"]
+    other = proxy.snapshot().get("other_in", 0)
     if other:
         print(
             f"warning: {other} chat input tokens matched neither MEANS prompt; "

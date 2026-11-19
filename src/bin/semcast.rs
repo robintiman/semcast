@@ -6,7 +6,9 @@ use std::sync::Arc;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use semcast::SemcastContextBuilder;
-use semcast::model::{AnthropicProvider, ModelProvider, OllamaProvider, VoyageProvider};
+use semcast::model::{
+    AnthropicProvider, ModelProvider, OllamaProvider, ReplayProvider, VoyageProvider,
+};
 use semcast::server::{JobRegistry, QueryEngine, jobs, serve};
 
 #[derive(Parser)]
@@ -35,11 +37,13 @@ struct ServeArgs {
     port: u16,
     /// Which provider runs completions (MEANS verify, extraction).
     /// `ollama` (the default) runs locally; `anthropic` needs
-    /// ANTHROPIC_API_KEY exported.
+    /// ANTHROPIC_API_KEY exported; `replay` answers MEANS from a recorded
+    /// store (`--replay-store`), for evals.
     #[arg(long, value_enum, default_value_t = CompletionProvider::Ollama)]
     provider: CompletionProvider,
     /// Chat model used to verify MEANS predicates. Defaults per provider:
-    /// claude-haiku-4-5 for `anthropic`, qwen3.8:27b for `ollama`.
+    /// claude-haiku-4-5 for `anthropic`, qwen3.8:27b for `ollama`. With
+    /// `replay`, the recorded model's id as stored (`ollama/gemma4:e4b`).
     #[arg(long)]
     model: Option<String>,
     /// Small Ollama chat model that pre-filters a MEANS no semantic index
@@ -93,12 +97,22 @@ struct ServeArgs {
     /// slower, not faster.
     #[arg(long, default_value_t = 4)]
     max_concurrent_jobs: usize,
+    /// With `--provider replay`: the store file of an earlier run, whose
+    /// verdicts answer every MEANS request. A request it holds no answer
+    /// for fails its row. Opened for writing, so pass a copy.
+    #[arg(long)]
+    replay_store: Option<PathBuf>,
+    /// With `--provider replay`: append one JSON line per request
+    /// (`chunked`, `chars`, `answered`) to this file.
+    #[arg(long)]
+    replay_log: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
 enum CompletionProvider {
     Anthropic,
     Ollama,
+    Replay,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -137,6 +151,21 @@ async fn main() -> std::io::Result<()> {
             }
             Arc::new(anthropic)
         }
+        CompletionProvider::Replay => {
+            let (Some(store), Some(model)) = (&args.replay_store, &args.model) else {
+                return Err(std::io::Error::other(
+                    "--provider replay needs --replay-store and --model (the recorded model's id)",
+                ));
+            };
+            let answers = semcast::cache::sqlite::SqliteCache::open(store).map_err(|error| {
+                std::io::Error::other(format!("opening {}: {error}", store.display()))
+            })?;
+            let mut replay = ReplayProvider::new(Arc::new(answers), model.as_str());
+            if let Some(log) = &args.replay_log {
+                replay = replay.with_log(log)?;
+            }
+            Arc::new(replay)
+        }
     };
 
     let mut builder = SemcastContextBuilder::new(model)
@@ -150,11 +179,15 @@ async fn main() -> std::io::Result<()> {
             builder = builder.with_embedder(Arc::new(voyage));
         }
         // With an Ollama completion provider the session model already
-        // embeds; Anthropic has no embedding models, so hand the builder a
-        // dedicated Ollama embedder.
+        // embeds; Anthropic and replay don't embed, so hand the builder a
+        // dedicated Ollama embedder (its chat model is never asked).
         EmbedProvider::Ollama => {
-            if let CompletionProvider::Anthropic = args.provider {
-                builder = builder.with_embedder(Arc::new(ollama()));
+            if !matches!(args.provider, CompletionProvider::Ollama) {
+                builder = builder.with_embedder(Arc::new(
+                    OllamaProvider::new(semcast::model::DEFAULT_CHAT_MODEL)
+                        .with_base_url(&args.ollama_url)
+                        .with_embed_model(&args.embed_model),
+                ));
             }
         }
     }
