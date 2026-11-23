@@ -136,6 +136,15 @@ pub trait SemanticIndex: std::fmt::Debug + Send + Sync {
     /// themselves. They are already paid for, so reading them back beats
     /// re-embedding a corpus.
     async fn doc_vectors(&self) -> Result<HashMap<u64, Embedding>>;
+
+    /// Document vectors for `texts` built exactly as [`doc_vectors`] builds
+    /// this index's own — same chunking, same embedder — for documents it
+    /// may not hold. Chunk vectors are stored (or read back) as an index
+    /// build stores them, but nothing is added to the index. Empty texts
+    /// have no vector.
+    ///
+    /// [`doc_vectors`]: SemanticIndex::doc_vectors
+    async fn vectors_of(&self, texts: Vec<String>) -> Result<HashMap<u64, Embedding>>;
 }
 
 /// Options for [`create_semantic_index`]. The defaults use the session's

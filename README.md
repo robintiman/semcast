@@ -222,8 +222,8 @@ memory without `--store`), and gives `MEANS`
 a cheap stage: one embedding call per query prunes non-candidates by vector
 similarity, and the verify model reads only the survivors. Under `WITH
 RECALL` it may read each survivor's top-3 chunks instead of the whole
-document (see below). Optional for `MEANS` and `RELEVANCE TO` but highly
-recommended; required by `GROUP BY MEANING OF` and `SEMANTIC DISTINCT ON`.
+document (see below). Optional for `MEANS`, `RELEVANCE TO` and `GROUP BY
+MEANING OF` but highly recommended; required by `SEMANTIC DISTINCT ON`.
 
 No `DROP` or `REFRESH` yet: run it again to rebuild after a load.
 
@@ -452,14 +452,19 @@ meaning_of(<text_column> [, <k>])   -- the label, as a value
 ```
 
 Groups rows by what they are about, when you don't already know the
-categories. Two stages: the index's vectors are clustered, then one model
-call per group reads its most central documents and names it. Cost tracks the
-number of groups, not rows.
+categories. Two stages: each document's vector (the mean of its chunks') is
+clustered, then one model call per group reads its most central documents
+and names it. Model cost tracks the number of groups, not rows.
+
+A semantic index supplies the vectors it already paid for. Without one (or
+over a computed column), the column is embedded the same way, and the chunk
+vectors are stored, so the next query reads them back; an index changes
+cost, never the groups.
 
 `INTO k` fixes the group count; without it, semcast sweeps a few values and
 keeps the best-separated. Clustering is seeded, so the same corpus always
-gives the same groups. A semantic index is required, and the operator blocks —
-which group a row belongs to is a fact about the whole table.
+gives the same groups. The operator blocks — which group a row belongs to is
+a fact about the whole table.
 
 ```sql
 SELECT topic, count(*) FROM meetings
@@ -473,9 +478,10 @@ GROUP BY MEANING OF transcript INTO 8 AS topic;
 ```
 
 `AS` names the label column so the `SELECT` list can use it. Rows the index
-hasn't seen get a NULL label rather than disappearing. Use `ONEOF` on a
+hasn't seen are embedded for the query and join a group; a NULL text gets a
+NULL label rather than disappearing. Use `ONEOF` on a
 [semantic type](#create-semantic-type) instead when you already know the
-categories — it's one call per row but needs no index.
+categories — it's one call per row.
 
 #### `SEMANTIC DISTINCT ON`
 

@@ -120,6 +120,8 @@ adds a digest of the input text, which is the verdict store's row key. On it:
 `ASK` per generation unit, each field stored under `typed_answer_key`) and
 `RELEVANCE TO` (`AskType::Score`, a 0–1 score; an index only picks
 candidates, and rows it doesn't cover are scored on full text).
+`MEANING OF` clusters document vectors (`EMBED`): an index's own, and
+`SemanticIndex::vectors_of` for the rest, built the same way.
 
 ### The funnel
 

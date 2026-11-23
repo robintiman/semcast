@@ -85,8 +85,8 @@ pub struct FunnelCounts {
     pub cluster_groups: usize,
     pub cluster_model_calls: usize,
     pub cluster_cache_hits: usize,
-    /// Rows the index has never seen. Clustering gives them a NULL label
-    /// rather than a group, so a non-zero count means a gap until refresh.
+    /// Rows the index has never seen. Clustering embeds them for the query,
+    /// so a non-zero count is embedding cost an index rebuild saves.
     pub cluster_unindexed_rows: usize,
     pub cluster_labels_failed: usize,
     pub has_classify: bool,
@@ -375,8 +375,8 @@ pub fn render(counts: &FunnelCounts) -> String {
         // own line rather than a number buried in the funnel.
         if counts.cluster_unindexed_rows > 0 {
             parts.push(format!(
-                "cluster: {} rows are not in the semantic index and have no group — \
-                 re-run CREATE SEMANTIC INDEX to include them",
+                "cluster: {} rows are not in the semantic index and were embedded \
+                 for this query — re-run CREATE SEMANTIC INDEX to read them from it",
                 counts.cluster_unindexed_rows,
             ));
         }

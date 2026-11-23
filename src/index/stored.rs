@@ -697,6 +697,42 @@ impl SemanticIndex for StoredIndex {
 
     /// The mean of each document's chunk vectors, renormalized: a document
     /// is its chunks, and cosine distance downstream assumes unit vectors.
+    async fn vectors_of(&self, texts: Vec<String>) -> Result<HashMap<u64, Embedding>> {
+        let (_, chunks) = self.chunk(texts).await?;
+        let keys: Vec<[u8; 16]> = chunks.iter().map(|chunk| chunk.embedding_key).collect();
+        let store = Arc::clone(&self.store);
+        let vectors = blocking(move || store.vectors(&keys)).await?;
+        let mut sums: HashMap<u64, (Embedding, usize)> = HashMap::new();
+        // `chunk` stored every vector just now; one missing is a store that
+        // dropped it, and the document goes without rather than with a mean
+        // of fewer chunks than `doc_vectors` would take.
+        let mut broken = HashSet::new();
+        for (chunk, vector) in chunks.iter().zip(vectors) {
+            let Some(vector) = vector.filter(|vector| vector.len() == self.dim) else {
+                broken.insert(chunk.doc_hash);
+                continue;
+            };
+            let (sum, count) = sums
+                .entry(chunk.doc_hash)
+                .or_insert_with(|| (vec![0.0; self.dim], 0));
+            for (slot, value) in sum.iter_mut().zip(&vector) {
+                *slot += value;
+            }
+            *count += 1;
+        }
+        Ok(sums
+            .into_iter()
+            .filter(|(hash, _)| !broken.contains(hash))
+            .map(|(hash, (mut sum, count))| {
+                for value in &mut sum {
+                    *value /= count as f32;
+                }
+                normalize(&mut sum);
+                (hash, sum)
+            })
+            .collect())
+    }
+
     async fn doc_vectors(&self) -> Result<HashMap<u64, Embedding>> {
         let store = Arc::clone(&self.store);
         let name = self.name.clone();
@@ -760,6 +796,54 @@ fn cosine(query: &[f32], vector: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn vectors_of_builds_what_the_index_would_and_adds_nothing() {
+        let store: Arc<dyn ChunkStore> = Arc::new(MemoryChunkStore::default());
+        let embedder: Arc<dyn ModelProvider> = Arc::new(crate::model::MockModel::default());
+        // Small slices, so a document spans several chunks.
+        let config = ChunkConfig {
+            max_tokens: 4,
+            overlap_tokens: 1,
+        };
+        let index = StoredIndex::create(
+            "t.body",
+            Arc::clone(&store),
+            Arc::clone(&embedder),
+            config.clone(),
+            SearchParams::default(),
+        )
+        .await
+        .unwrap();
+        let texts = vec![
+            "one two three four five six seven".to_owned(),
+            "eight nine".to_owned(),
+        ];
+        index.rebuild(texts.clone()).await.unwrap();
+        let indexed = index.doc_vectors().await.unwrap();
+
+        let scratch = StoredIndex::create(
+            "",
+            Arc::clone(&store),
+            embedder,
+            config,
+            SearchParams::default(),
+        )
+        .await
+        .unwrap();
+        let built = scratch
+            .vectors_of(vec![texts[0].clone(), "ten eleven".to_owned()])
+            .await
+            .unwrap();
+        assert_eq!(built[&doc_hash(&texts[0])], indexed[&doc_hash(&texts[0])]);
+        assert!(built.contains_key(&doc_hash("ten eleven")));
+        assert_eq!(
+            index.indexed_doc_hashes().await.unwrap().len(),
+            2,
+            "nothing added to the index"
+        );
+        assert!(scratch.indexed_doc_hashes().await.unwrap().is_empty());
+    }
 
     #[test]
     fn vectors_round_trip_through_their_encoding() {

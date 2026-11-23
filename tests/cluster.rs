@@ -40,9 +40,26 @@ fn clustering_model() -> Arc<MockModel> {
     Arc::new(MockModel::answering_json_with(theme_label).embedding_by_theme(["refund", "launch"]))
 }
 
-/// notes(id, body) — three billing, three launch.
+/// notes(id, body) — three billing, three launch — with a semantic index.
 async fn notes_context(model: Arc<MockModel>) -> (SessionContext, tempfile::TempDir) {
     let ctx = semcast_context(model);
+    notes_table(&ctx).await;
+    let dir = tempfile::tempdir().unwrap();
+    create_semantic_index(
+        &ctx,
+        "notes",
+        "body",
+        IndexOptions {
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    (ctx, dir)
+}
+
+/// notes(id, body) — three billing, three launch — no index.
+async fn notes_table(ctx: &SessionContext) {
     let values: Vec<String> = BILLING
         .iter()
         .chain(LAUNCH.iter())
@@ -58,19 +75,6 @@ async fn notes_context(model: Arc<MockModel>) -> (SessionContext, tempfile::Temp
     .collect()
     .await
     .unwrap();
-
-    let dir = tempfile::tempdir().unwrap();
-    create_semantic_index(
-        &ctx,
-        "notes",
-        "body",
-        IndexOptions {
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
-    (ctx, dir)
 }
 
 async fn run(ctx: &SessionContext, sql: &str) -> Vec<RecordBatch> {
@@ -320,9 +324,9 @@ async fn cluster_reports_a_funnel() {
 }
 
 #[tokio::test]
-async fn rows_the_index_never_saw_have_no_group() {
+async fn rows_the_index_never_saw_join_a_group() {
     let (ctx, _dir) = notes_context(clustering_model()).await;
-    ctx.sql("INSERT INTO notes VALUES (99, 'a late arrival nobody indexed')")
+    ctx.sql("INSERT INTO notes VALUES (99, 'please refund this invoice')")
         .await
         .unwrap()
         .collect()
@@ -331,42 +335,53 @@ async fn rows_the_index_never_saw_have_no_group() {
 
     let batches = run(
         &ctx,
-        "SELECT id, meaning_of(body, 2) AS topic FROM notes WHERE id = 99",
+        "SELECT id, meaning_of(body, 2) AS topic FROM notes ORDER BY id",
     )
     .await;
-    let labels = batches[0]
-        .column(1)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .expect("topic is Utf8");
-    assert!(
-        labels.is_null(0),
-        "an unindexed row keeps its place with no group, rather than vanishing"
+    let mut topics = std::collections::HashMap::new();
+    for batch in &batches {
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let labels = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for row in 0..batch.num_rows() {
+            topics.insert(ids.value(row), labels.value(row).to_owned());
+        }
+    }
+    assert_eq!(
+        topics[&99], topics[&1],
+        "embedded for the query, the late row joins the billing group"
     );
 }
 
 #[tokio::test]
-async fn clustering_without_an_index_is_a_plan_time_error() {
-    let ctx = semcast_context(clustering_model());
-    ctx.sql("CREATE TABLE plain AS SELECT * FROM (VALUES (1, 'a')) AS t(id, body)")
-        .await
-        .unwrap()
-        .collect()
-        .await
-        .unwrap();
+async fn clustering_without_an_index_embeds_the_column() {
+    let model = clustering_model();
+    let (indexed, _dir) = notes_context(Arc::clone(&model)).await;
+    let with_index = groups(&indexed, BY_THEME).await;
 
-    let message = error(
-        &ctx,
-        "SELECT topic, count(*) FROM plain GROUP BY MEANING OF body AS topic",
-    )
-    .await;
-    assert!(
-        message.contains("requires a semantic index on plain(body)"),
-        "{message}"
+    let model = clustering_model();
+    let ctx = semcast_context(Arc::clone(&model) as _);
+    notes_table(&ctx).await;
+    assert_eq!(
+        groups(&ctx, BY_THEME).await,
+        with_index,
+        "an index changes cost, not groups"
     );
-    assert!(
-        message.contains("CREATE SEMANTIC INDEX ON plain(body)"),
-        "{message}"
+    let embeds = model.embed_calls();
+    assert!(embeds > 0, "the column was embedded");
+    groups(&ctx, BY_THEME).await;
+    // Only the dimension probe: every chunk vector is read back.
+    assert_eq!(
+        model.embed_calls() - embeds,
+        1,
+        "the rerun reads stored vectors"
     );
 }
 

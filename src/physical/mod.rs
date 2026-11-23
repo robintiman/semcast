@@ -15,7 +15,7 @@ pub mod trace;
 pub mod verify;
 
 pub use classify::SemClassifyExec;
-pub use cluster::SemClusterExec;
+pub use cluster::{ClusterVectors, SemClusterExec};
 pub use distinct::SemDistinctExec;
 pub use extract::SemExtractExec;
 pub use index_scan::IndexScanExec;
