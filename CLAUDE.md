@@ -109,6 +109,11 @@ projection below it with the column replaced by the marker, so `WHERE angry`
 is an ordinary `MEANS` filter. A `MemTable` check must look through the
 wrapper (`catalog::is_memory_table`).
 
+`src/semantic_view.rs`: `[EXPLAIN] REFRESH SEMANTIC VIEW v` on any view.
+`REFRESH` reads the view to the end; `EXPLAIN REFRESH` lists the view's
+questions (`semantic_view::questions`, from its optimized plan) and quotes
+each over its column (`quote`, shared with semantic columns), asking nothing.
+
 ### SemIR
 
 `src/semir/` is the redesign's semantic IR, built over DataFusion's resolved

@@ -29,6 +29,7 @@ pub mod model;
 pub mod optimizer;
 pub mod physical;
 pub mod semantic_column;
+pub mod semantic_view;
 pub mod semir;
 pub mod server;
 pub mod sql;
@@ -203,6 +204,15 @@ pub(crate) async fn run_sql(ctx: &SessionContext, text: &str, record: bool) -> R
                 } => semantic_column::explain_refresh(ctx, &table, &name).await,
                 sql::ddl::SemanticDdl::RefreshColumn { table, name, .. } => {
                     semantic_column::refresh_column(ctx, &table, &name).await?;
+                    let no_rows = LogicalPlanBuilder::empty(false).build()?;
+                    Ok(DataFrame::new(ctx.state(), no_rows))
+                }
+                sql::ddl::SemanticDdl::RefreshView {
+                    name,
+                    explain: true,
+                } => semantic_view::explain_refresh(ctx, &name).await,
+                sql::ddl::SemanticDdl::RefreshView { name, .. } => {
+                    semantic_view::refresh_view(ctx, &name).await?;
                     let no_rows = LogicalPlanBuilder::empty(false).build()?;
                     Ok(DataFrame::new(ctx.state(), no_rows))
                 }
