@@ -488,10 +488,12 @@ impl SemanticCache for SqliteCache {
         // key read here is put again only by a query that missed it before
         // this read, a race `get` closes and this does not; the store keeps
         // its first value on disk regardless.
-        let mut committed = self.committed_many(&missing);
+        // `get`, not `remove`: a batch may ask one key twice (two rows with
+        // the same text), and every copy is answered.
+        let committed = self.committed_many(&missing);
         for (key, answer) in row_keys.iter().zip(answers.iter_mut()) {
             if answer.is_none() {
-                *answer = committed.remove(key);
+                *answer = committed.get(key).cloned();
             }
         }
         answers
@@ -804,6 +806,23 @@ mod tests {
         );
         assert_eq!(cache.get(&key("c")), None);
         assert_eq!(cache.len().unwrap(), 2);
+    }
+
+    #[test]
+    fn a_key_asked_twice_in_one_batch_is_answered_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        {
+            let cache = SqliteCache::open(&path).unwrap();
+            cache.put(key("a"), CachedValue::Value("yes".to_owned()));
+        }
+        // Reopened, so the answer is read from disk, not memory.
+        let cache = SqliteCache::open(&path).unwrap();
+        let yes = Some(CachedValue::Value("yes".to_owned()));
+        assert_eq!(
+            cache.get_many(&[key("a"), key("b"), key("a")]),
+            vec![yes.clone(), None, yes]
+        );
     }
 
     #[test]

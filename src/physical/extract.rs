@@ -253,7 +253,14 @@ impl Extractor {
                 })
             })
             .collect();
-        let mut stored = self.cache.get_many(&keys).into_iter();
+        // The store read can block on disk: keep it off the async workers.
+        let cache = Arc::clone(&self.cache);
+        let expected = keys.len();
+        let stored = tokio::task::spawn_blocking(move || cache.get_many(&keys))
+            .await
+            .map_err(|error| DataFusionError::External(Box::new(error)))?;
+        debug_assert_eq!(stored.len(), expected, "one answer per key");
+        let mut stored = stored.into_iter();
         let mut requests = Vec::new();
         let mut pending: Vec<PendingRow> = Vec::new();
 
@@ -402,6 +409,10 @@ fn decode_unit<'f>(
     unit: &[&'f FieldSpec],
     answers: Vec<Option<CachedValue>>,
 ) -> Option<Vec<(&'f str, ScalarValue)>> {
+    // A store that answered short has not answered the whole unit.
+    if answers.len() != unit.len() {
+        return None;
+    }
     unit.iter()
         .zip(answers)
         .map(|(spec, answer)| match answer {
