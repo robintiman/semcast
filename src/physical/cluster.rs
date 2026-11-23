@@ -424,7 +424,7 @@ impl Grouper {
                         // The size may have changed under the same id (a
                         // re-pulled model): forget it and probe again.
                         Err(error) => {
-                            tracing::debug!("MEANING OF: retrying with a fresh probe: {error}");
+                            tracing::warn!("MEANING OF: retrying with a fresh probe: {error}");
                             dims.lock().expect("dims lock poisoned").remove(&id);
                         }
                     }
