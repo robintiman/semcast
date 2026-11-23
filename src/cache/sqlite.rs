@@ -776,6 +776,30 @@ mod tests {
 
     const GOLDEN_TYPED_ROW_KEY: u128 = 189111490489735937782696940493731198119;
 
+    /// The same for a relevance score, pinned on the layout rank stored
+    /// before SemIR built it, so no store loses one.
+    #[test]
+    fn relevance_row_key_matches_golden_value() {
+        let model = ModelId("ollama/gemma4:e4b".to_owned());
+        let key = crate::physical::rank::relevance_cache_key(
+            "offline sync",
+            "we ship offline sync in Q3",
+            &model,
+            true,
+        );
+        let before = CacheKey {
+            type_version: "offline sync".to_owned(),
+            field: "relevance".to_owned(),
+            input_digest: stable_digest(&[b"we ship offline sync in Q3"]),
+            model_id: model,
+            prompt_version: "relevance-v1".to_owned(),
+        };
+        assert_eq!(key, before);
+        assert_eq!(u128::from_le_bytes(row_key(&key)), GOLDEN_RELEVANCE_ROW_KEY);
+    }
+
+    const GOLDEN_RELEVANCE_ROW_KEY: u128 = 291944048648181334763871151408011735218;
+
     fn key(input: &str) -> CacheKey {
         CacheKey {
             type_version: "the customer is angry".to_owned(),

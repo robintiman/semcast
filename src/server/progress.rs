@@ -99,8 +99,8 @@ pub struct FunnelCounts {
     pub has_rank: bool,
     pub rank_candidate_rows: usize,
     pub rank_rows_pruned: usize,
-    /// Rows the index has never seen. A rank drops them, so a non-zero count
-    /// means results are missing until the index is refreshed.
+    /// Rows the index has never seen. A rank scores them on their full text,
+    /// one call each, so a non-zero count is cost an index refresh saves.
     pub rank_unindexed_rows: usize,
     pub rank_model_calls: usize,
     pub rank_cache_hits: usize,
@@ -414,8 +414,8 @@ pub fn render(counts: &FunnelCounts) -> String {
         // line rather than a number buried in the funnel.
         if counts.rank_unindexed_rows > 0 {
             parts.push(format!(
-                "rank: {} rows are not in the semantic index and were skipped — \
-                 REFRESH SEMANTIC INDEX to include them",
+                "rank: {} rows are not in the semantic index and were scored on \
+                 their full text — REFRESH SEMANTIC INDEX to rank them from the index",
                 counts.rank_unindexed_rows,
             ));
         }
