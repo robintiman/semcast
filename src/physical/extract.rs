@@ -259,7 +259,17 @@ impl Extractor {
         let stored = tokio::task::spawn_blocking(move || cache.get_many(&keys))
             .await
             .map_err(|error| DataFusionError::External(Box::new(error)))?;
-        debug_assert_eq!(stored.len(), expected, "one answer per key");
+        // A store that breaks one answer per key can't be lined up with the
+        // keys at all: ask everything rather than misread a field.
+        let stored = if stored.len() == expected {
+            stored
+        } else {
+            tracing::warn!(
+                "store answered {} of {expected} extraction keys; asking the model",
+                stored.len()
+            );
+            vec![None; expected]
+        };
         let mut stored = stored.into_iter();
         let mut requests = Vec::new();
         let mut pending: Vec<PendingRow> = Vec::new();
