@@ -87,12 +87,12 @@ fn relevance_aliases(query: &Query) -> Vec<String> {
 }
 
 /// The name an identifier resolves to: as written when quoted, folded to
-/// lower case when not, as DataFusion resolves it.
+/// ASCII lower case when not, as DataFusion resolves it.
 fn resolved(ident: &Ident) -> String {
     if ident.quote_style.is_some() {
         ident.value.clone()
     } else {
-        ident.value.to_lowercase()
+        ident.value.to_ascii_lowercase()
     }
 }
 
