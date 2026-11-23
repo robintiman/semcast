@@ -37,6 +37,7 @@ use serde_json::Value;
 use crate::cache::{CacheKey, CachedValue, SemanticCache};
 use crate::logical::sem_extract::output_column_name;
 use crate::model::{CompletionRequest, ModelId, ModelProvider};
+use crate::semir::{typed_answer_key, typed_unit};
 use crate::types::{EXTRACT_PROMPT_VERSION, FieldSpec, FieldType, SemanticType, unit_hash};
 
 /// Per-row `max_tokens` for an extraction request. Typed JSON is compact; this
@@ -235,18 +236,33 @@ impl Extractor {
         }
 
         let units = self.target.generation_units();
+        let unit_ids: Vec<String> = units
+            .iter()
+            .map(|unit| typed_unit(&self.target.name, unit_hash(unit)))
+            .collect();
+        // Every field of every unit of every row, in one store read. NULL
+        // source never reaches the model — all its fields stay NULL.
+        let asked: Vec<usize> = (0..rows).filter(|&row| texts.is_valid(row)).collect();
+        let keys: Vec<CacheKey> = asked
+            .iter()
+            .flat_map(|&row| {
+                let text = texts.value(row);
+                units.iter().zip(&unit_ids).flat_map(move |(unit, id)| {
+                    unit.iter()
+                        .map(move |spec| self.cache_key(id, &spec.name, text))
+                })
+            })
+            .collect();
+        let mut stored = self.cache.get_many(&keys).into_iter();
         let mut requests = Vec::new();
         let mut pending: Vec<PendingRow> = Vec::new();
 
-        for row in 0..rows {
-            // NULL source never reaches the model — all fields stay NULL.
-            if !texts.is_valid(row) {
-                continue;
-            }
+        for row in asked {
             let text = texts.value(row);
             let mut pending_units = Vec::new();
             for (unit_idx, unit) in units.iter().enumerate() {
-                match self.read_unit(unit, text) {
+                let answers: Vec<Option<CachedValue>> = stored.by_ref().take(unit.len()).collect();
+                match decode_unit(unit, answers) {
                     Some(hits) => {
                         self.cache_hits.add(unit.len());
                         for (name, scalar) in hits {
@@ -302,7 +318,13 @@ impl Extractor {
                 continue;
             };
             for &unit_idx in &pending_row.pending_units {
-                self.apply_unit(&units[unit_idx], &object, pending_row, &mut values);
+                self.apply_unit(
+                    &units[unit_idx],
+                    &unit_ids[unit_idx],
+                    &object,
+                    pending_row,
+                    &mut values,
+                );
             }
         }
 
@@ -319,34 +341,12 @@ impl Extractor {
         )?)
     }
 
-    /// Read a whole unit from the cache — all members must hit, or it is
-    /// pending. Returns the decoded `(field, value)` pairs on a full hit.
-    fn read_unit<'f>(
-        &self,
-        unit: &[&'f FieldSpec],
-        text: &str,
-    ) -> Option<Vec<(&'f str, ScalarValue)>> {
-        let mut hits = Vec::with_capacity(unit.len());
-        for spec in unit {
-            match self.cache.get(&self.cache_key(unit, &spec.name, text)) {
-                Some(CachedValue::Value(raw)) => {
-                    let normalized: Value = serde_json::from_str(&raw).ok()?;
-                    hits.push((
-                        spec.name.as_str(),
-                        scalar_from_normalized(&spec.ty, &normalized),
-                    ));
-                }
-                _ => return None,
-            }
-        }
-        Some(hits)
-    }
-
     /// Decode and validate one unit's fields from the model's JSON object,
     /// writing the values and caching the unit only if every member validated.
     fn apply_unit(
         &self,
         unit: &[&FieldSpec],
+        unit_id: &str,
         object: &serde_json::Map<String, Value>,
         pending_row: &PendingRow,
         values: &mut HashMap<&str, Vec<ScalarValue>>,
@@ -380,7 +380,7 @@ impl Extractor {
                     .iter()
                     .map(|(spec, normalized)| {
                         (
-                            self.cache_key(unit, &spec.name, &pending_row.text),
+                            self.cache_key(unit_id, &spec.name, &pending_row.text),
                             CachedValue::Value(normalized.to_string()),
                         )
                     })
@@ -389,16 +389,32 @@ impl Extractor {
         }
     }
 
-    /// Provenance: per-unit type hash + field + input + model + prompt scheme.
-    fn cache_key(&self, unit: &[&FieldSpec], field: &str, text: &str) -> CacheKey {
-        CacheKey {
-            type_version: format!("{}@{:x}", self.target.name, unit_hash(unit)),
-            field: field.to_owned(),
-            input_digest: crate::cache::stable_digest(&[text.as_bytes()]),
-            model_id: self.model_id.clone(),
-            prompt_version: EXTRACT_PROMPT_VERSION.to_owned(),
-        }
+    /// One field of the typed `ASK` for `unit_id` ([`typed_unit`]) about `text`.
+    fn cache_key(&self, unit_id: &str, field: &str, text: &str) -> CacheKey {
+        typed_answer_key(unit_id, field, text, &self.model_id, EXTRACT_PROMPT_VERSION)
     }
+}
+
+/// A whole unit from its stored answers, one per member in order — all
+/// must be present, or it is pending. The decoded `(field, value)` pairs on
+/// a full hit.
+fn decode_unit<'f>(
+    unit: &[&'f FieldSpec],
+    answers: Vec<Option<CachedValue>>,
+) -> Option<Vec<(&'f str, ScalarValue)>> {
+    unit.iter()
+        .zip(answers)
+        .map(|(spec, answer)| match answer {
+            Some(CachedValue::Value(raw)) => {
+                let normalized: Value = serde_json::from_str(&raw).ok()?;
+                Some((
+                    spec.name.as_str(),
+                    scalar_from_normalized(&spec.ty, &normalized),
+                ))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// Parse the model's response into a JSON object, tolerating a Markdown code

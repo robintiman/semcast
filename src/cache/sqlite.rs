@@ -749,6 +749,31 @@ mod tests {
 
     const GOLDEN_ROW_KEY: u128 = 137170530867284571163207860107501048400;
 
+    /// The same for one field of a typed answer, pinned on the layout
+    /// extraction stored before SemIR built it, so no store loses one.
+    #[test]
+    fn typed_row_key_matches_golden_value() {
+        let model = ModelId("ollama/gemma4:e4b".to_owned());
+        let key = crate::semir::typed_answer_key(
+            &crate::semir::typed_unit("meeting_facts", 0x1234_abcd),
+            "launch_stage",
+            "we ship in Q3",
+            &model,
+            crate::types::EXTRACT_PROMPT_VERSION,
+        );
+        let before = CacheKey {
+            type_version: format!("{}@{:x}", "meeting_facts", 0x1234_abcd_u128),
+            field: "launch_stage".to_owned(),
+            input_digest: stable_digest(&[b"we ship in Q3"]),
+            model_id: model,
+            prompt_version: "extract-v1".to_owned(),
+        };
+        assert_eq!(key, before);
+        assert_eq!(u128::from_le_bytes(row_key(&key)), GOLDEN_TYPED_ROW_KEY);
+    }
+
+    const GOLDEN_TYPED_ROW_KEY: u128 = 189111490489735937782696940493731198119;
+
     fn key(input: &str) -> CacheKey {
         CacheKey {
             type_version: "the customer is angry".to_owned(),

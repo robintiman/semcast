@@ -115,8 +115,9 @@ wrapper (`catalog::is_memory_table`).
 plan (DataFusion keeps the SQL front end). Every semantic question is an
 `ASK(input, instruction, type)`: its `expr_id` names the question (normalized
 instruction, type, model, prompt version, not the input), and its answer key
-adds a digest of the input text, which is the verdict store's row key. Today
-only `MEANS` (`AskType::Bool`) is on it.
+adds a digest of the input text, which is the verdict store's row key. On it:
+`MEANS` (`AskType::Bool`) and typed extraction (`AskType::Typed`, one
+`ASK` per generation unit, each field stored under `typed_answer_key`).
 
 ### The funnel
 
