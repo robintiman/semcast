@@ -222,8 +222,9 @@ memory without `--store`), and gives `MEANS`
 a cheap stage: one embedding call per query prunes non-candidates by vector
 similarity, and the verify model reads only the survivors. Under `WITH
 RECALL` it may read each survivor's top-3 chunks instead of the whole
-document (see below). Optional for `MEANS`, `RELEVANCE TO` and `GROUP BY
-MEANING OF` but highly recommended; required by `SEMANTIC DISTINCT ON`.
+document (see below). Optional, but highly recommended: without one,
+`MEANS` asks about every row, `RELEVANCE TO` scores every row, and `GROUP BY
+MEANING OF` and `SEMANTIC DISTINCT ON` embed the column at query time.
 
 No `DROP` or `REFRESH` yet: run it again to rebuild after a load.
 
@@ -492,8 +493,8 @@ SELECT SEMANTIC DISTINCT ON (<text_column>) ... [WITH SIMILARITY <fraction>]
 ```
 
 Collapses rows that say the same thing. The cheapest thing semcast does —
-**no model calls at all**: the index already knows how alike two documents
-are, and "duplicate" is a threshold on that.
+**no model calls at all**: document vectors say how alike two documents are,
+and "duplicate" is a threshold on that.
 
 `WITH SIMILARITY` sets that threshold, defaulting to `0.9`. Higher is
 stricter. Otherwise this is Postgres's `DISTINCT ON`: one row survives per
@@ -511,9 +512,12 @@ WITH SIMILARITY 0.8;
   5 | an outage took the dashboard down for an hour
 ```
 
-A semantic index is required. Rows it hasn't seen fall back to exact-match
-dedupe rather than being collapsed on a guess — an index gap leaves
-duplicates in, never data out.
+With a semantic index, the vectors it paid for are read back; without one
+(or over a computed column), the column is embedded the way an index would
+be, and the chunk vectors are stored for the next query; if the embedder
+fails, the query fails. Rows an index hasn't seen are embedded for the query
+too; if that fails, they fall back to exact-match dedupe rather than being
+collapsed on a guess — duplicates stay in, never data out.
 
 #### `CREATE SEMANTIC TYPE`
 

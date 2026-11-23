@@ -77,10 +77,14 @@ pub struct FunnelCounts {
     pub has_distinct: bool,
     pub distinct_groups: usize,
     pub distinct_duplicate_rows: usize,
-    /// Rows the index has never seen. Dedupe gives them a NULL key, and NULL
-    /// never equals NULL, so they all survive — duplicates stay in rather
-    /// than data going out.
+    /// Rows the index has never seen. Dedupe embeds them for the query, so a
+    /// non-zero count is embedding cost an index rebuild saves.
     pub distinct_unindexed_rows: usize,
+    /// Documents vectored for the query with no index over the column.
+    pub distinct_docs_vectored: usize,
+    /// Documents a stale index lacked whose embedding failed: exact-match
+    /// dedupe only.
+    pub distinct_docs_unembedded: usize,
     pub has_cluster: bool,
     pub cluster_groups: usize,
     pub cluster_model_calls: usize,
@@ -213,6 +217,8 @@ pub fn snapshot(plan: &Arc<dyn ExecutionPlan>) -> FunnelCounts {
                     counts.distinct_groups += counter_total(&metrics, "groups");
                     counts.distinct_duplicate_rows += counter_total(&metrics, "duplicate_rows");
                     counts.distinct_unindexed_rows += counter_total(&metrics, "unindexed_rows");
+                    counts.distinct_docs_vectored += counter_total(&metrics, "docs_vectored");
+                    counts.distinct_docs_unembedded += counter_total(&metrics, "docs_unembedded");
                 }
             }
             "SemClusterExec" => {
@@ -361,10 +367,25 @@ pub fn render(counts: &FunnelCounts) -> String {
             "dedupe: {} distinct, {} duplicates collapsed",
             counts.distinct_groups, counts.distinct_duplicate_rows,
         ));
+        if counts.distinct_docs_vectored > 0 {
+            parts.push(format!(
+                "dedupe: no semantic index, so {} documents were vectored for this \
+                 query (stored chunk vectors are read back, the rest embedded)",
+                counts.distinct_docs_vectored,
+            ));
+        }
+        if counts.distinct_docs_unembedded > 0 {
+            parts.push(format!(
+                "dedupe: embedding {} documents the semantic index lacks failed; only \
+                 their exact copies were collapsed — check the embedder, then re-run \
+                 CREATE SEMANTIC INDEX",
+                counts.distinct_docs_unembedded,
+            ));
+        }
         if counts.distinct_unindexed_rows > 0 {
             parts.push(format!(
-                "dedupe: {} rows are not in the semantic index and were left as-is — \
-                 re-run CREATE SEMANTIC INDEX to deduplicate them",
+                "dedupe: {} rows are not in the semantic index and were embedded \
+                 for this query — re-run CREATE SEMANTIC INDEX to read them from it",
                 counts.distinct_unindexed_rows,
             ));
         }
@@ -389,7 +410,8 @@ pub fn render(counts: &FunnelCounts) -> String {
         if counts.cluster_docs_unembedded > 0 {
             parts.push(format!(
                 "cluster: embedding {} documents the semantic index lacks failed; \
-                 their rows have no group — re-run CREATE SEMANTIC INDEX",
+                 their rows have no group — check the embedder, then re-run CREATE \
+                 SEMANTIC INDEX",
                 counts.cluster_docs_unembedded,
             ));
         }

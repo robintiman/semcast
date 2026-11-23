@@ -800,6 +800,26 @@ mod tests {
 
     const GOLDEN_RELEVANCE_ROW_KEY: u128 = 291944048648181334763871151408011735218;
 
+    /// The same for a cluster label, pinned on the layout cluster stored
+    /// before SemIR built it.
+    #[test]
+    fn cluster_label_row_key_matches_golden_value() {
+        let model = ModelId("ollama/gemma4:e4b".to_owned());
+        let members = stable_digest(&[&1u64.to_le_bytes(), &2u64.to_le_bytes()]);
+        let key = crate::physical::cluster::cluster_label_key(members, &model);
+        let before = CacheKey {
+            type_version: "cluster".to_owned(),
+            field: "label".to_owned(),
+            input_digest: members,
+            model_id: model,
+            prompt_version: "cluster-v1".to_owned(),
+        };
+        assert_eq!(key, before);
+        assert_eq!(u128::from_le_bytes(row_key(&key)), GOLDEN_LABEL_ROW_KEY);
+    }
+
+    const GOLDEN_LABEL_ROW_KEY: u128 = 308613733850477786867294982195544815604;
+
     fn key(input: &str) -> CacheKey {
         CacheKey {
             type_version: "the customer is angry".to_owned(),
