@@ -23,7 +23,7 @@ use std::ops::ControlFlow;
 use datafusion::sql::parser::Statement;
 use datafusion::sql::sqlparser::ast::{
     Expr, Function, FunctionArguments, Ident, ObjectName, OrderByKind, Query, SelectItem, SetExpr,
-    VisitMut, VisitorMut,
+    TableFactor, VisitMut, VisitorMut, visit_expressions,
 };
 
 use crate::sql::rank_udf::RELEVANCE_UDF_NAME;
@@ -54,8 +54,7 @@ impl VisitorMut for RelevanceDesc {
         {
             for item in items {
                 let call = is_relevance_call(&item.expr);
-                let alias = matches!(&item.expr, Expr::Identifier(ident)
-                    if aliases.contains(&resolved(ident)));
+                let alias = aliases.names(&item.expr);
                 if call && item.options.asc.is_none() {
                     item.options.asc = Some(false);
                 }
@@ -68,22 +67,122 @@ impl VisitorMut for RelevanceDesc {
     }
 }
 
-/// The select-list aliases of `relevance()` calls in `query`'s own
-/// `SELECT`: what an `ORDER BY score` can mean.
-fn relevance_aliases(query: &Query) -> Vec<String> {
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        return Vec::new();
-    };
-    select
-        .projection
-        .iter()
-        .filter_map(|item| match item {
-            SelectItem::ExprWithAlias { expr, alias } if is_relevance_call(expr) => {
-                Some(resolved(alias))
+/// The names an `ORDER BY` in `query` can use for a relevance score: the
+/// query's own select-list aliases of an expression over `relevance()`, and
+/// those a derived table or CTE in its `FROM` exposes, plain or qualified by
+/// the table's name. An own select item of the same name that isn't a score
+/// shadows a table's.
+#[derive(Default)]
+struct RelevanceAliases {
+    /// Own select-list aliases of a score.
+    own: Vec<String>,
+    /// Own select-list aliases of anything else.
+    shadowed: Vec<String>,
+    /// (table name, column) a `FROM` item exposes a score as.
+    tables: Vec<(String, String)>,
+}
+
+impl RelevanceAliases {
+    /// Whether `expr` names a relevance score.
+    fn names(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Identifier(ident) => {
+                let name = resolved(ident);
+                self.own.contains(&name)
+                    || (!self.shadowed.contains(&name)
+                        && self.tables.iter().any(|(_, column)| *column == name))
             }
-            _ => None,
-        })
-        .collect()
+            Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+                let (table, column) = (resolved(&parts[0]), resolved(&parts[1]));
+                self.tables.iter().any(|t| t.0 == table && t.1 == column)
+            }
+            _ => false,
+        }
+    }
+}
+
+fn relevance_aliases(query: &Query) -> RelevanceAliases {
+    let mut aliases = RelevanceAliases::default();
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return aliases;
+    };
+    for item in &select.projection {
+        if let SelectItem::ExprWithAlias { expr, alias } = item {
+            if contains_relevance_call(expr) {
+                aliases.own.push(resolved(alias));
+            } else {
+                aliases.shadowed.push(resolved(alias));
+            }
+        }
+    }
+    let ctes: Vec<(String, &Query)> = query
+        .with
+        .iter()
+        .flat_map(|with| &with.cte_tables)
+        .map(|cte| (resolved(&cte.alias.name), cte.query.as_ref()))
+        .collect();
+    let factors = select.from.iter().flat_map(|from| {
+        std::iter::once(&from.relation).chain(from.joins.iter().map(|j| &j.relation))
+    });
+    for factor in factors {
+        let (table, body) = match factor {
+            TableFactor::Derived {
+                subquery,
+                alias: Some(alias),
+                ..
+            } => (resolved(&alias.name), subquery.as_ref()),
+            TableFactor::Table { name, alias, .. } => {
+                let [part] = name.0.as_slice() else { continue };
+                let Some(ident) = part.as_ident() else {
+                    continue;
+                };
+                let Some((_, body)) = ctes.iter().find(|(cte, _)| *cte == resolved(ident)) else {
+                    continue;
+                };
+                let table = alias
+                    .as_ref()
+                    .map_or_else(|| resolved(ident), |a| resolved(&a.name));
+                (table, *body)
+            }
+            _ => continue,
+        };
+        let inner = relevance_aliases(body);
+        // What the body's own `FROM` exposes reaches here only through a `*`.
+        let passed = if selects_everything(body) {
+            inner.tables
+        } else {
+            Vec::new()
+        };
+        for column in inner.own.into_iter().chain(passed.into_iter().map(|t| t.1)) {
+            aliases.tables.push((table.clone(), column));
+        }
+    }
+    aliases
+}
+
+/// Whether `query`'s select list passes its `FROM`'s columns through (`*`).
+fn selects_everything(query: &Query) -> bool {
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return false;
+    };
+    select.projection.iter().any(|item| {
+        matches!(
+            item,
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..)
+        )
+    })
+}
+
+/// Whether `expr` reads a `relevance()` score anywhere inside it.
+fn contains_relevance_call(expr: &Expr) -> bool {
+    visit_expressions(expr, |e| {
+        if is_relevance_call(e) {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    })
+    .is_break()
 }
 
 /// The name an identifier resolves to: as written when quoted, folded to
@@ -175,6 +274,41 @@ mod tests {
             "SELECT relevance(body, 'x') AS \"Score\", score FROM t ORDER BY score DESC LIMIT 5",
             "a quoted alias names only itself"
         );
+    }
+
+    #[test]
+    fn a_score_from_a_derived_table_or_cte_sorts_nulls_last() {
+        let cases = [
+            (
+                "SELECT * FROM (SELECT id, relevance(b, 'x') AS s FROM t) AS q ORDER BY s DESC LIMIT 5",
+                "SELECT * FROM (SELECT id, relevance(b, 'x') AS s FROM t) AS q ORDER BY s DESC NULLS LAST LIMIT 5",
+            ),
+            (
+                "SELECT * FROM (SELECT id, relevance(b, 'x') AS s FROM t) AS q ORDER BY q.s DESC LIMIT 5",
+                "SELECT * FROM (SELECT id, relevance(b, 'x') AS s FROM t) AS q ORDER BY q.s DESC NULLS LAST LIMIT 5",
+            ),
+            (
+                "WITH r AS (SELECT id, ROUND(relevance(b, 'x'), 2) AS s FROM t) SELECT * FROM r ORDER BY s DESC LIMIT 5",
+                "WITH r AS (SELECT id, ROUND(relevance(b, 'x'), 2) AS s FROM t) SELECT * FROM r ORDER BY s DESC NULLS LAST LIMIT 5",
+            ),
+            (
+                "SELECT * FROM (SELECT * FROM (SELECT relevance(b, 'x') AS s FROM t) AS a) AS q ORDER BY s DESC LIMIT 5",
+                "SELECT * FROM (SELECT * FROM (SELECT relevance(b, 'x') AS s FROM t) AS a) AS q ORDER BY s DESC NULLS LAST LIMIT 5",
+            ),
+        ];
+        for (sql, expected) in cases {
+            assert_eq!(rewrite(sql), expected);
+        }
+    }
+
+    #[test]
+    fn a_name_that_is_not_the_score_is_untouched() {
+        // The outer select's own `s` shadows the table's score.
+        let sql = "SELECT b AS s FROM (SELECT b, relevance(b, 'x') AS s FROM t) AS q ORDER BY s DESC LIMIT 5";
+        assert_eq!(rewrite(sql), sql);
+        // The middle query doesn't pass the inner score through.
+        let sql = "SELECT * FROM (SELECT id FROM (SELECT id, relevance(b, 'x') AS s FROM t) AS a) AS q, u ORDER BY s DESC LIMIT 5";
+        assert_eq!(rewrite(sql), sql);
     }
 
     #[test]

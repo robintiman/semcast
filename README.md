@@ -423,10 +423,12 @@ the index is rebuilt.
 Without an index (or over a computed expression), every row is scored on its
 full text: one model call per distinct text, an exact top-`k`.
 
-A NULL text, or a row the model failed to score, gets a NULL score. Ordered
-by the `RELEVANCE TO`/`relevance()` itself or its select-list alias, it
-sorts last unless the query says `NULLS FIRST`; ordered from an outer query,
-write `NULLS LAST`. An index is found by table name: rank `FROM meetings`,
+A NULL text, or a row the model failed to score, gets a NULL score, which
+sorts last unless the query says `NULLS FIRST`: ordered by the `RELEVANCE
+TO`/`relevance()` itself, by a select-list alias of an expression over it,
+or by such an alias from a subquery or CTE in the `FROM`. Ordering by
+position (`ORDER BY 2`) or across a `UNION` takes SQL's default; write
+`NULLS LAST` there. An index is found by table name: rank `FROM meetings`,
 not `FROM meetings m … m.transcript`, or every row is scored on its full
 text.
 
