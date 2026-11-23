@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, Int64Array, RecordBatch, StringArray};
 use datafusion::execution::context::SessionContext;
-use semcast::model::{CompletionRequest, MockModel};
+use semcast::model::{CompletionRequest, MockModel, ModelProvider};
 use semcast::{IndexOptions, create_semantic_index, semcast_context};
 use serde_json::{Value, json};
 
@@ -503,5 +503,34 @@ async fn into_zero_is_a_parse_error() {
     assert!(
         message.contains("positive number of groups"),
         "INTO 0 must be rejected on its own terms, not as a parse failure: {message}"
+    );
+}
+
+#[tokio::test]
+async fn a_stale_embedder_size_is_probed_again() {
+    let model = clustering_model();
+    let (indexed, _dir) = notes_context(Arc::clone(&model)).await;
+    let with_index = groups(&indexed, BY_THEME).await;
+
+    let model = clustering_model();
+    let ctx = semcast_context(Arc::clone(&model) as _);
+    notes_table(&ctx).await;
+    let runtime = ctx
+        .state()
+        .config()
+        .get_extension::<semcast::index::registry::SemcastRuntime>()
+        .unwrap();
+    // As if the model behind the same id had changed size.
+    runtime
+        .embed_dims()
+        .lock()
+        .unwrap()
+        .insert(model.embed_id().0, 7);
+
+    assert_eq!(groups(&ctx, BY_THEME).await, with_index);
+    assert_ne!(
+        runtime.embed_dims().lock().unwrap()[&model.embed_id().0],
+        7,
+        "the size seen now replaces the stale one"
     );
 }

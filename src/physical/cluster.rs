@@ -43,7 +43,7 @@ use futures::TryStreamExt;
 use crate::cache::{CacheKey, CachedValue, SemanticCache};
 use crate::index::chunk::ChunkConfig;
 use crate::index::kmeans::{self, Clustering};
-use crate::index::stored::{ChunkStore, StoredIndex};
+use crate::index::stored::{ChunkStore, StoredIndex, VECTORS_OF_BATCH};
 use crate::index::{SearchParams, SemanticIndex, doc_hash};
 use crate::logical::sem_cluster::REPRESENTATIVES_PER_CLUSTER;
 use crate::model::{CompletionRequest, Embedding, ModelId, ModelProvider};
@@ -243,7 +243,7 @@ impl ExecutionPlan for SemClusterExec {
                 .counter("model_calls_merged", partition),
             cache_hits: MetricBuilder::new(&self.metrics).counter("cache_hits", partition),
             unindexed_rows: MetricBuilder::new(&self.metrics).counter("unindexed_rows", partition),
-            docs_embedded: MetricBuilder::new(&self.metrics).counter("docs_embedded", partition),
+            docs_vectored: MetricBuilder::new(&self.metrics).counter("docs_vectored", partition),
             docs_unembedded: MetricBuilder::new(&self.metrics)
                 .counter("docs_unembedded", partition),
             labels_failed: MetricBuilder::new(&self.metrics).counter("labels_failed", partition),
@@ -296,7 +296,7 @@ struct Grouper {
     unindexed_rows: Count,
     /// Documents whose vector was built for this query (no index): chunk
     /// vectors already stored are read back, the rest embedded.
-    docs_embedded: Count,
+    docs_vectored: Count,
     /// Documents a stale index lacked whose embedding failed: no group.
     docs_unembedded: Count,
     labels_failed: Count,
@@ -368,26 +368,31 @@ impl Grouper {
                     .copied()
                     .filter(|hash| !vectors.contains_key(hash))
                     .collect();
-                if missing.is_empty() {
-                    return Ok(vectors);
-                }
-                let wanted = missing.iter().map(|hash| texts[hash].clone()).collect();
-                match index.vectors_of(wanted).await {
-                    Ok(built) => {
-                        for hash in &missing {
-                            if built.contains_key(hash) {
-                                self.unindexed_rows.add(rows[hash]);
+                // In batches, so one failure leaves only its own batch
+                // ungrouped; what the rest stored is read back next time.
+                for batch in missing.chunks(VECTORS_OF_BATCH) {
+                    let wanted = batch.iter().map(|hash| texts[hash].clone()).collect();
+                    match index.vectors_of(wanted).await {
+                        Ok(built) => {
+                            for hash in batch {
+                                if built.contains_key(hash) {
+                                    self.unindexed_rows.add(rows[hash]);
+                                }
                             }
+                            vectors.extend(built);
                         }
-                        vectors.extend(built);
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            "MEANING OF: embedding {} documents the index lacks failed, \
-                             leaving them ungrouped: {error}",
-                            missing.len()
-                        );
-                        self.docs_unembedded.add(missing.len());
+                        Err(error) => {
+                            // An empty text never had a vector to lose.
+                            let lost = batch
+                                .iter()
+                                .filter(|hash| !texts[*hash].trim().is_empty())
+                                .count();
+                            tracing::warn!(
+                                "MEANING OF: embedding {lost} documents the index lacks \
+                                 failed, leaving them ungrouped: {error}"
+                            );
+                            self.docs_unembedded.add(lost);
+                        }
                     }
                 }
                 Ok(vectors)
@@ -397,41 +402,46 @@ impl Grouper {
                 store,
                 dims,
             } => {
-                let known = dims
-                    .lock()
-                    .expect("dims lock poisoned")
-                    .get(&embedder.embed_id().0)
-                    .copied();
-                // A scratch index adds nothing to the store's indexes: it
-                // only chunks and embeds as an index build would.
-                let scratch = match known {
-                    Some(dim) => StoredIndex::open(
+                let wanted: Vec<String> = hashes.iter().map(|hash| texts[hash].clone()).collect();
+                let id = embedder.embed_id().0;
+                let known = dims.lock().expect("dims lock poisoned").get(&id).copied();
+                if let Some(dim) = known {
+                    // A scratch index adds nothing to the store's indexes:
+                    // it only chunks and embeds as an index build would.
+                    let scratch = StoredIndex::open(
                         "",
                         Arc::clone(store),
                         Arc::clone(embedder),
                         ChunkConfig::default(),
                         SearchParams::default(),
                         dim,
-                    ),
-                    None => {
-                        let scratch = StoredIndex::create(
-                            "",
-                            Arc::clone(store),
-                            Arc::clone(embedder),
-                            ChunkConfig::default(),
-                            SearchParams::default(),
-                        )
-                        .await?;
-                        dims.lock()
-                            .expect("dims lock poisoned")
-                            .insert(embedder.embed_id().0, scratch.dim());
-                        scratch
+                    );
+                    match scratch.vectors_of(wanted.clone()).await {
+                        Ok(built) => {
+                            self.docs_vectored.add(built.len());
+                            return Ok(built);
+                        }
+                        // The size may have changed under the same id (a
+                        // re-pulled model): forget it and probe again.
+                        Err(error) => {
+                            tracing::debug!("MEANING OF: retrying with a fresh probe: {error}");
+                            dims.lock().expect("dims lock poisoned").remove(&id);
+                        }
                     }
-                };
-                let built = scratch
-                    .vectors_of(hashes.iter().map(|hash| texts[hash].clone()).collect())
-                    .await?;
-                self.docs_embedded.add(built.len());
+                }
+                let scratch = StoredIndex::create(
+                    "",
+                    Arc::clone(store),
+                    Arc::clone(embedder),
+                    ChunkConfig::default(),
+                    SearchParams::default(),
+                )
+                .await?;
+                let built = scratch.vectors_of(wanted).await?;
+                dims.lock()
+                    .expect("dims lock poisoned")
+                    .insert(id, scratch.dim());
+                self.docs_vectored.add(built.len());
                 Ok(built)
             }
         }

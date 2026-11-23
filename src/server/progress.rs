@@ -89,7 +89,7 @@ pub struct FunnelCounts {
     /// so a non-zero count is embedding cost an index rebuild saves.
     pub cluster_unindexed_rows: usize,
     /// Documents vectored for the query with no index over the column.
-    pub cluster_docs_embedded: usize,
+    pub cluster_docs_vectored: usize,
     /// Documents a stale index lacked whose embedding failed: no group.
     pub cluster_docs_unembedded: usize,
     pub cluster_labels_failed: usize,
@@ -222,7 +222,7 @@ pub fn snapshot(plan: &Arc<dyn ExecutionPlan>) -> FunnelCounts {
                     counts.cluster_model_calls += sent_calls(&metrics, "model_calls");
                     counts.cluster_cache_hits += counter_total(&metrics, "cache_hits");
                     counts.cluster_unindexed_rows += counter_total(&metrics, "unindexed_rows");
-                    counts.cluster_docs_embedded += counter_total(&metrics, "docs_embedded");
+                    counts.cluster_docs_vectored += counter_total(&metrics, "docs_vectored");
                     counts.cluster_docs_unembedded += counter_total(&metrics, "docs_unembedded");
                     counts.cluster_labels_failed += counter_total(&metrics, "labels_failed");
                 }
@@ -377,11 +377,11 @@ pub fn render(counts: &FunnelCounts) -> String {
             counts.cluster_cache_hits,
             counts.cluster_labels_failed,
         ));
-        if counts.cluster_docs_embedded > 0 {
+        if counts.cluster_docs_vectored > 0 {
             parts.push(format!(
                 "cluster: no semantic index, so {} documents were vectored for this \
                  query (stored chunk vectors are read back, the rest embedded)",
-                counts.cluster_docs_embedded,
+                counts.cluster_docs_vectored,
             ));
         }
         // Rows an index should have covered cost embedding, or a group when

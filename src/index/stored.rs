@@ -42,7 +42,7 @@ const DIM_PROBE: &str = "semcast embedding dimension probe";
 const WRITE_BATCH: usize = 2_000;
 
 /// Most documents [`StoredIndex::vectors_of`] chunks and embeds at once.
-const VECTORS_OF_BATCH: usize = 512;
+pub const VECTORS_OF_BATCH: usize = 512;
 
 /// Most keys one batched vector read binds.
 const MAX_READ_BATCH: usize = 512;
@@ -525,7 +525,7 @@ impl StoredIndex {
 
     /// Chunk `texts` and make sure every chunk has a stored vector.
     async fn chunk(&self, texts: Vec<String>) -> Result<(usize, Vec<StoredChunk>)> {
-        let (docs, chunks, _) = self.chunk_with_vectors(texts).await?;
+        let (docs, chunks, _) = self.chunk_and_embed(texts, false).await?;
         Ok((docs, chunks))
     }
 
@@ -533,6 +533,14 @@ impl StoredIndex {
     async fn chunk_with_vectors(
         &self,
         texts: Vec<String>,
+    ) -> Result<(usize, Vec<StoredChunk>, Vec<Embedding>)> {
+        self.chunk_and_embed(texts, true).await
+    }
+
+    async fn chunk_and_embed(
+        &self,
+        texts: Vec<String>,
+        collect: bool,
     ) -> Result<(usize, Vec<StoredChunk>, Vec<Embedding>)> {
         let mut chunk_texts = Vec::new();
         let mut placements = Vec::new();
@@ -557,7 +565,7 @@ impl StoredIndex {
             .iter()
             .map(|text| embedding_key(&model, self.dim, text))
             .collect();
-        let vectors = self.ensure_vectors(&chunk_texts, &keys).await?;
+        let vectors = self.ensure_vectors(&chunk_texts, &keys, collect).await?;
         let chunks = placements
             .into_iter()
             .zip(chunk_texts)
@@ -575,9 +583,15 @@ impl StoredIndex {
         Ok((docs, chunks, vectors))
     }
 
-    /// Embed (and store) every chunk the store has no vector for, and
-    /// return every chunk's vector, in order.
-    async fn ensure_vectors(&self, texts: &[String], keys: &[[u8; 16]]) -> Result<Vec<Embedding>> {
+    /// Embed (and store) every chunk the store has no vector for. With
+    /// `collect`, also return every chunk's vector in order; without, a
+    /// build holds one embed batch at a time, not the corpus.
+    async fn ensure_vectors(
+        &self,
+        texts: &[String],
+        keys: &[[u8; 16]],
+        collect: bool,
+    ) -> Result<Vec<Embedding>> {
         let model = self.embedder.embed_id();
         let store = Arc::clone(&self.store);
         let lookup = keys.to_vec();
@@ -600,41 +614,59 @@ impl StoredIndex {
                 )));
             }
             if let Some(vector) = embedded.iter().find(|vector| vector.len() != self.dim) {
-                return Err(SemcastError::Index(format!(
-                    "embedder {} returned dimension {}, the index stores {}; recreate the \
-                     index with CREATE SEMANTIC INDEX",
-                    model.0,
-                    vector.len(),
-                    self.dim
-                )));
+                return Err(SemcastError::Index(if self.name.is_empty() {
+                    format!(
+                        "embedder {} returned dimension {}, {} expected",
+                        model.0,
+                        vector.len(),
+                        self.dim
+                    )
+                } else {
+                    format!(
+                        "embedder {} returned dimension {}, the index stores {}; recreate \
+                         the index with CREATE SEMANTIC INDEX",
+                        model.0,
+                        vector.len(),
+                        self.dim
+                    )
+                }));
             }
             let fresh: Vec<([u8; 16], Embedding)> =
                 batch.iter().map(|&i| keys[i]).zip(embedded).collect();
-            for (&i, (_, vector)) in batch.iter().zip(&fresh) {
-                stored[i] = Some(vector.clone());
-            }
             let store = Arc::clone(&self.store);
             let model = model.clone();
-            blocking(move || store.put_vectors(&model, &fresh)).await?;
+            let fresh = blocking(move || {
+                store.put_vectors(&model, &fresh)?;
+                Ok(fresh)
+            })
+            .await?;
+            if collect {
+                for (&i, (_, vector)) in batch.iter().zip(fresh) {
+                    stored[i] = Some(vector);
+                }
+            }
+        }
+        if !collect {
+            return Ok(Vec::new());
         }
         // A key repeated within `texts` was embedded once, at its first
-        // position: fill the later ones from it.
+        // position: later positions copy it from there.
         let mut first: HashMap<[u8; 16], usize> = HashMap::new();
+        let mut vectors: Vec<Embedding> = Vec::with_capacity(keys.len());
         for (i, key) in keys.iter().enumerate() {
-            first.entry(*key).or_insert(i);
+            let at = *first.entry(*key).or_insert(i);
+            let vector = match stored[i].take() {
+                Some(vector) => vector,
+                None if at < i => vectors[at].clone(),
+                None => {
+                    return Err(SemcastError::Index(format!(
+                        "the store lost the vector of chunk {i} as it was written"
+                    )));
+                }
+            };
+            vectors.push(vector);
         }
-        (0..keys.len())
-            .map(|i| {
-                stored[i]
-                    .clone()
-                    .or_else(|| stored[first[&keys[i]]].clone())
-                    .ok_or_else(|| {
-                        SemcastError::Index(format!(
-                            "the store lost the vector of chunk {i} as it was written"
-                        ))
-                    })
-            })
-            .collect()
+        Ok(vectors)
     }
 
     async fn embed_query(&self, query: &str) -> Result<Embedding> {
