@@ -253,6 +253,64 @@ async fn rerun_is_served_from_cache() {
     );
 }
 
+/// A store that counts how it is read.
+#[derive(Debug, Default)]
+struct CountingStore {
+    inner: InMemoryCache,
+    single_reads: std::sync::atomic::AtomicUsize,
+    batched_reads: std::sync::atomic::AtomicUsize,
+}
+
+impl semcast::cache::SemanticCache for CountingStore {
+    fn get(&self, key: &semcast::cache::CacheKey) -> Option<semcast::cache::CachedValue> {
+        self.single_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.get(key)
+    }
+    fn put(&self, key: semcast::cache::CacheKey, value: semcast::cache::CachedValue) {
+        self.inner.put(key, value);
+    }
+    fn get_many(
+        &self,
+        keys: &[semcast::cache::CacheKey],
+    ) -> Vec<Option<semcast::cache::CachedValue>> {
+        self.batched_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        keys.iter().map(|key| self.inner.get(key)).collect()
+    }
+}
+
+#[tokio::test]
+async fn stored_extractions_are_read_once_per_batch() {
+    let mock = json_mock();
+    let store = Arc::new(CountingStore::default());
+    let ctx = facts_context_with(semcast_context_with_cache(
+        Arc::clone(&mock) as Arc<_>,
+        Arc::clone(&store) as Arc<_>,
+    ))
+    .await;
+    let query = "SELECT CAST(transcript AS MeetingFacts).products, \
+                 CAST(transcript AS MeetingFacts).launch_stage FROM meetings";
+    rows(&ctx, query).await;
+    let calls = mock.completion_calls();
+    let reads = |s: &CountingStore| {
+        (
+            s.single_reads.load(std::sync::atomic::Ordering::Relaxed),
+            s.batched_reads.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    };
+    let before = reads(&store);
+    rows(&ctx, query).await;
+    let after = reads(&store);
+    assert_eq!(
+        mock.completion_calls(),
+        calls,
+        "the rerun is served from the store"
+    );
+    assert_eq!(after.0, before.0, "no field is read alone");
+    assert_eq!(after.1 - before.1, 1, "one read for the whole batch");
+}
+
 #[tokio::test]
 async fn means_and_cast_compose_extraction_runs_on_survivors_only() {
     // One mock answers both the MEANS verdict (schemaless) and the extraction

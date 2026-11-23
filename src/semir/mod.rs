@@ -3,7 +3,8 @@
 //! Every semantic operator is, underneath, one question put to a model about
 //! one piece of text: `ASK(input, instruction, type)`. `x MEANS 'p'` is
 //! `ASK(x, 'p', BOOL)`; `CONFIDENCE(x MEANS 'p')` is the probability of that
-//! same `ASK`; later phases bring `CAST`, classify and rank onto it too.
+//! same `ASK`; `CAST(x AS T)` is `ASK(x, synth(T), T)`, asked per generation
+//! unit of `T` ([`typed_answer_key`]); later phases bring rank onto it too.
 //!
 //! An [`Ask`] has two identities, and keeping them apart is the point:
 //!
@@ -28,20 +29,25 @@ use datafusion::logical_expr::Expr;
 use crate::cache::{CacheKey, stable_digest};
 use crate::model::ModelId;
 
-/// What an [`Ask`] answers with. One variant until classify, rank and typed
-/// extraction move onto SemIR.
+/// What an [`Ask`] answers with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd)]
 pub enum AskType {
     /// Yes or no — `MEANS`.
     Bool,
+    /// The fields of one generation unit of a semantic type — `CAST`. Each
+    /// field is stored apart, under [`typed_answer_key`].
+    Typed,
 }
 
 impl AskType {
     /// The answer kind as the store names it. Durable: it is part of every
     /// key, and `"means"` is what yes/no verdicts have always been stored as.
+    /// A typed answer is stored per field, under the field's own name; this
+    /// names the kind in its [`question_id`] only.
     pub fn field(self) -> &'static str {
         match self {
             AskType::Bool => "means",
+            AskType::Typed => "typed",
         }
     }
 }
@@ -129,6 +135,35 @@ pub fn answer_key(
     CacheKey {
         type_version: instruction.to_owned(),
         field: output.field().to_owned(),
+        input_digest: stable_digest(&[input.as_bytes()]),
+        model_id: model.clone(),
+        prompt_version: prompt_version.to_owned(),
+    }
+}
+
+/// The instruction a typed `ASK` is keyed under: one generation unit of a
+/// semantic type, as `<type>@<unit hash in hex>`. The unit hash covers its
+/// fields' names, types and docs ([`crate::types::unit_hash`]), so editing
+/// one field asks that unit again and leaves the others' answers valid.
+/// Durable, like every part of a key.
+pub fn typed_unit(type_name: &str, unit_hash: u128) -> String {
+    format!("{type_name}@{unit_hash:x}")
+}
+
+/// The store key for one field of a typed answer, `ASK(x, synth(T), T)`
+/// asked of one generation unit ([`typed_unit`]): the unit, the field's
+/// name, a digest of the text, the model and the prompt version. The layout
+/// extraction has always stored, so no store loses an answer.
+pub fn typed_answer_key(
+    unit: &str,
+    field: &str,
+    input: &str,
+    model: &ModelId,
+    prompt_version: &str,
+) -> CacheKey {
+    CacheKey {
+        type_version: unit.to_owned(),
+        field: field.to_owned(),
         input_digest: stable_digest(&[input.as_bytes()]),
         model_id: model.clone(),
         prompt_version: prompt_version.to_owned(),
