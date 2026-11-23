@@ -382,9 +382,10 @@ impl Ranker {
     /// Prune a batch to the rows that will be scored: the index's candidates,
     /// and every row it has never seen, which is scored on its full text
     /// like the `MEANS` pre-filter passes such rows to full-text verify. An
-    /// indexed row that isn't a candidate is pruned. Unindexed rows are
-    /// counted in `unindexed_rows` (with an index), so index staleness shows
-    /// up in the funnel as the calls it costs.
+    /// indexed row that isn't a candidate is pruned; a NULL text is kept
+    /// with a NULL score. Without an index every row counts as a candidate;
+    /// with one, rows it never saw are counted in `unindexed_rows`, so index
+    /// staleness shows up in the funnel as the calls it costs.
     fn keep_candidates(&self, candidates: &Candidates, batch: RecordBatch) -> Result<RecordBatch> {
         if batch.num_rows() == 0 {
             return Ok(batch);
@@ -397,9 +398,10 @@ impl Ranker {
 
         let mut keep = vec![false; batch.num_rows()];
         for (row, keep_row) in keep.iter_mut().enumerate() {
-            // NULL text has nothing to rank — free to drop here.
+            // NULL text keeps its row with a NULL score, as a `MEANS` label
+            // over NULL is NULL: it costs nothing and sorts last.
             if !texts.is_valid(row) {
-                self.rows_pruned.add(1);
+                *keep_row = true;
                 continue;
             }
             let hash = doc_hash(texts.value(row));
@@ -411,6 +413,8 @@ impl Ranker {
             } else {
                 if self.index.is_some() {
                     self.unindexed_rows.add(1);
+                } else {
+                    self.candidate_rows.add(1);
                 }
                 *keep_row = true;
             }

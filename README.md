@@ -423,6 +423,9 @@ the index is rebuilt.
 Without an index (or over a computed expression), every row is scored on its
 full text: one model call per distinct text, an exact top-`k`.
 
+A NULL text, or a row the model failed to score, gets a NULL score, which
+sorts last unless the query says `NULLS FIRST`.
+
 ```sql
 SELECT meeting_id, title FROM meetings
 ORDER BY transcript RELEVANCE TO 'offline sync' LIMIT 10;

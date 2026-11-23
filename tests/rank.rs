@@ -270,19 +270,20 @@ async fn the_rerank_model_reads_chunks_not_the_whole_document() {
 }
 
 #[tokio::test]
-async fn null_text_never_ranks() {
+async fn null_text_ranks_last_with_a_null_score() {
     let (ctx, _dir) = indexed_context(ranking_model()).await;
     let batches = run(
         &ctx,
-        "SELECT meeting_id FROM meetings
-         ORDER BY transcript RELEVANCE TO 'offline sync' LIMIT 10",
+        "SELECT meeting_id, relevance(transcript, 'offline sync') AS score
+         FROM meetings ORDER BY score DESC LIMIT 10",
     )
     .await;
 
-    assert!(
-        !ids(&batches).contains(&4),
-        "the NULL transcript has no score and cannot be ranked"
-    );
+    let ids = ids(&batches);
+    assert_eq!(ids.len(), 4, "the NULL transcript keeps its row: {ids:?}");
+    assert_eq!(ids.last(), Some(&4), "a NULL score sorts last: {ids:?}");
+    let last = batches.iter().rev().find(|b| b.num_rows() > 0).unwrap();
+    assert!(last.column(1).is_null(last.num_rows() - 1));
 }
 
 #[tokio::test]
@@ -312,8 +313,8 @@ async fn rows_the_index_never_saw_are_scored_on_their_full_text() {
     assert_eq!(model.completion_calls(), 4);
 }
 
-/// Dropping a row silently is the failure mode this operator has to avoid, so
-/// the count has to reach the funnel the server streams as NOTICEs.
+/// Rows the index should have covered cost a call each, so the count has to
+/// reach the funnel the server streams as NOTICEs, with the fix.
 #[tokio::test]
 async fn skipped_unindexed_rows_are_reported_in_the_funnel() {
     let (ctx, _dir) = indexed_context(ranking_model()).await;
@@ -346,7 +347,7 @@ async fn skipped_unindexed_rows_are_reported_in_the_funnel() {
     );
     let line = semcast::server::progress::render(&counts);
     assert!(
-        line.contains("REFRESH SEMANTIC INDEX"),
+        line.contains("re-run CREATE SEMANTIC INDEX"),
         "the NOTICE must say how to fix it: {line}"
     );
 }
@@ -398,6 +399,22 @@ async fn relevance_in_a_where_clause_is_a_plan_time_error() {
         message.contains("only supported in the SELECT list or an ORDER BY"),
         "error should name the legal positions: {message}"
     );
+}
+
+#[tokio::test]
+async fn a_subquery_column_ranks_on_its_full_text() {
+    let model = ranking_model();
+    let (ctx, _dir) = indexed_context(Arc::clone(&model)).await;
+    let batches = run(
+        &ctx,
+        "SELECT meeting_id FROM (
+             SELECT meeting_id, title || ' ' || transcript AS doc FROM meetings
+         ) ORDER BY doc RELEVANCE TO 'offline sync' LIMIT 3",
+    )
+    .await;
+
+    assert_eq!(ids(&batches)[0], 1);
+    assert_eq!(model.completion_calls(), 3, "no index covers the computed column");
 }
 
 #[tokio::test]

@@ -358,7 +358,7 @@ pub fn render(counts: &FunnelCounts) -> String {
         if counts.distinct_unindexed_rows > 0 {
             parts.push(format!(
                 "dedupe: {} rows are not in the semantic index and were left as-is — \
-                 REFRESH SEMANTIC INDEX to deduplicate them",
+                 re-run CREATE SEMANTIC INDEX to deduplicate them",
                 counts.distinct_unindexed_rows,
             ));
         }
@@ -376,7 +376,7 @@ pub fn render(counts: &FunnelCounts) -> String {
         if counts.cluster_unindexed_rows > 0 {
             parts.push(format!(
                 "cluster: {} rows are not in the semantic index and have no group — \
-                 REFRESH SEMANTIC INDEX to include them",
+                 re-run CREATE SEMANTIC INDEX to include them",
                 counts.cluster_unindexed_rows,
             ));
         }
@@ -410,12 +410,12 @@ pub fn render(counts: &FunnelCounts) -> String {
             counts.rank_cache_hits,
             counts.rank_rows_failed,
         ));
-        // Dropped rows are invisible in the result, so they get their own
-        // line rather than a number buried in the funnel.
+        // Rows an index should have covered cost a call each: their own
+        // line, with the fix, rather than a number buried in the funnel.
         if counts.rank_unindexed_rows > 0 {
             parts.push(format!(
                 "rank: {} rows are not in the semantic index and were scored on \
-                 their full text — REFRESH SEMANTIC INDEX to rank them from the index",
+                 their full text — re-run CREATE SEMANTIC INDEX to rank them from the index",
                 counts.rank_unindexed_rows,
             ));
         }

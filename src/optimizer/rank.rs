@@ -7,9 +7,9 @@
 //! for a reference to the node's score column — the same shape
 //! [`ExtractRewriteRule`] uses.
 //!
-//! A `LIMIT` is required. Without one, "rank these rows" means one model call
-//! per row of the whole table, which is exactly the surprise semcast exists to
-//! avoid; the limit also sizes the candidate stage.
+//! A `LIMIT` is required: with a semantic index it sizes the candidate stage,
+//! so cost tracks `k` rather than the table. Without an index every row is
+//! scored anyway, and the limit only cuts the result.
 //!
 //! [`SemRankNode`]: crate::logical::SemRankNode
 //! [`ExtractRewriteRule`]: crate::optimizer::extract::ExtractRewriteRule
@@ -32,9 +32,9 @@ use crate::sql::rank_udf::RELEVANCE_UDF_NAME;
 const NOT_IN_SELECT_OR_ORDER_BY: &str = "relevance() is only supported in the SELECT list or an ORDER BY; \
      wrap it in a subquery to filter or group on a relevance score";
 
-const NO_LIMIT: &str = "relevance() requires a LIMIT — ranking without one means \
-     one model call per row of the whole table; add `LIMIT <k>` (the candidate \
-     stage is sized from it)";
+const NO_LIMIT: &str = "relevance() requires a LIMIT — add `LIMIT <k>`; with a \
+     semantic index the candidate stage is sized from it, so cost tracks k \
+     rather than the table";
 
 /// Turns `relevance()` markers into `SemRank` nodes below the projection or
 /// sort that holds them.

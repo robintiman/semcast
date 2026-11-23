@@ -376,13 +376,11 @@ impl ExtensionPlanner for SemcastExtensionPlanner {
             )?;
             // An index only picks candidates: a computed expression, or a
             // column no index covers, is scored row by row on its full text.
-            let index = match column_behind_casts(&rank.text) {
-                Some(column) => {
-                    let (table, field) = qualified_name(column, logical_inputs[0].schema())?;
-                    index_for(&table, &field, session_state)
-                }
-                None => None,
-            };
+            // A column that names no table (a subquery's computed column)
+            // has no index either.
+            let index = column_behind_casts(&rank.text)
+                .and_then(|column| qualified_name(column, logical_inputs[0].schema()).ok())
+                .and_then(|(table, field)| index_for(&table, &field, session_state));
             let chunks_per_doc = index
                 .as_ref()
                 .map_or(0, |index| index.search_params().chunks_per_doc);
