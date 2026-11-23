@@ -41,6 +41,10 @@ pub struct SemcastRuntime {
     /// RECALL`, which makes that filter lossy and gives it a share of the
     /// statement's recall budget.
     scorer: bool,
+    /// The vector size each embedder (by `embed_id`) was seen to return,
+    /// so embedding outside an index (`MEANING OF` with none) probes it
+    /// once per process, not once per query.
+    embed_dims: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 impl SemcastRuntime {
@@ -54,6 +58,7 @@ impl SemcastRuntime {
             types: Arc::new(TypeRegistry::default()),
             catalog: None,
             scorer: false,
+            embed_dims: Arc::default(),
         }
     }
 
@@ -89,6 +94,11 @@ impl SemcastRuntime {
     /// Where semantic indexes keep their chunks and vectors.
     pub fn chunk_store(&self) -> &Arc<dyn crate::index::stored::ChunkStore> {
         &self.chunk_store
+    }
+
+    /// The vector size seen per embedder; see the field.
+    pub fn embed_dims(&self) -> &Arc<Mutex<HashMap<String, usize>>> {
+        &self.embed_dims
     }
 
     /// Share the session's verdict store.

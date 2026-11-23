@@ -358,6 +358,12 @@ async fn rows_the_index_never_saw_join_a_group() {
         topics[&99], topics[&1],
         "embedded for the query, the late row joins the billing group"
     );
+    let counts = funnel(
+        &ctx,
+        "SELECT id, meaning_of(body, 2) AS topic FROM notes ORDER BY id",
+    )
+    .await;
+    assert_eq!(counts.cluster_unindexed_rows, 1);
 }
 
 #[tokio::test]
@@ -377,11 +383,65 @@ async fn clustering_without_an_index_embeds_the_column() {
     let embeds = model.embed_calls();
     assert!(embeds > 0, "the column was embedded");
     groups(&ctx, BY_THEME).await;
-    // Only the dimension probe: every chunk vector is read back.
     assert_eq!(
-        model.embed_calls() - embeds,
-        1,
-        "the rerun reads stored vectors"
+        model.embed_calls(),
+        embeds,
+        "the rerun reads stored vectors and knows the embedder's size"
+    );
+}
+
+#[tokio::test]
+async fn clustering_an_empty_input_embeds_nothing() {
+    let model = clustering_model();
+    let ctx = semcast_context(Arc::clone(&model) as _);
+    notes_table(&ctx).await;
+    run(
+        &ctx,
+        "SELECT topic, count(*) FROM notes WHERE id > 100 GROUP BY MEANING OF body AS topic",
+    )
+    .await;
+    assert_eq!(model.embed_calls(), 0);
+}
+
+/// Runs `sql` and returns its funnel counts.
+async fn funnel(ctx: &SessionContext, sql: &str) -> semcast::server::progress::FunnelCounts {
+    let plan = semcast::sql(ctx, sql)
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
+    datafusion::physical_plan::collect(Arc::clone(&plan), ctx.task_ctx())
+        .await
+        .unwrap();
+    semcast::server::progress::snapshot(&plan)
+}
+
+#[tokio::test]
+async fn a_row_the_index_lacks_goes_ungrouped_when_embedding_it_fails() {
+    let model = Arc::new(
+        MockModel::answering_json_with(theme_label)
+            .embedding_by_theme(["refund", "launch"])
+            .failing_embeds_on(["late arrival"]),
+    );
+    let (ctx, _dir) = notes_context(model).await;
+    ctx.sql("INSERT INTO notes VALUES (99, 'a late arrival nobody indexed')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let counts = funnel(&ctx, BY_THEME).await;
+    assert_eq!(counts.cluster_docs_unembedded, 1, "the query still ran");
+    assert_eq!(
+        groups(&ctx, BY_THEME).await,
+        vec![
+            (String::new(), 1),
+            ("billing problems".to_owned(), 3),
+            ("launch planning".to_owned(), 3),
+        ],
+        "the late row has no group; the rest are grouped"
     );
 }
 

@@ -457,9 +457,10 @@ clustered, then one model call per group reads its most central documents
 and names it. Model cost tracks the number of groups, not rows.
 
 A semantic index supplies the vectors it already paid for. Without one (or
-over a computed column), the column is embedded the same way, and the chunk
-vectors are stored, so the next query reads them back; an index changes
-cost, never the groups.
+over a computed column), the column is embedded the same way (the session's
+embedder, default chunking), and the chunk vectors are stored, so the next
+query reads them back. The groups match an index's built with those
+defaults; an index changes the cost.
 
 `INTO k` fixes the group count; without it, semcast sweeps a few values and
 keeps the best-separated. Clustering is seeded, so the same corpus always
@@ -478,8 +479,9 @@ GROUP BY MEANING OF transcript INTO 8 AS topic;
 ```
 
 `AS` names the label column so the `SELECT` list can use it. Rows the index
-hasn't seen are embedded for the query and join a group; a NULL text gets a
-NULL label rather than disappearing. Use `ONEOF` on a
+hasn't seen are embedded for the query and join a group (if that embedding
+fails, they get a NULL label and the NOTICE says so); a NULL text gets a NULL
+label rather than disappearing. Use `ONEOF` on a
 [semantic type](#create-semantic-type) instead when you already know the
 categories — it's one call per row.
 

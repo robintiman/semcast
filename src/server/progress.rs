@@ -88,6 +88,10 @@ pub struct FunnelCounts {
     /// Rows the index has never seen. Clustering embeds them for the query,
     /// so a non-zero count is embedding cost an index rebuild saves.
     pub cluster_unindexed_rows: usize,
+    /// Documents vectored for the query with no index over the column.
+    pub cluster_docs_embedded: usize,
+    /// Documents a stale index lacked whose embedding failed: no group.
+    pub cluster_docs_unembedded: usize,
     pub cluster_labels_failed: usize,
     pub has_classify: bool,
     pub classify_model_calls: usize,
@@ -218,6 +222,8 @@ pub fn snapshot(plan: &Arc<dyn ExecutionPlan>) -> FunnelCounts {
                     counts.cluster_model_calls += sent_calls(&metrics, "model_calls");
                     counts.cluster_cache_hits += counter_total(&metrics, "cache_hits");
                     counts.cluster_unindexed_rows += counter_total(&metrics, "unindexed_rows");
+                    counts.cluster_docs_embedded += counter_total(&metrics, "docs_embedded");
+                    counts.cluster_docs_unembedded += counter_total(&metrics, "docs_unembedded");
                     counts.cluster_labels_failed += counter_total(&metrics, "labels_failed");
                 }
             }
@@ -371,8 +377,22 @@ pub fn render(counts: &FunnelCounts) -> String {
             counts.cluster_cache_hits,
             counts.cluster_labels_failed,
         ));
-        // An unlabelled row is invisible in a GROUP BY result, so it gets its
-        // own line rather than a number buried in the funnel.
+        if counts.cluster_docs_embedded > 0 {
+            parts.push(format!(
+                "cluster: no semantic index, so {} documents were vectored for this \
+                 query (stored chunk vectors are read back, the rest embedded)",
+                counts.cluster_docs_embedded,
+            ));
+        }
+        // Rows an index should have covered cost embedding, or a group when
+        // that failed: their own lines, with the fix.
+        if counts.cluster_docs_unembedded > 0 {
+            parts.push(format!(
+                "cluster: embedding {} documents the semantic index lacks failed; \
+                 their rows have no group — re-run CREATE SEMANTIC INDEX",
+                counts.cluster_docs_unembedded,
+            ));
+        }
         if counts.cluster_unindexed_rows > 0 {
             parts.push(format!(
                 "cluster: {} rows are not in the semantic index and were embedded \

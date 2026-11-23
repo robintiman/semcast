@@ -326,6 +326,7 @@ impl ExtensionPlanner for SemcastExtensionPlanner {
                     ClusterVectors::Embed {
                         embedder: Arc::clone(runtime.embedder()),
                         store: Arc::clone(runtime.chunk_store()),
+                        dims: Arc::clone(runtime.embed_dims()),
                     }
                 }
             };

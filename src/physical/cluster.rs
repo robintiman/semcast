@@ -6,17 +6,18 @@
 //! cluster reads its most central documents and names it. Model cost is a
 //! function of the number of groups, not the number of rows.
 //!
-//! An index changes cost, never the answer: with one, the vectors it already
-//! paid for are read back, and only documents it doesn't hold are embedded;
-//! without one, the column is embedded the same way, chunk vectors stored so
-//! the next query reads them back.
+//! An index changes cost, not the answer: with one, the vectors it already
+//! paid for are read back, and only documents it doesn't hold are embedded
+//! (with the index's embedder and chunking); without one, the column is
+//! embedded with the session's embedder and default chunking, chunk vectors
+//! stored so the next query reads them back. The groups match an index's
+//! when it was built with those defaults.
 //!
 //! Blocking, and unavoidably so: which group a row belongs to is a fact about
 //! the whole relation. That is the price of clustering, and the operator says
 //! so in `EXPLAIN` rather than hiding it.
 
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 
@@ -84,10 +85,13 @@ pub enum ClusterVectors {
     /// A semantic index over the column: its vectors, plus vectors built the
     /// same way for documents it doesn't hold.
     Index(Arc<dyn SemanticIndex>),
-    /// No index: embed the column, storing chunk vectors in `store`.
+    /// No index: embed the column as an index build would (the session's
+    /// embedder, default chunking), storing chunk vectors in `store`.
     Embed {
         embedder: Arc<dyn ModelProvider>,
         store: Arc<dyn ChunkStore>,
+        /// The vector size per embedder, shared with the session.
+        dims: Arc<std::sync::Mutex<HashMap<String, usize>>>,
     },
 }
 
@@ -239,6 +243,9 @@ impl ExecutionPlan for SemClusterExec {
                 .counter("model_calls_merged", partition),
             cache_hits: MetricBuilder::new(&self.metrics).counter("cache_hits", partition),
             unindexed_rows: MetricBuilder::new(&self.metrics).counter("unindexed_rows", partition),
+            docs_embedded: MetricBuilder::new(&self.metrics).counter("docs_embedded", partition),
+            docs_unembedded: MetricBuilder::new(&self.metrics)
+                .counter("docs_unembedded", partition),
             labels_failed: MetricBuilder::new(&self.metrics).counter("labels_failed", partition),
         };
         // One future produces every output batch: no row can be labelled
@@ -287,6 +294,11 @@ struct Grouper {
     cache_hits: Count,
     /// Rows an index over the column doesn't hold, embedded for this query.
     unindexed_rows: Count,
+    /// Documents whose vector was built for this query (no index): chunk
+    /// vectors already stored are read back, the rest embedded.
+    docs_embedded: Count,
+    /// Documents a stale index lacked whose embedding failed: no group.
+    docs_unembedded: Count,
     labels_failed: Count,
 }
 
@@ -301,6 +313,7 @@ impl Grouper {
         // clustering must not depend on how the scan happened to batch rows.
         let mut hashes: Vec<u64> = Vec::new();
         let mut texts: HashMap<u64, String> = HashMap::new();
+        let mut rows: HashMap<u64, usize> = HashMap::new();
         for batch in &batches {
             let values = self.evaluate_texts(batch)?;
             let values = values
@@ -313,12 +326,17 @@ impl Grouper {
                 }
                 let text = values.value(row);
                 let hash = doc_hash(text);
+                *rows.entry(hash).or_default() += 1;
                 if texts.insert(hash, text.to_owned()).is_none() {
                     hashes.push(hash);
                 }
             }
         }
-        let vectors = self.vectors(&hashes, &texts, &batches).await?;
+        let vectors = if hashes.is_empty() {
+            HashMap::new()
+        } else {
+            self.vectors(&hashes, &texts, &rows).await?
+        };
         // A document with no vector (an empty text, a lost chunk) has no group.
         hashes.retain(|hash| vectors.contains_key(hash));
         hashes.sort_unstable();
@@ -331,62 +349,92 @@ impl Grouper {
     }
 
     /// Every distinct document's vector: an index's own, and the rest built
-    /// the same way. Rows an index doesn't hold are counted as unindexed.
+    /// the same way. With an index, the rows it lacks are counted as
+    /// unindexed once they have a vector; if embedding them fails, they go
+    /// ungrouped rather than failing the query (an index gap degrades).
+    /// Without one, an embedder failure fails the query: nothing could be
+    /// grouped.
     async fn vectors(
         &self,
         hashes: &[u64],
         texts: &HashMap<u64, String>,
-        batches: &[RecordBatch],
+        rows: &HashMap<u64, usize>,
     ) -> Result<HashMap<u64, Embedding>> {
-        let index: Arc<dyn SemanticIndex> = match &self.vectors {
-            ClusterVectors::Index(index) => Arc::clone(index),
-            ClusterVectors::Embed { embedder, store } => Arc::new(
-                // A scratch index adds nothing to the store's indexes: it only
-                // chunks and embeds as an index build would.
-                StoredIndex::create(
-                    "",
-                    Arc::clone(store),
-                    Arc::clone(embedder),
-                    ChunkConfig::default(),
-                    SearchParams::default(),
-                )
-                .await?,
-            ),
-        };
-        let mut vectors = match &self.vectors {
-            ClusterVectors::Index(_) => index.doc_vectors().await?,
-            ClusterVectors::Embed { .. } => HashMap::new(),
-        };
-        let missing: Vec<u64> = hashes
-            .iter()
-            .copied()
-            .filter(|hash| !vectors.contains_key(hash))
-            .collect();
-        if missing.is_empty() {
-            return Ok(vectors);
-        }
-        if let ClusterVectors::Index(_) = self.vectors {
-            let missing: HashSet<u64> = missing.iter().copied().collect();
-            for batch in batches {
-                let values = self.evaluate_texts(batch)?;
-                let values = values
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .expect("text cast to Utf8");
-                let unindexed = (0..values.len())
-                    .filter(|&row| {
-                        values.is_valid(row) && missing.contains(&doc_hash(values.value(row)))
-                    })
-                    .count();
-                self.unindexed_rows.add(unindexed);
+        match &self.vectors {
+            ClusterVectors::Index(index) => {
+                let mut vectors = index.doc_vectors().await?;
+                let missing: Vec<u64> = hashes
+                    .iter()
+                    .copied()
+                    .filter(|hash| !vectors.contains_key(hash))
+                    .collect();
+                if missing.is_empty() {
+                    return Ok(vectors);
+                }
+                let wanted = missing.iter().map(|hash| texts[hash].clone()).collect();
+                match index.vectors_of(wanted).await {
+                    Ok(built) => {
+                        for hash in &missing {
+                            if built.contains_key(hash) {
+                                self.unindexed_rows.add(rows[hash]);
+                            }
+                        }
+                        vectors.extend(built);
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            "MEANING OF: embedding {} documents the index lacks failed, \
+                             leaving them ungrouped: {error}",
+                            missing.len()
+                        );
+                        self.docs_unembedded.add(missing.len());
+                    }
+                }
+                Ok(vectors)
+            }
+            ClusterVectors::Embed {
+                embedder,
+                store,
+                dims,
+            } => {
+                let known = dims
+                    .lock()
+                    .expect("dims lock poisoned")
+                    .get(&embedder.embed_id().0)
+                    .copied();
+                // A scratch index adds nothing to the store's indexes: it
+                // only chunks and embeds as an index build would.
+                let scratch = match known {
+                    Some(dim) => StoredIndex::open(
+                        "",
+                        Arc::clone(store),
+                        Arc::clone(embedder),
+                        ChunkConfig::default(),
+                        SearchParams::default(),
+                        dim,
+                    ),
+                    None => {
+                        let scratch = StoredIndex::create(
+                            "",
+                            Arc::clone(store),
+                            Arc::clone(embedder),
+                            ChunkConfig::default(),
+                            SearchParams::default(),
+                        )
+                        .await?;
+                        dims.lock()
+                            .expect("dims lock poisoned")
+                            .insert(embedder.embed_id().0, scratch.dim());
+                        scratch
+                    }
+                };
+                let built = scratch
+                    .vectors_of(hashes.iter().map(|hash| texts[hash].clone()).collect())
+                    .await?;
+                self.docs_embedded.add(built.len());
+                Ok(built)
             }
         }
-        vectors.extend(
-            index
-                .vectors_of(missing.iter().map(|hash| texts[hash].clone()).collect())
-                .await?,
-        );
-        Ok(vectors)
     }
 
     /// Cluster the documents and name each group, returning the label per
