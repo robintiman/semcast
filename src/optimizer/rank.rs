@@ -116,6 +116,17 @@ fn rewrite_node(
             for expr in &sort_exprs {
                 builder.observe(expr)?;
             }
+            // The rank node adds its score column below the sort, which
+            // passes every input column up: put a projection back on top so
+            // the sort's output schema is what it was (an `ORDER BY` on a
+            // select alias puts this sort above the projection, at the top).
+            let columns: Vec<Expr> = sort
+                .input
+                .schema()
+                .columns()
+                .into_iter()
+                .map(Expr::Column)
+                .collect();
             let input = builder.build((*sort.input).clone())?;
 
             let expr = sort
@@ -127,11 +138,14 @@ fn rewrite_node(
                 })
                 .collect::<Result<Vec<_>>>()?;
 
-            Ok(Transformed::yes(LogicalPlan::Sort(Sort {
+            let sorted = LogicalPlan::Sort(Sort {
                 expr,
                 input: Arc::new(input),
                 fetch: sort.fetch,
-            })))
+            });
+            Ok(Transformed::yes(LogicalPlan::Projection(
+                Projection::try_new(columns, Arc::new(sorted))?,
+            )))
         }
         other => {
             // A marker anywhere else never gets a node, so catch it here

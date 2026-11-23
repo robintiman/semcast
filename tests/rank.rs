@@ -472,3 +472,52 @@ async fn free_predicates_run_before_the_ranking() {
         "only the surviving row should be scored"
     );
 }
+
+#[tokio::test]
+async fn ranking_by_a_select_alias_keeps_the_select_lists_columns() {
+    let (ctx, _dir) = indexed_context(ranking_model()).await;
+    let batches = run(
+        &ctx,
+        "SELECT meeting_id, title || ' ' || transcript AS doc FROM meetings
+         ORDER BY doc RELEVANCE TO 'offline sync' LIMIT 3",
+    )
+    .await;
+
+    assert_eq!(batches[0].num_columns(), 2, "no score column leaks out");
+    assert_eq!(ids(&batches)[0], 1);
+}
+
+#[tokio::test]
+async fn a_score_sorted_from_an_outer_query_puts_no_score_last() {
+    let (ctx, _dir) = indexed_context(ranking_model()).await;
+    let batches = run(
+        &ctx,
+        "SELECT * FROM (
+             SELECT meeting_id, relevance(transcript, 'offline sync') AS score FROM meetings
+         ) AS q ORDER BY score DESC LIMIT 10",
+    )
+    .await;
+
+    let ids = ids(&batches);
+    assert_eq!(ids.first(), Some(&1), "best first: {ids:?}");
+    assert_eq!(
+        ids.last(),
+        Some(&4),
+        "the NULL transcript's score last: {ids:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_selected_score_from_an_outer_query_puts_no_score_last() {
+    let (ctx, _dir) = indexed_context(ranking_model()).await;
+    let batches = run(
+        &ctx,
+        "SELECT meeting_id, score FROM (
+             SELECT meeting_id, relevance(transcript, 'offline sync') AS score FROM meetings
+         ) AS q ORDER BY score DESC LIMIT 10",
+    )
+    .await;
+
+    let ids = ids(&batches);
+    assert_eq!(ids.last(), Some(&4), "no score sorts last: {ids:?}");
+}
