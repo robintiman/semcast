@@ -28,8 +28,8 @@ use crate::physical::index_scan::{CalibrationConfig, ChunkEvidence, IndexScanExe
 use crate::physical::score_scan::ScorerHealth;
 use crate::physical::store_lookup::{StoreEvidence, StoreLookupExec};
 use crate::physical::{
-    ScoreScanExec, SemClassifyExec, SemClusterExec, SemDistinctExec, SemExtractExec, SemRankExec,
-    VerifyExec,
+    ClusterVectors, ScoreScanExec, SemClassifyExec, SemClusterExec, SemDistinctExec,
+    SemExtractExec, SemRankExec, VerifyExec,
 };
 
 /// The default DataFusion planner plus semcast extension planning.
@@ -309,28 +309,33 @@ impl ExtensionPlanner for SemcastExtensionPlanner {
         if let Some(cluster) = node.as_any().downcast_ref::<SemClusterNode>() {
             let schema = logical_inputs[0].schema();
             let text = planner.create_physical_expr(&cluster.text, schema, session_state)?;
-            // Clustering is the index's vectors or nothing: without them the
-            // only alternative is embedding the corpus mid-query.
-            let column = column_behind_casts(&cluster.text).ok_or_else(|| {
-                DataFusionError::Plan(format!(
-                    "MEANING OF requires a plain indexed column, not a computed \
-                     expression (got `{}`)",
-                    cluster.text
-                ))
-            })?;
-            let (table, field) = qualified_name(column, schema)?;
-            let index = index_for(&table, &field, session_state).ok_or_else(|| {
-                DataFusionError::Plan(format!(
-                    "MEANING OF requires a semantic index on {table}({field}); \
-                     create one with: CREATE SEMANTIC INDEX ON {table}({field});"
-                ))
-            })?;
+            // An index's vectors are read back; without one the column is
+            // embedded the same way (a computed or subquery column has none).
+            let index = column_behind_casts(&cluster.text)
+                .and_then(|column| qualified_name(column, schema).ok())
+                .and_then(|(table, field)| index_for(&table, &field, session_state));
+            let vectors = match index {
+                Some(index) => ClusterVectors::Index(index),
+                None => {
+                    let runtime = session_state
+                        .config()
+                        .get_extension::<SemcastRuntime>()
+                        .ok_or_else(|| {
+                            DataFusionError::Plan("MEANING OF needs a semcast session".to_owned())
+                        })?;
+                    ClusterVectors::Embed {
+                        embedder: Arc::clone(runtime.embedder()),
+                        store: Arc::clone(runtime.chunk_store()),
+                        dims: Arc::clone(runtime.embed_dims()),
+                    }
+                }
+            };
             return Ok(Some(Arc::new(SemClusterExec::new(
                 Arc::clone(&physical_inputs[0]),
                 text,
                 cluster.k,
                 crate::logical::sem_cluster::label_column_name(cluster.id),
-                index,
+                vectors,
                 Arc::clone(&self.model),
                 Arc::clone(&self.cache),
             )?)));

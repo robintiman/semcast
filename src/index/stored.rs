@@ -41,6 +41,9 @@ const DIM_PROBE: &str = "semcast embedding dimension probe";
 /// catalog writing beside it.
 const WRITE_BATCH: usize = 2_000;
 
+/// Most documents [`StoredIndex::vectors_of`] chunks and embeds at once.
+pub const VECTORS_OF_BATCH: usize = 512;
+
 /// Most keys one batched vector read binds.
 const MAX_READ_BATCH: usize = 512;
 
@@ -522,6 +525,23 @@ impl StoredIndex {
 
     /// Chunk `texts` and make sure every chunk has a stored vector.
     async fn chunk(&self, texts: Vec<String>) -> Result<(usize, Vec<StoredChunk>)> {
+        let (docs, chunks, _) = self.chunk_and_embed(texts, false).await?;
+        Ok((docs, chunks))
+    }
+
+    /// [`Self::chunk`], also returning each chunk's vector, in order.
+    async fn chunk_with_vectors(
+        &self,
+        texts: Vec<String>,
+    ) -> Result<(usize, Vec<StoredChunk>, Vec<Embedding>)> {
+        self.chunk_and_embed(texts, true).await
+    }
+
+    async fn chunk_and_embed(
+        &self,
+        texts: Vec<String>,
+        collect: bool,
+    ) -> Result<(usize, Vec<StoredChunk>, Vec<Embedding>)> {
         let mut chunk_texts = Vec::new();
         let mut placements = Vec::new();
         let mut docs = 0;
@@ -538,14 +558,14 @@ impl StoredIndex {
             }
         }
         if chunk_texts.is_empty() {
-            return Ok((0, Vec::new()));
+            return Ok((0, Vec::new(), Vec::new()));
         }
         let model = self.embedder.embed_id();
         let keys: Vec<[u8; 16]> = chunk_texts
             .iter()
             .map(|text| embedding_key(&model, self.dim, text))
             .collect();
-        self.ensure_vectors(&chunk_texts, &keys).await?;
+        let vectors = self.ensure_vectors(&chunk_texts, &keys, collect).await?;
         let chunks = placements
             .into_iter()
             .zip(chunk_texts)
@@ -560,15 +580,22 @@ impl StoredIndex {
                 },
             )
             .collect();
-        Ok((docs, chunks))
+        Ok((docs, chunks, vectors))
     }
 
-    /// Embed (and store) every chunk the store has no vector for.
-    async fn ensure_vectors(&self, texts: &[String], keys: &[[u8; 16]]) -> Result<()> {
+    /// Embed (and store) every chunk the store has no vector for. With
+    /// `collect`, also return every chunk's vector in order; without, a
+    /// build holds one embed batch at a time, not the corpus.
+    async fn ensure_vectors(
+        &self,
+        texts: &[String],
+        keys: &[[u8; 16]],
+        collect: bool,
+    ) -> Result<Vec<Embedding>> {
         let model = self.embedder.embed_id();
         let store = Arc::clone(&self.store);
         let lookup = keys.to_vec();
-        let stored = blocking(move || store.vectors(&lookup)).await?;
+        let mut stored = blocking(move || store.vectors(&lookup)).await?;
         let mut seen = HashSet::new();
         let missing: Vec<usize> = (0..texts.len())
             .filter(|&i| stored[i].is_none() && seen.insert(keys[i]))
@@ -587,21 +614,59 @@ impl StoredIndex {
                 )));
             }
             if let Some(vector) = embedded.iter().find(|vector| vector.len() != self.dim) {
-                return Err(SemcastError::Index(format!(
-                    "embedder {} returned dimension {}, the index stores {}; recreate the \
-                     index with CREATE SEMANTIC INDEX",
-                    model.0,
-                    vector.len(),
-                    self.dim
-                )));
+                return Err(SemcastError::Index(if self.name.is_empty() {
+                    format!(
+                        "embedder {} returned dimension {}, {} expected",
+                        model.0,
+                        vector.len(),
+                        self.dim
+                    )
+                } else {
+                    format!(
+                        "embedder {} returned dimension {}, the index stores {}; recreate \
+                         the index with CREATE SEMANTIC INDEX",
+                        model.0,
+                        vector.len(),
+                        self.dim
+                    )
+                }));
             }
             let fresh: Vec<([u8; 16], Embedding)> =
                 batch.iter().map(|&i| keys[i]).zip(embedded).collect();
             let store = Arc::clone(&self.store);
             let model = model.clone();
-            blocking(move || store.put_vectors(&model, &fresh)).await?;
+            let fresh = blocking(move || {
+                store.put_vectors(&model, &fresh)?;
+                Ok(fresh)
+            })
+            .await?;
+            if collect {
+                for (&i, (_, vector)) in batch.iter().zip(fresh) {
+                    stored[i] = Some(vector);
+                }
+            }
         }
-        Ok(())
+        if !collect {
+            return Ok(Vec::new());
+        }
+        // A key repeated within `texts` was embedded once, at its first
+        // position: later positions copy it from there.
+        let mut first: HashMap<[u8; 16], usize> = HashMap::new();
+        let mut vectors: Vec<Embedding> = Vec::with_capacity(keys.len());
+        for (i, key) in keys.iter().enumerate() {
+            let at = *first.entry(*key).or_insert(i);
+            let vector = match stored[i].take() {
+                Some(vector) => vector,
+                None if at < i => vectors[at].clone(),
+                None => {
+                    return Err(SemcastError::Index(format!(
+                        "the store lost the vector of chunk {i} as it was written"
+                    )));
+                }
+            };
+            vectors.push(vector);
+        }
+        Ok(vectors)
     }
 
     async fn embed_query(&self, query: &str) -> Result<Embedding> {
@@ -695,6 +760,37 @@ impl SemanticIndex for StoredIndex {
         Ok(hits)
     }
 
+    /// Built as [`Self::doc_vectors`] builds the index's own: the same
+    /// chunks, embedded or read back, and their [`mean`].
+    async fn vectors_of(&self, texts: Vec<String>) -> Result<HashMap<u64, Embedding>> {
+        let mut means = HashMap::new();
+        // In bounded batches, so a large column holds one batch's chunk
+        // vectors at a time, not all of them.
+        for batch in texts.chunks(VECTORS_OF_BATCH) {
+            let (_, chunks, vectors) = self.chunk_with_vectors(batch.to_vec()).await?;
+            let dim = self.dim;
+            means.extend(
+                blocking(move || {
+                    let mut sums: HashMap<u64, (Embedding, usize)> = HashMap::new();
+                    for (chunk, vector) in chunks.iter().zip(&vectors) {
+                        let (sum, count) = sums
+                            .entry(chunk.doc_hash)
+                            .or_insert_with(|| (vec![0.0; dim], 0));
+                        for (slot, value) in sum.iter_mut().zip(vector) {
+                            *slot += value;
+                        }
+                        *count += 1;
+                    }
+                    Ok(sums
+                        .into_iter()
+                        .map(|(hash, (sum, count))| (hash, mean(sum, count))))
+                })
+                .await?,
+            );
+        }
+        Ok(means)
+    }
+
     /// The mean of each document's chunk vectors, renormalized: a document
     /// is its chunks, and cosine distance downstream assumes unit vectors.
     async fn doc_vectors(&self) -> Result<HashMap<u64, Embedding>> {
@@ -718,13 +814,7 @@ impl SemanticIndex for StoredIndex {
         .await?;
         Ok(sums
             .into_iter()
-            .map(|(hash, (mut sum, count))| {
-                for value in &mut sum {
-                    *value /= count as f32;
-                }
-                normalize(&mut sum);
-                (hash, sum)
-            })
+            .map(|(hash, (sum, count))| (hash, mean(sum, count)))
             .collect())
     }
 }
@@ -736,6 +826,16 @@ async fn blocking<T: Send + 'static>(
     tokio::task::spawn_blocking(work)
         .await
         .map_err(|error| SemcastError::Index(format!("index task failed: {error}")))?
+}
+
+/// A document's vector from the sum of its `count` chunk vectors: their
+/// mean, renormalized, since cosine distance downstream assumes unit vectors.
+fn mean(mut sum: Embedding, count: usize) -> Embedding {
+    for value in &mut sum {
+        *value /= count as f32;
+    }
+    normalize(&mut sum);
+    sum
 }
 
 fn normalize(vector: &mut [f32]) {
@@ -760,6 +860,54 @@ fn cosine(query: &[f32], vector: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn vectors_of_builds_what_the_index_would_and_adds_nothing() {
+        let store: Arc<dyn ChunkStore> = Arc::new(MemoryChunkStore::default());
+        let embedder: Arc<dyn ModelProvider> = Arc::new(crate::model::MockModel::default());
+        // Small slices, so a document spans several chunks.
+        let config = ChunkConfig {
+            max_tokens: 4,
+            overlap_tokens: 1,
+        };
+        let index = StoredIndex::create(
+            "t.body",
+            Arc::clone(&store),
+            Arc::clone(&embedder),
+            config.clone(),
+            SearchParams::default(),
+        )
+        .await
+        .unwrap();
+        let texts = vec![
+            "one two three four five six seven".to_owned(),
+            "eight nine".to_owned(),
+        ];
+        index.rebuild(texts.clone()).await.unwrap();
+        let indexed = index.doc_vectors().await.unwrap();
+
+        let scratch = StoredIndex::create(
+            "",
+            Arc::clone(&store),
+            embedder,
+            config,
+            SearchParams::default(),
+        )
+        .await
+        .unwrap();
+        let built = scratch
+            .vectors_of(vec![texts[0].clone(), "ten eleven".to_owned()])
+            .await
+            .unwrap();
+        assert_eq!(built[&doc_hash(&texts[0])], indexed[&doc_hash(&texts[0])]);
+        assert!(built.contains_key(&doc_hash("ten eleven")));
+        assert_eq!(
+            index.indexed_doc_hashes().await.unwrap().len(),
+            2,
+            "nothing added to the index"
+        );
+        assert!(scratch.indexed_doc_hashes().await.unwrap().is_empty());
+    }
 
     #[test]
     fn vectors_round_trip_through_their_encoding() {

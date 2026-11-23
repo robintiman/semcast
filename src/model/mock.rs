@@ -33,6 +33,8 @@ pub struct MockModel {
     latency: Option<Duration>,
     /// Inputs containing any of these fail; see [`MockModel::failing_on`].
     failing: Vec<String>,
+    /// See [`MockModel::failing_embeds_on`].
+    failing_embeds: Vec<String>,
     /// See [`MockModel::with_yes_probability`].
     yes_probability: Option<YesProbability>,
     /// See [`MockModel::with_id`]; `None` is "mock".
@@ -143,6 +145,17 @@ impl MockModel {
         S: Into<String>,
     {
         self.failing = needles.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Fail an embed call whose texts include one containing any of
+    /// `needles`, as an embedder outage would. It still counts as a call.
+    pub fn failing_embeds_on<I, S>(mut self, needles: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.failing_embeds = needles.into_iter().map(Into::into).collect();
         self
     }
 
@@ -266,6 +279,15 @@ impl ModelProvider for MockModel {
 
     async fn embed(&self, texts: Vec<String>) -> Result<Vec<Embedding>> {
         self.embed_calls.fetch_add(1, Ordering::Relaxed);
+        if texts.iter().any(|text| {
+            self.failing_embeds
+                .iter()
+                .any(|n| text.contains(n.as_str()))
+        }) {
+            return Err(crate::SemcastError::Model(
+                "mock embed failure configured for this input".to_owned(),
+            ));
+        }
         Ok(texts
             .iter()
             .map(|t| {
