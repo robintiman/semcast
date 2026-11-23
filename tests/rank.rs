@@ -414,7 +414,11 @@ async fn a_subquery_column_ranks_on_its_full_text() {
     .await;
 
     assert_eq!(ids(&batches)[0], 1);
-    assert_eq!(model.completion_calls(), 3, "no index covers the computed column");
+    assert_eq!(
+        model.completion_calls(),
+        3,
+        "no index covers the computed column"
+    );
 }
 
 #[tokio::test]

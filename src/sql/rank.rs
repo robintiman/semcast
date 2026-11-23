@@ -22,7 +22,7 @@ use std::ops::ControlFlow;
 
 use datafusion::sql::parser::Statement;
 use datafusion::sql::sqlparser::ast::{
-    Expr, Function, FunctionArguments, ObjectName, OrderByKind, Query, SelectItem, SetExpr,
+    Expr, Function, FunctionArguments, Ident, ObjectName, OrderByKind, Query, SelectItem, SetExpr,
     VisitMut, VisitorMut,
 };
 
@@ -55,7 +55,7 @@ impl VisitorMut for RelevanceDesc {
             for item in items {
                 let call = is_relevance_call(&item.expr);
                 let alias = matches!(&item.expr, Expr::Identifier(ident)
-                    if aliases.iter().any(|a| a.eq_ignore_ascii_case(&ident.value)));
+                    if aliases.contains(&resolved(ident)));
                 if call && item.options.asc.is_none() {
                     item.options.asc = Some(false);
                 }
@@ -79,11 +79,21 @@ fn relevance_aliases(query: &Query) -> Vec<String> {
         .iter()
         .filter_map(|item| match item {
             SelectItem::ExprWithAlias { expr, alias } if is_relevance_call(expr) => {
-                Some(alias.value.clone())
+                Some(resolved(alias))
             }
             _ => None,
         })
         .collect()
+}
+
+/// The name an identifier resolves to: as written when quoted, folded to
+/// lower case when not, as DataFusion resolves it.
+fn resolved(ident: &Ident) -> String {
+    if ident.quote_style.is_some() {
+        ident.value.clone()
+    } else {
+        ident.value.to_lowercase()
+    }
 }
 
 fn is_relevance_call(expr: &Expr) -> bool {
@@ -152,6 +162,18 @@ mod tests {
         assert_eq!(
             rewrite("SELECT body AS score FROM t ORDER BY score DESC LIMIT 5"),
             "SELECT body AS score FROM t ORDER BY score DESC LIMIT 5"
+        );
+        assert_eq!(
+            rewrite("SELECT relevance(body, 'x') AS Score FROM t ORDER BY score DESC LIMIT 5"),
+            "SELECT relevance(body, 'x') AS Score FROM t ORDER BY score DESC NULLS LAST LIMIT 5",
+            "unquoted names fold alike"
+        );
+        assert_eq!(
+            rewrite(
+                "SELECT relevance(body, 'x') AS \"Score\", score FROM t ORDER BY score DESC LIMIT 5"
+            ),
+            "SELECT relevance(body, 'x') AS \"Score\", score FROM t ORDER BY score DESC LIMIT 5",
+            "a quoted alias names only itself"
         );
     }
 
