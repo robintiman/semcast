@@ -550,13 +550,8 @@ pub async fn refresh_column(
     }
     // The analyzer and optimizer rules apply to DataFrame plans too, so this
     // reads the column exactly as a query would.
-    let batches = ctx
-        .table(table)
-        .await?
-        .select_columns(&[name])?
-        .collect()
-        .await?;
-    Ok(batches.iter().map(|batch| batch.num_rows()).sum())
+    let frame = ctx.table(table).await?.select_columns(&[name])?;
+    crate::semantic_view::drain(frame).await
 }
 
 /// One `ALTER` at a time: each reads the table's columns, changes them, and

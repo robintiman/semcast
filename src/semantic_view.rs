@@ -17,8 +17,11 @@
 //! The quote is an upper bound. It counts every distinct text of the column
 //! a question reads, over the whole table, as if no filter came before it;
 //! the view's own read may need fewer (a `WHERE` before the `MEANS`, an
-//! index pruning under `WITH RECALL`). A question over a computed
-//! expression has no column to count, and its counts are NULL.
+//! index pruning under `WITH RECALL`), so `to_ask` can stay above zero after
+//! a refresh. A question over a computed expression has no column to count,
+//! and its counts are NULL; so do rank, cluster, dedupe and typed
+//! extraction, whose cost isn't one yes/no per text — they are listed, and
+//! a refresh pays for them like the rest.
 //!
 //! Questions are asked one per call, as the view's own reads ask them, so
 //! the answers a refresh stores are exactly the ones those reads look up.
@@ -41,6 +44,7 @@ use crate::cache::{CacheKey, CachedValue};
 use crate::index::registry::{column_behind_casts, qualified_name};
 use crate::logical::sem_classify::{ClassifyOutput, SemClassifyNode};
 use crate::logical::sem_filter::SemFilterNode;
+use crate::logical::{SemClusterNode, SemDistinctNode, SemExtractNode, SemRankNode};
 use crate::model::ModelId;
 use crate::physical::classify::{
     CLASSIFY_MAX_TOKENS, CLASSIFY_PROMPT_VERSION, synthesize_classify_prompt,
@@ -67,6 +71,11 @@ pub(crate) enum QuestionKind {
     Filter,
     Label,
     Confidence,
+    /// Not quoted (NULL counts): its cost isn't one yes/no per text.
+    Rank,
+    Cluster,
+    Distinct,
+    Extract,
 }
 
 impl QuestionKind {
@@ -75,7 +84,19 @@ impl QuestionKind {
             QuestionKind::Filter => "MEANS",
             QuestionKind::Label => "label",
             QuestionKind::Confidence => "CONFIDENCE",
+            QuestionKind::Rank => "RELEVANCE TO",
+            QuestionKind::Cluster => "MEANING OF",
+            QuestionKind::Distinct => "SEMANTIC DISTINCT ON",
+            QuestionKind::Extract => "CAST",
         }
+    }
+
+    /// Whether [`quote`] can count it: one yes/no answer per text.
+    fn quotable(self) -> bool {
+        matches!(
+            self,
+            QuestionKind::Filter | QuestionKind::Label | QuestionKind::Confidence
+        )
     }
 }
 
@@ -114,6 +135,30 @@ pub(crate) fn questions(plan: &LogicalPlan) -> crate::Result<Vec<Question>> {
                     conditions: classify.conditions.clone(),
                     source: source(&classify.text, classify.input.schema()),
                 });
+            } else if let Some(rank) = any.downcast_ref::<SemRankNode>() {
+                found.push(Question {
+                    kind: QuestionKind::Rank,
+                    conditions: vec![rank.query.clone()],
+                    source: source(&rank.text, rank.input.schema()),
+                });
+            } else if let Some(cluster) = any.downcast_ref::<SemClusterNode>() {
+                found.push(Question {
+                    kind: QuestionKind::Cluster,
+                    conditions: vec![cluster.k.map_or("auto".to_owned(), |k| format!("INTO {k}"))],
+                    source: source(&cluster.text, cluster.input.schema()),
+                });
+            } else if let Some(distinct) = any.downcast_ref::<SemDistinctNode>() {
+                found.push(Question {
+                    kind: QuestionKind::Distinct,
+                    conditions: vec![format!("SIMILARITY {}", distinct.similarity)],
+                    source: source(&distinct.text, distinct.input.schema()),
+                });
+            } else if let Some(extract) = any.downcast_ref::<SemExtractNode>() {
+                found.push(Question {
+                    kind: QuestionKind::Extract,
+                    conditions: vec![extract.target.name.clone()],
+                    source: source(&extract.source, extract.input.schema()),
+                });
             }
         }
         Ok(TreeNodeRecursion::Continue)
@@ -140,10 +185,17 @@ pub(crate) async fn quote(
     let Some((table, column)) = &question.source else {
         return Ok(None);
     };
-    // A qualifier the view gave a subquery names no table: nothing to count.
-    let Ok(frame) = ctx.table(table.as_str()).await else {
+    if !question.kind.quotable() {
         return Ok(None);
-    };
+    }
+    // Only a base table is read: a qualifier that names a view (or one the
+    // view gave a subquery) could ask the model to be counted, or name a
+    // different relation. Nothing to count then.
+    match ctx.table_provider(table.as_str()).await {
+        Ok(provider) if provider.table_type() == TableType::Base => {}
+        _ => return Ok(None),
+    }
+    let frame = ctx.table(table.as_str()).await?;
     // The text column only: no semantic column is read, so nothing is asked.
     let batches = frame.select_columns(&[column.as_str()])?.collect().await?;
     let mut quote = Quote::default();
@@ -249,14 +301,25 @@ async fn view_questions(
     Ok((frame, questions))
 }
 
+/// Run `frame` to the end, keeping nothing but the row count.
+pub(crate) async fn drain(frame: DataFrame) -> crate::Result<usize> {
+    use futures::StreamExt;
+    let mut stream = frame.execute_stream().await?;
+    let mut rows = 0;
+    while let Some(batch) = stream.next().await {
+        rows += batch?.num_rows();
+    }
+    Ok(rows)
+}
+
 /// `REFRESH SEMANTIC VIEW name`: read the view to the end, so every answer
 /// its next read needs is asked now and stored. Returns the rows read.
 pub async fn refresh_view(ctx: &SessionContext, name: &str) -> crate::Result<usize> {
     let (frame, _) = view_questions(ctx, name).await?;
     // The analyzer and optimizer rules apply to DataFrame plans too, so this
-    // reads the view exactly as a query would.
-    let batches = frame.collect().await?;
-    Ok(batches.iter().map(|batch| batch.num_rows()).sum())
+    // reads the view exactly as a query would; each batch is counted and
+    // dropped, so a large view isn't held.
+    drain(frame).await
 }
 
 /// `EXPLAIN REFRESH SEMANTIC VIEW name`: one row per semantic question the

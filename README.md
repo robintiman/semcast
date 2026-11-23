@@ -325,7 +325,8 @@ EXPLAIN REFRESH SEMANTIC VIEW <view>;
 
 Any view that asks a semantic question can be paid for ahead of time, so a
 dashboard reading it gets stored answers. `REFRESH` reads the view to the
-end, asking what the store hasn't answered; the next read asks nothing.
+end, asking what the store hasn't answered; the next read of the same rows
+asks nothing.
 
 ```sql
 CREATE VIEW angry AS SELECT id FROM tickets WHERE body MEANS 'the customer is angry';
@@ -337,7 +338,10 @@ REFRESH SEMANTIC VIEW angry;
 asks (`MEANS`, a `CASE` label, `CONFIDENCE`), with the column it reads and
 the same counts and estimates as a semantic column's. It is an upper bound:
 it counts every text of that column, as if no filter came before the
-question. A question over a computed expression shows NULL counts.
+question, so after a refresh `to_ask` stays above zero by the texts that
+filter skipped. A question over a computed expression shows NULL counts, as
+do `RELEVANCE TO`, `MEANING OF`, `SEMANTIC DISTINCT ON` and `CAST`, whose cost
+isn't one yes/no per text; they are listed, and a refresh pays for them.
 
 #### `WITH RECALL`
 

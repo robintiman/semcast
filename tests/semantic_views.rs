@@ -179,3 +179,38 @@ async fn only_a_view_that_asks_something_refreshes() {
     let message = error(&ctx, "REFRESH SEMANTIC VIEW").await;
     assert!(message.contains("REFRESH SEMANTIC VIEW name"), "{message}");
 }
+
+#[tokio::test]
+async fn a_rank_view_refreshes_and_is_listed_unquoted() {
+    let model = Arc::new(MockModel::answering_json_with(
+        |_| serde_json::json!({"score": 0.5}),
+    ));
+    let ctx = tickets(Arc::clone(&model)).await;
+    run(
+        &ctx,
+        "CREATE VIEW top AS SELECT id FROM tickets ORDER BY body RELEVANCE TO 'anger' LIMIT 2",
+    )
+    .await;
+
+    let quote = run(&ctx, "EXPLAIN REFRESH SEMANTIC VIEW top").await;
+    assert_eq!(
+        text(&quote, "question"),
+        vec![Some("RELEVANCE TO".to_owned())]
+    );
+    assert_eq!(
+        column(&quote, "to_ask"),
+        vec![None],
+        "not a yes/no per text"
+    );
+    assert_eq!(model.completion_calls(), 0);
+
+    run(&ctx, "REFRESH SEMANTIC VIEW top").await;
+    let paid = model.completion_calls();
+    assert!(paid > 0);
+    run(&ctx, "SELECT * FROM top").await;
+    assert_eq!(
+        model.completion_calls(),
+        paid,
+        "the read is served from the store"
+    );
+}
