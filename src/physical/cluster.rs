@@ -302,7 +302,7 @@ impl Grouper {
             HashMap::new()
         } else {
             self.vectors
-                .for_documents(&hashes, &texts, &rows, &self.counts)
+                .for_documents(&hashes, &texts, &rows, &self.counts, "MEANING OF")
                 .await?
         };
         // A document with no vector (an empty text, a lost chunk) has no group.

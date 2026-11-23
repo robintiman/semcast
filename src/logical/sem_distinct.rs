@@ -130,7 +130,8 @@ impl UserDefinedLogicalNodeCore for SemDistinctNode {
     fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "SemDistinct: SIMILARITY ≥ {:.2}   no model calls, blocking",
+            "SemDistinct: SIMILARITY ≥ {:.2}   no model calls (embeds the column if \
+             no index covers it), blocking",
             self.similarity
         )
     }

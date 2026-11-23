@@ -72,13 +72,15 @@ impl DocVectors {
     /// the same way. With an index, the rows it lacks are counted as
     /// unindexed once they have a vector; if embedding them fails, they go
     /// without one rather than failing the query (an index gap degrades).
-    /// Without an index, an embedder failure fails the query.
+    /// Without an index, an embedder failure fails the query. `operator`
+    /// names the caller in logs.
     pub async fn for_documents(
         &self,
         hashes: &[u64],
         texts: &HashMap<u64, String>,
         rows: &HashMap<u64, usize>,
         counts: &VectorCounts,
+        operator: &'static str,
     ) -> Result<HashMap<u64, Embedding>> {
         match self {
             DocVectors::Index(index) => {
@@ -108,8 +110,8 @@ impl DocVectors {
                                 .filter(|hash| !texts[*hash].trim().is_empty())
                                 .count();
                             tracing::warn!(
-                                "embedding {lost} documents the index lacks failed; they go \
-                                 without a vector: {error}"
+                                "{operator}: embedding {lost} documents the index lacks \
+                                 failed; they go without a vector: {error}"
                             );
                             counts.docs_unembedded.add(lost);
                         }
@@ -145,7 +147,7 @@ impl DocVectors {
                         // re-pulled model): forget it and probe again.
                         Err(error) => {
                             tracing::warn!(
-                                "embedding outside an index failed; probing the embedder again: {error}"
+                                "{operator}: embedding outside an index failed; probing the embedder again: {error}"
                             );
                             dims.lock().expect("dims lock poisoned").remove(&id);
                         }

@@ -514,9 +514,9 @@ WITH SIMILARITY 0.8;
 
 With a semantic index, the vectors it paid for are read back; without one
 (or over a computed column), the column is embedded the way an index would
-be, and the chunk vectors are stored for the next query. Rows the index
-hasn't seen are embedded for the query too. A row that still has no vector
-(its embedding failed) falls back to exact-match dedupe rather than being
+be, and the chunk vectors are stored for the next query; if the embedder
+fails, the query fails. Rows an index hasn't seen are embedded for the query
+too; if that fails, they fall back to exact-match dedupe rather than being
 collapsed on a guess — duplicates stay in, never data out.
 
 #### `CREATE SEMANTIC TYPE`

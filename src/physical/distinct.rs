@@ -232,7 +232,7 @@ impl Deduper {
             HashMap::new()
         } else {
             self.vectors
-                .for_documents(&hashes, &texts, &rows, &self.counts)
+                .for_documents(&hashes, &texts, &rows, &self.counts, "SEMANTIC DISTINCT ON")
                 .await?
         };
         // A document with no vector is left out of the grouping rather than

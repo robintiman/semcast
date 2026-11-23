@@ -377,7 +377,8 @@ pub fn render(counts: &FunnelCounts) -> String {
         if counts.distinct_docs_unembedded > 0 {
             parts.push(format!(
                 "dedupe: embedding {} documents the semantic index lacks failed; only \
-                 their exact copies were collapsed — re-run CREATE SEMANTIC INDEX",
+                 their exact copies were collapsed — check the embedder, then re-run \
+                 CREATE SEMANTIC INDEX",
                 counts.distinct_docs_unembedded,
             ));
         }
@@ -409,7 +410,8 @@ pub fn render(counts: &FunnelCounts) -> String {
         if counts.cluster_docs_unembedded > 0 {
             parts.push(format!(
                 "cluster: embedding {} documents the semantic index lacks failed; \
-                 their rows have no group — re-run CREATE SEMANTIC INDEX",
+                 their rows have no group — check the embedder, then re-run CREATE \
+                 SEMANTIC INDEX",
                 counts.cluster_docs_unembedded,
             ));
         }
