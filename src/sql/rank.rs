@@ -217,7 +217,7 @@ fn exposed_scores(body: &Query, renamed: &[TableAliasColumnDef]) -> Vec<String> 
     for item in &select.projection {
         match item {
             SelectItem::Wildcard(options) => {
-                let hidden = replaced(options);
+                let hidden = [replaced(options), inner.shadowed.clone()].concat();
                 names.extend(
                     inner
                         .tables
@@ -230,7 +230,7 @@ fn exposed_scores(body: &Query, renamed: &[TableAliasColumnDef]) -> Vec<String> 
                 SelectItemQualifiedWildcardKind::ObjectName(name),
                 options,
             ) => {
-                let hidden = replaced(options);
+                let hidden = [replaced(options), inner.shadowed.clone()].concat();
                 let Some(table) = name.0.last().and_then(|part| part.as_ident()) else {
                     continue;
                 };
@@ -250,7 +250,8 @@ fn exposed_scores(body: &Query, renamed: &[TableAliasColumnDef]) -> Vec<String> 
 }
 
 /// The columns a `*` replaces or renames, which no longer carry what the
-/// table exposed under that name.
+/// table exposed under that name. (An `EXCLUDE`d one carries nothing; a
+/// column the select list then defines by that name is in its `shadowed`.)
 fn replaced(options: &WildcardAdditionalOptions) -> Vec<String> {
     let mut names: Vec<String> = options
         .opt_replace
@@ -459,6 +460,8 @@ mod tests {
     #[test]
     fn a_replaced_column_is_not_the_score() {
         let sql = "SELECT * FROM (SELECT * REPLACE (0 AS s) FROM (SELECT relevance(b, 'x') AS s FROM t) AS a) AS q ORDER BY s DESC LIMIT 5";
+        assert_eq!(rewrite(sql), sql);
+        let sql = "SELECT * FROM (SELECT * EXCLUDE (s), id AS s FROM (SELECT id, relevance(b, 'x') AS s FROM t) AS a) AS q ORDER BY s DESC LIMIT 5";
         assert_eq!(rewrite(sql), sql);
     }
 
