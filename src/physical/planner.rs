@@ -374,24 +374,16 @@ impl ExtensionPlanner for SemcastExtensionPlanner {
                 logical_inputs[0].schema(),
                 session_state,
             )?;
-            // Ranking has no verify-only fallback: without an index there are
-            // no candidates, so "rank" would mean a model call per row of the
-            // whole table. Say so, and name the statement that fixes it.
-            let column = column_behind_casts(&rank.text).ok_or_else(|| {
-                DataFusionError::Plan(format!(
-                    "RELEVANCE TO requires a plain indexed column, not a computed \
-                     expression (got `{}`)",
-                    rank.text
-                ))
-            })?;
-            let (table, field) = qualified_name(column, logical_inputs[0].schema())?;
-            let index = index_for(&table, &field, session_state).ok_or_else(|| {
-                DataFusionError::Plan(format!(
-                    "RELEVANCE TO requires a semantic index on {table}({field}); \
-                     create one with: CREATE SEMANTIC INDEX ON {table}({field});"
-                ))
-            })?;
-            let chunks_per_doc = index.search_params().chunks_per_doc;
+            // An index only picks candidates: a computed expression, or a
+            // column no index covers, is scored row by row on its full text.
+            // A column that names no table (a subquery's computed column)
+            // has no index either.
+            let index = column_behind_casts(&rank.text)
+                .and_then(|column| qualified_name(column, logical_inputs[0].schema()).ok())
+                .and_then(|(table, field)| index_for(&table, &field, session_state));
+            let chunks_per_doc = index
+                .as_ref()
+                .map_or(0, |index| index.search_params().chunks_per_doc);
             return Ok(Some(Arc::new(SemRankExec::new(
                 Arc::clone(&physical_inputs[0]),
                 text,

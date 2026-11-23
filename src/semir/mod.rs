@@ -4,7 +4,8 @@
 //! one piece of text: `ASK(input, instruction, type)`. `x MEANS 'p'` is
 //! `ASK(x, 'p', BOOL)`; `CONFIDENCE(x MEANS 'p')` is the probability of that
 //! same `ASK`; `CAST(x AS T)` is `ASK(x, synth(T), T)`, asked per generation
-//! unit of `T` ([`typed_answer_key`]); later phases bring rank onto it too.
+//! unit of `T` ([`typed_answer_key`]); `x RELEVANCE TO 'q'` is
+//! `ASK(x, 'q', SCORE)`, a 0–1 score.
 //!
 //! An [`Ask`] has two identities, and keeping them apart is the point:
 //!
@@ -37,17 +38,21 @@ pub enum AskType {
     /// The fields of one generation unit of a semantic type — `CAST`. Each
     /// field is stored apart, under [`typed_answer_key`].
     Typed,
+    /// A relevance score from 0 to 1 — `RELEVANCE TO`.
+    Score,
 }
 
 impl AskType {
     /// The answer kind as the store names it. Durable: it is part of every
-    /// key, and `"means"` is what yes/no verdicts have always been stored as.
+    /// key; `"means"` and `"relevance"` are what yes/no verdicts and
+    /// relevance scores have always been stored as.
     /// A typed answer is stored per field, under the field's own name; this
     /// names the kind in its [`question_id`] only.
     pub fn field(self) -> &'static str {
         match self {
             AskType::Bool => "means",
             AskType::Typed => "typed",
+            AskType::Score => "relevance",
         }
     }
 }

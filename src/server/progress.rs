@@ -99,8 +99,8 @@ pub struct FunnelCounts {
     pub has_rank: bool,
     pub rank_candidate_rows: usize,
     pub rank_rows_pruned: usize,
-    /// Rows the index has never seen. A rank drops them, so a non-zero count
-    /// means results are missing until the index is refreshed.
+    /// Rows the index has never seen. A rank scores them on their full text,
+    /// one call each, so a non-zero count is cost an index refresh saves.
     pub rank_unindexed_rows: usize,
     pub rank_model_calls: usize,
     pub rank_cache_hits: usize,
@@ -358,7 +358,7 @@ pub fn render(counts: &FunnelCounts) -> String {
         if counts.distinct_unindexed_rows > 0 {
             parts.push(format!(
                 "dedupe: {} rows are not in the semantic index and were left as-is — \
-                 REFRESH SEMANTIC INDEX to deduplicate them",
+                 re-run CREATE SEMANTIC INDEX to deduplicate them",
                 counts.distinct_unindexed_rows,
             ));
         }
@@ -376,7 +376,7 @@ pub fn render(counts: &FunnelCounts) -> String {
         if counts.cluster_unindexed_rows > 0 {
             parts.push(format!(
                 "cluster: {} rows are not in the semantic index and have no group — \
-                 REFRESH SEMANTIC INDEX to include them",
+                 re-run CREATE SEMANTIC INDEX to include them",
                 counts.cluster_unindexed_rows,
             ));
         }
@@ -410,12 +410,12 @@ pub fn render(counts: &FunnelCounts) -> String {
             counts.rank_cache_hits,
             counts.rank_rows_failed,
         ));
-        // Dropped rows are invisible in the result, so they get their own
-        // line rather than a number buried in the funnel.
+        // Rows an index should have covered cost a call each: their own
+        // line, with the fix, rather than a number buried in the funnel.
         if counts.rank_unindexed_rows > 0 {
             parts.push(format!(
-                "rank: {} rows are not in the semantic index and were skipped — \
-                 REFRESH SEMANTIC INDEX to include them",
+                "rank: {} rows are not in the semantic index and were scored on \
+                 their full text — re-run CREATE SEMANTIC INDEX to rank them from the index",
                 counts.rank_unindexed_rows,
             ));
         }

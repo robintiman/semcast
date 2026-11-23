@@ -270,26 +270,27 @@ async fn the_rerank_model_reads_chunks_not_the_whole_document() {
 }
 
 #[tokio::test]
-async fn null_text_never_ranks() {
+async fn null_text_ranks_last_with_a_null_score() {
     let (ctx, _dir) = indexed_context(ranking_model()).await;
     let batches = run(
         &ctx,
-        "SELECT meeting_id FROM meetings
-         ORDER BY transcript RELEVANCE TO 'offline sync' LIMIT 10",
+        "SELECT meeting_id, relevance(transcript, 'offline sync') AS score
+         FROM meetings ORDER BY score DESC LIMIT 10",
     )
     .await;
 
-    assert!(
-        !ids(&batches).contains(&4),
-        "the NULL transcript has no score and cannot be ranked"
-    );
+    let ids = ids(&batches);
+    assert_eq!(ids.len(), 4, "the NULL transcript keeps its row: {ids:?}");
+    assert_eq!(ids.last(), Some(&4), "a NULL score sorts last: {ids:?}");
+    let last = batches.iter().rev().find(|b| b.num_rows() > 0).unwrap();
+    assert!(last.column(1).is_null(last.num_rows() - 1));
 }
 
 #[tokio::test]
-async fn rows_the_index_never_saw_are_pruned() {
+async fn rows_the_index_never_saw_are_scored_on_their_full_text() {
     let model = ranking_model();
     let (ctx, _dir) = indexed_context(Arc::clone(&model)).await;
-    // Insert after indexing: the new row is invisible to the candidate stage.
+    // Insert after indexing: the candidate stage can't see the new row.
     ctx.sql("INSERT INTO meetings VALUES (5, 'late add', 'offline sync shipped')")
         .await
         .unwrap()
@@ -305,13 +306,15 @@ async fn rows_the_index_never_saw_are_pruned() {
     .await;
 
     assert!(
-        !ids(&batches).contains(&5),
-        "an unindexed row cannot be a candidate — REFRESH SEMANTIC INDEX first"
+        ids(&batches).contains(&5),
+        "an index changes cost, never which rows can rank"
     );
+    // The 3 indexed candidates on their chunks, the new row on its text.
+    assert_eq!(model.completion_calls(), 4);
 }
 
-/// Dropping a row silently is the failure mode this operator has to avoid, so
-/// the count has to reach the funnel the server streams as NOTICEs.
+/// Rows the index should have covered cost a call each, so the count has to
+/// reach the funnel the server streams as NOTICEs, with the fix.
 #[tokio::test]
 async fn skipped_unindexed_rows_are_reported_in_the_funnel() {
     let (ctx, _dir) = indexed_context(ranking_model()).await;
@@ -344,29 +347,27 @@ async fn skipped_unindexed_rows_are_reported_in_the_funnel() {
     );
     let line = semcast::server::progress::render(&counts);
     assert!(
-        line.contains("REFRESH SEMANTIC INDEX"),
+        line.contains("re-run CREATE SEMANTIC INDEX"),
         "the NOTICE must say how to fix it: {line}"
     );
 }
 
 #[tokio::test]
-async fn ranking_without_an_index_is_a_plan_time_error() {
-    let ctx = meetings_context_with_model(ranking_model()).await;
-    let message = error(
-        &ctx,
-        "SELECT meeting_id FROM meetings
-         ORDER BY transcript RELEVANCE TO 'offline sync' LIMIT 3",
-    )
-    .await;
+async fn ranking_without_an_index_scores_every_row_on_its_full_text() {
+    let model = ranking_model();
+    let ctx = meetings_context_with_model(Arc::clone(&model)).await;
+    let query = "SELECT meeting_id FROM meetings
+                 ORDER BY transcript RELEVANCE TO 'offline sync' LIMIT 3";
 
-    assert!(
-        message.contains("requires a semantic index on meetings(transcript)"),
-        "error should name the missing index: {message}"
+    let batches = run(&ctx, query).await;
+    assert_eq!(ids(&batches)[0], 1, "the transcript that answers the query");
+    assert_eq!(
+        model.completion_calls(),
+        3,
+        "one call per non-NULL row, no index to prune"
     );
-    assert!(
-        message.contains("CREATE SEMANTIC INDEX ON meetings(transcript)"),
-        "error should name the statement that fixes it: {message}"
-    );
+    run(&ctx, query).await;
+    assert_eq!(model.completion_calls(), 3, "the rerun reads the store");
 }
 
 #[tokio::test]
@@ -401,19 +402,39 @@ async fn relevance_in_a_where_clause_is_a_plan_time_error() {
 }
 
 #[tokio::test]
-async fn a_computed_text_expression_is_a_plan_time_error() {
-    let (ctx, _dir) = indexed_context(ranking_model()).await;
-    let message = error(
+async fn a_subquery_column_ranks_on_its_full_text() {
+    let model = ranking_model();
+    let (ctx, _dir) = indexed_context(Arc::clone(&model)).await;
+    let batches = run(
         &ctx,
-        "SELECT meeting_id FROM meetings
-         ORDER BY (title || transcript) RELEVANCE TO 'offline sync' LIMIT 3",
+        "SELECT meeting_id FROM (
+             SELECT meeting_id, title || ' ' || transcript AS doc FROM meetings
+         ) ORDER BY doc RELEVANCE TO 'offline sync' LIMIT 3",
     )
     .await;
 
-    assert!(
-        message.contains("plain indexed column"),
-        "error should explain why a computed expression can't rank: {message}"
+    assert_eq!(ids(&batches)[0], 1);
+    assert_eq!(
+        model.completion_calls(),
+        3,
+        "no index covers the computed column"
     );
+}
+
+#[tokio::test]
+async fn a_computed_text_expression_ranks_on_its_full_text() {
+    let model = ranking_model();
+    let (ctx, _dir) = indexed_context(Arc::clone(&model)).await;
+    let batches = run(
+        &ctx,
+        "SELECT meeting_id FROM meetings
+         ORDER BY (title || ' ' || transcript) RELEVANCE TO 'offline sync' LIMIT 3",
+    )
+    .await;
+
+    assert_eq!(ids(&batches)[0], 1);
+    // No index covers the expression; the NULL transcript makes a NULL text.
+    assert_eq!(model.completion_calls(), 3);
 }
 
 #[tokio::test]

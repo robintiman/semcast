@@ -222,8 +222,8 @@ memory without `--store`), and gives `MEANS`
 a cheap stage: one embedding call per query prunes non-candidates by vector
 similarity, and the verify model reads only the survivors. Under `WITH
 RECALL` it may read each survivor's top-3 chunks instead of the whole
-document (see below). Optional for `MEANS` but highly recommended; required
-by `RELEVANCE TO`, `GROUP BY MEANING OF` and `SEMANTIC DISTINCT ON`.
+document (see below). Optional for `MEANS` and `RELEVANCE TO` but highly
+recommended; required by `GROUP BY MEANING OF` and `SEMANTIC DISTINCT ON`.
 
 No `DROP` or `REFRESH` yet: run it again to rebuild after a load.
 
@@ -410,13 +410,25 @@ ORDER BY <text_column> RELEVANCE TO '<natural-language query>' LIMIT <k>
 relevance(<text_column>, '<natural-language query>')   -- the score, as a value
 ```
 
-Orders rows by how well the text answers the query, best first. Two stages:
-the index picks 4× `k` candidates (at least 32) by similarity, then one model
-call each scores them 0–1. Cost tracks `k`, not the table.
+Orders rows by how well the text answers the query, best first: the model
+scores each row 0–1. `LIMIT` is required.
 
-`LIMIT` and a semantic index are both required — without either, ranking is
-one model call per row of the whole table. The result is an approximate
-top-`k`: a row the index didn't surface as a candidate can't win.
+With a semantic index, two stages: the index picks 4× `k` candidates (at
+least 32) by similarity, then one model call each scores their best chunks.
+Cost tracks `k`, not the table, and the result is an approximate top-`k`: an
+indexed row the index didn't surface as a candidate can't win. A row added
+after the index was built is scored on its full text, one call each, until
+the index is rebuilt.
+
+Without an index (or over a computed expression), every row is scored on its
+full text: one model call per distinct text, an exact top-`k`.
+
+A NULL text, or a row the model failed to score, gets a NULL score. Ordered
+by the `RELEVANCE TO`/`relevance()` itself or its select-list alias, it
+sorts last unless the query says `NULLS FIRST`; ordered from an outer query,
+write `NULLS LAST`. An index is found by table name: rank `FROM meetings`,
+not `FROM meetings m … m.transcript`, or every row is scored on its full
+text.
 
 ```sql
 SELECT meeting_id, title FROM meetings
@@ -666,9 +678,9 @@ SELECT * FROM job_result('job_1753711331000_0000');
 - [x] Ingestion — Parquet/CSV on disk: path-literal `SELECT`, `CREATE EXTERNAL TABLE`, CTAS, `COPY TO`
 - [x] Batch jobs — `SUBMIT` a statement, poll `semcast_jobs`, read `job_result()`
 - [x] Persistent, cross-session verdict cache and catalog — `--store`
-- [x] Rank — `ORDER BY … RELEVANCE TO … LIMIT k` and `relevance()` as a
-      two-stage funnel: index similarity picks the candidates, a rerank pass
-      orders them
+- [x] Rank — `ORDER BY … RELEVANCE TO … LIMIT k` and `relevance()`: with an
+      index, similarity picks the candidates and a rerank pass orders them;
+      without one, every row is scored
 - [x] Classify — `MEANS` in a `SELECT` list or a `CASE` branch, all branches
       fused into one model call per row
 - [x] Semantic columns — `ALTER TABLE … ADD SEMANTIC COLUMN … AS (… MEANS …)`,

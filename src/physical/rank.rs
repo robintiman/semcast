@@ -1,14 +1,21 @@
-//! The rerank stage — semantic ranking as a two-stage funnel.
+//! The rank stage — `x RELEVANCE TO 'q'` is `ASK(x, 'q', SCORE)`: the model
+//! scores each row 0–1 against the query.
 //!
-//! Stage one is the semantic index: one embed call picks the candidates by
-//! cosine similarity, over-fetching a multiple of the query's `LIMIT`. Stage
-//! two spends the model, scoring each candidate's best chunks on a 0–1 scale.
-//! Cost is a function of the `LIMIT`, not of the table's size.
+//! With a semantic index it is a two-stage funnel. Stage one: one embed call
+//! picks the candidates by cosine similarity, over-fetching a multiple of the
+//! query's `LIMIT`. Stage two spends the model, scoring each candidate's best
+//! chunks. Cost is a function of the `LIMIT`, not of the table's size, and the
+//! result is an approximate top-k: an indexed row the index didn't surface as
+//! a candidate cannot win, however well it would have scored.
+//!
+//! An index changes cost, never which rows can rank: a row the index has
+//! never seen (or every row, with no index) is scored on its full text, one
+//! call per distinct text. The two inputs are asked under different prompts
+//! and prompt versions, as `MEANS` keeps chunked and full-text verdicts
+//! apart.
 //!
 //! The operator only *materializes* the score column; the `Sort` and `Limit`
-//! above it do the ordering and truncation. That makes the result an
-//! approximate top-k: a row the index never surfaced as a candidate cannot
-//! win, however well it would have scored.
+//! above it do the ordering and truncation.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -20,7 +27,7 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::Statistics;
 use datafusion::common::stats::Precision;
-use datafusion::error::Result;
+use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::{Distribution, EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
@@ -39,12 +46,32 @@ use crate::index::{ChunkHit, SearchParams, SemanticIndex, doc_hash};
 use crate::model::{CompletionRequest, ModelId, ModelProvider};
 use crate::physical::extract::parse_json_object;
 use crate::physical::verify::CHUNK_SEPARATOR;
+use crate::semir::{AskType, answer_key, normalize_instruction};
 
-/// Version of the synthesized rerank prompt. Participates in cache keys: bump
-/// it and every cached score is honestly invalidated.
+/// Version of the synthesized rerank prompt over a document's best chunks.
+/// Participates in cache keys: bump it and every cached score is honestly
+/// invalidated.
 pub const RELEVANCE_PROMPT_VERSION: &str = "relevance-v1";
 
-/// The instruction the rerank model sees. Users never write this.
+/// Version of the prompt over a document's full text, for rows no index
+/// covers. Its own constant: a one-chunk document sends the same input
+/// either way, and sharing a key would serve one prompt's score for the
+/// other's question.
+pub const RELEVANCE_FULL_PROMPT_VERSION: &str = "relevance-v1-full";
+
+/// The instruction the full-text scoring model sees.
+pub fn synthesize_relevance_prompt_full(query: &str) -> String {
+    format!(
+        "You are scoring how well a document matches a search query.\n\n\
+         Query: {query}\n\n\
+         Reply with a JSON object {{\"score\": n}} where n is between 0 and 1: \
+         1 means the document is exactly what the query asks for, 0 means it \
+         is unrelated."
+    )
+}
+
+/// The instruction the rerank model sees over a document's best chunks.
+/// Users never write this.
 pub fn synthesize_relevance_prompt(query: &str) -> String {
     format!(
         "You are scoring how well a document matches a search query. You see \
@@ -88,7 +115,9 @@ pub struct SemRankExec {
     candidates: usize,
     /// Name of the appended score column.
     score_column: String,
-    index: Arc<dyn SemanticIndex>,
+    /// Picks the candidates and their chunks; without one every row is
+    /// scored on its full text.
+    index: Option<Arc<dyn SemanticIndex>>,
     /// Chunks per document handed to the rerank model as evidence.
     chunks_per_doc: usize,
     model: Arc<dyn ModelProvider>,
@@ -106,7 +135,7 @@ impl SemRankExec {
         query: impl Into<String>,
         candidates: usize,
         score_column: impl Into<String>,
-        index: Arc<dyn SemanticIndex>,
+        index: Option<Arc<dyn SemanticIndex>>,
         chunks_per_doc: usize,
         model: Arc<dyn ModelProvider>,
         cache: Arc<dyn SemanticCache>,
@@ -127,7 +156,8 @@ impl SemRankExec {
         Ok(Self {
             input,
             text,
-            query: query.into(),
+            // Normalized where it enters, so every key built from it agrees.
+            query: normalize_instruction(&query.into()),
             candidates,
             score_column,
             index,
@@ -153,16 +183,25 @@ impl SemRankExec {
 
 impl DisplayAs for SemRankExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(
-            f,
-            "SemRankExec: RELEVANCE TO '{}' embed_model={} model={} \
-             top-{} chunks   ≤{} model calls",
-            self.query,
-            self.index.embed_model_id(),
-            self.model.id(),
-            self.chunks_per_doc,
-            self.candidates,
-        )
+        match &self.index {
+            Some(index) => write!(
+                f,
+                "SemRankExec: RELEVANCE TO '{}' embed_model={} model={} \
+                 top-{} chunks   ≤{} model calls, plus one per unindexed row",
+                self.query,
+                index.embed_model_id(),
+                self.model.id(),
+                self.chunks_per_doc,
+                self.candidates,
+            ),
+            None => write!(
+                f,
+                "SemRankExec: RELEVANCE TO '{}' model={} full text, no index   \
+                 one model call per distinct row",
+                self.query,
+                self.model.id(),
+            ),
+        }
     }
 }
 
@@ -195,7 +234,7 @@ impl ExecutionPlan for SemRankExec {
             self.query.clone(),
             self.candidates,
             self.score_column.clone(),
-            Arc::clone(&self.index),
+            self.index.clone(),
             self.chunks_per_doc,
             Arc::clone(&self.model),
             Arc::clone(&self.cache),
@@ -212,9 +251,10 @@ impl ExecutionPlan for SemRankExec {
             text: Arc::clone(&self.text),
             query: self.query.clone(),
             prompt: synthesize_relevance_prompt(&self.query),
+            full_prompt: synthesize_relevance_prompt_full(&self.query),
             candidates: self.candidates,
             params: self.search_params(),
-            index: Arc::clone(&self.index),
+            index: self.index.clone(),
             model_id: self.model.id(),
             model: Arc::clone(&self.model),
             cache: Arc::clone(&self.cache),
@@ -244,16 +284,18 @@ impl ExecutionPlan for SemRankExec {
         ))
     }
 
-    /// At most `candidates` distinct documents survive the index stage.
-    /// Inexact because rows sharing a text value all survive together.
+    /// With an index, about `candidates` distinct documents survive, plus
+    /// any the index never saw; without one, every row. Inexact because rows
+    /// sharing a text value all survive together.
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
         let input_rows = self.input.partition_statistics(partition)?.num_rows;
         let mut statistics = Statistics::new_unknown(&self.output_schema);
-        statistics.num_rows = match input_rows {
-            Precision::Exact(rows) | Precision::Inexact(rows) => {
+        statistics.num_rows = match (input_rows, &self.index) {
+            (Precision::Exact(rows) | Precision::Inexact(rows), Some(_)) => {
                 Precision::Inexact(rows.min(self.candidates))
             }
-            Precision::Absent => Precision::Inexact(self.candidates),
+            (rows, None) => rows.to_inexact(),
+            (Precision::Absent, Some(_)) => Precision::Inexact(self.candidates),
         };
         Ok(Arc::new(statistics))
     }
@@ -277,10 +319,13 @@ struct Candidates {
 struct Ranker {
     text: Arc<dyn PhysicalExpr>,
     query: String,
+    /// Over a document's best chunks.
     prompt: String,
+    /// Over a document's full text.
+    full_prompt: String,
     candidates: usize,
     params: SearchParams,
-    index: Arc<dyn SemanticIndex>,
+    index: Option<Arc<dyn SemanticIndex>>,
     model_id: ModelId,
     model: Arc<dyn ModelProvider>,
     cache: Arc<dyn SemanticCache>,
@@ -300,8 +345,9 @@ impl Ranker {
     async fn run(self, mut input: SendableRecordBatchStream) -> Result<Vec<RecordBatch>> {
         let candidates = self.candidates().await?;
 
-        // Keep only candidate rows. Bounded by the over-fetch, so buffering
-        // the survivors is safe even over a large table.
+        // Keep candidates and rows no index covers. With an index this is
+        // bounded by the over-fetch plus the index's staleness; without one
+        // it is the whole input, as any sort would buffer.
         let mut kept = Vec::new();
         while let Some(batch) = input.try_next().await? {
             let batch = self.keep_candidates(&candidates, batch)?;
@@ -320,20 +366,26 @@ impl Ranker {
     /// the excerpts the model will read, plus one membership scan so a stale
     /// index can be told from a losing document.
     async fn candidates(&self) -> Result<Candidates> {
-        let hits = self.index.search(&self.query, &self.params).await?;
+        let Some(index) = &self.index else {
+            return Ok(Candidates {
+                evidence: HashMap::new(),
+                indexed: HashSet::new(),
+            });
+        };
+        let hits = index.search(&self.query, &self.params).await?;
         Ok(Candidates {
             evidence: bucket_candidates(hits, self.candidates, self.params.chunks_per_doc),
-            indexed: self.index.indexed_doc_hashes().await?,
+            indexed: index.indexed_doc_hashes().await?,
         })
     }
 
-    /// Prune a batch to its candidate rows.
-    ///
-    /// Three-way, and deliberately unlike the `MEANS` pre-filter, which passes
-    /// unindexed rows through to full-text verification. A rank has nothing to
-    /// pass them through *to*: an unscored row has no place in an ordering. So
-    /// they are dropped — but counted separately in `unindexed_rows`, so index
-    /// staleness shows up in the funnel instead of silently shrinking results.
+    /// Prune a batch to the rows that will be scored: the index's candidates,
+    /// and every row it has never seen, which is scored on its full text
+    /// like the `MEANS` pre-filter passes such rows to full-text verify. An
+    /// indexed row that isn't a candidate is pruned; a NULL text is kept
+    /// with a NULL score. Without an index every row counts as a candidate;
+    /// with one, rows it never saw are counted in `unindexed_rows`, so index
+    /// staleness shows up in the funnel as the calls it costs.
     fn keep_candidates(&self, candidates: &Candidates, batch: RecordBatch) -> Result<RecordBatch> {
         if batch.num_rows() == 0 {
             return Ok(batch);
@@ -346,9 +398,10 @@ impl Ranker {
 
         let mut keep = vec![false; batch.num_rows()];
         for (row, keep_row) in keep.iter_mut().enumerate() {
-            // NULL text has nothing to rank — free to drop here.
+            // NULL text keeps its row with a NULL score, as a `MEANS` label
+            // over NULL is NULL: it costs nothing and sorts last.
             if !texts.is_valid(row) {
-                self.rows_pruned.add(1);
+                *keep_row = true;
                 continue;
             }
             let hash = doc_hash(texts.value(row));
@@ -358,25 +411,29 @@ impl Ranker {
             } else if candidates.indexed.contains(&hash) {
                 self.rows_pruned.add(1);
             } else {
-                self.unindexed_rows.add(1);
+                if self.index.is_some() {
+                    self.unindexed_rows.add(1);
+                } else {
+                    self.candidate_rows.add(1);
+                }
+                *keep_row = true;
             }
         }
         Ok(filter_record_batch(&batch, &BooleanArray::from(keep))?)
     }
 
-    /// Stage two: one batched model call scores every distinct candidate
-    /// document. Scores key on the document, so rows sharing a text value
+    /// Stage two: one store read, then one batched model call, score every
+    /// distinct kept document — a candidate on its chunks, any other on its
+    /// full text. Scores key on the document, so rows sharing a text value
     /// share one call.
     async fn score(
         &self,
         evidence: &HashMap<u64, Vec<String>>,
         kept: &[RecordBatch],
     ) -> Result<HashMap<u64, f64>> {
-        let mut scores = HashMap::new();
+        // (document, input sent, whether it is chunks), once per document.
+        let mut asks: Vec<(u64, String, bool)> = Vec::new();
         let mut seen = HashSet::new();
-        let mut requests = Vec::new();
-        let mut pending = Vec::new();
-
         for batch in kept {
             let texts = self.evaluate_texts(batch)?;
             let texts = texts
@@ -387,31 +444,63 @@ impl Ranker {
                 if !texts.is_valid(row) {
                     continue;
                 }
-                let hash = doc_hash(texts.value(row));
+                let text = texts.value(row);
+                let hash = doc_hash(text);
                 if !seen.insert(hash) {
                     continue;
                 }
-                let Some(chunks) = evidence.get(&hash) else {
-                    // `keep_candidates` already dropped every non-candidate.
-                    continue;
-                };
-                let input = chunks.join(CHUNK_SEPARATOR);
-                if let Some(CachedValue::Value(score)) = self.cache.get(&self.cache_key(&input)) {
-                    self.cache_hits.add(1);
-                    if let Ok(score) = score.parse::<f64>() {
-                        scores.insert(hash, score);
-                    }
-                    continue;
-                }
-                requests.push(CompletionRequest {
-                    system: self.prompt.clone(),
-                    input: input.clone(),
-                    max_tokens: 32,
-                    schema: Some(score_schema()),
-                    logprobs: false,
+                asks.push(match evidence.get(&hash) {
+                    Some(chunks) => (hash, chunks.join(CHUNK_SEPARATOR), true),
+                    None => (hash, text.to_owned(), false),
                 });
-                pending.push((hash, input));
             }
+        }
+
+        let keys: Vec<CacheKey> = asks
+            .iter()
+            .map(|(_, input, chunked)| self.cache_key(input, *chunked))
+            .collect();
+        // The store read can block on disk: keep it off the async workers.
+        let cache = Arc::clone(&self.cache);
+        let expected = keys.len();
+        let stored = tokio::task::spawn_blocking(move || cache.get_many(&keys))
+            .await
+            .map_err(|error| DataFusionError::External(Box::new(error)))?;
+        // A store that breaks one answer per key can't be lined up with the
+        // asks: ask everything rather than misread a score.
+        let stored = if stored.len() == expected {
+            stored
+        } else {
+            tracing::warn!(
+                "store answered {} of {expected} relevance keys; asking the model",
+                stored.len()
+            );
+            vec![None; expected]
+        };
+
+        let mut scores = HashMap::new();
+        let mut requests = Vec::new();
+        let mut pending = Vec::new();
+        for ((hash, input, chunked), stored) in asks.into_iter().zip(stored) {
+            if let Some(CachedValue::Value(score)) = stored {
+                self.cache_hits.add(1);
+                if let Ok(score) = score.parse::<f64>() {
+                    scores.insert(hash, score);
+                }
+                continue;
+            }
+            requests.push(CompletionRequest {
+                system: if chunked {
+                    self.prompt.clone()
+                } else {
+                    self.full_prompt.clone()
+                },
+                input: input.clone(),
+                max_tokens: 32,
+                schema: Some(score_schema()),
+                logprobs: false,
+            });
+            pending.push((hash, input, chunked));
         }
         // Counted as sent, so progress shows calls while they run; merges
         // are known only once they answer.
@@ -420,14 +509,16 @@ impl Ranker {
         self.model_calls_merged
             .add(crate::physical::verify::merged_calls(&completions));
         debug_assert_eq!(completions.len(), pending.len());
-        for ((hash, input), completion) in pending.iter().zip(&completions) {
+        for ((hash, input, chunked), completion) in pending.iter().zip(&completions) {
             match completion.as_ref().map(|c| parse_score(&c.text)) {
                 Ok(Some(score)) => {
                     scores.insert(*hash, score);
                     // Only successful scores are cached: a transient model
                     // failure must not permanently sink a row's ranking.
-                    self.cache
-                        .put(self.cache_key(input), CachedValue::Value(score.to_string()));
+                    self.cache.put(
+                        self.cache_key(input, *chunked),
+                        CachedValue::Value(score.to_string()),
+                    );
                 }
                 // Row-level failure: NULL score, which sorts last under DESC.
                 Ok(None) | Err(_) => self.rows_failed.add(1),
@@ -468,21 +559,26 @@ impl Ranker {
         Ok(cast(&texts, &DataType::Utf8)?)
     }
 
-    fn cache_key(&self, input: &str) -> CacheKey {
-        relevance_cache_key(&self.query, input, &self.model_id)
+    fn cache_key(&self, input: &str, chunked: bool) -> CacheKey {
+        relevance_cache_key(&self.query, input, &self.model_id, chunked)
     }
 }
 
-/// Full provenance: same query + sent excerpts + model + prompt scheme → same
-/// score, across every query that ever asks again.
-pub(crate) fn relevance_cache_key(query: &str, input: &str, model_id: &ModelId) -> CacheKey {
-    CacheKey {
-        type_version: query.to_owned(),
-        field: "relevance".to_owned(),
-        input_digest: crate::cache::stable_digest(&[input.as_bytes()]),
-        model_id: model_id.clone(),
-        prompt_version: RELEVANCE_PROMPT_VERSION.to_owned(),
-    }
+/// The answer key of `ASK(input, query, SCORE)`: same query + sent input +
+/// model + prompt scheme → same score, across every query that ever asks
+/// again. The layout relevance scores have always been stored under.
+pub(crate) fn relevance_cache_key(
+    query: &str,
+    input: &str,
+    model_id: &ModelId,
+    chunked: bool,
+) -> CacheKey {
+    let version = if chunked {
+        RELEVANCE_PROMPT_VERSION
+    } else {
+        RELEVANCE_FULL_PROMPT_VERSION
+    };
+    answer_key(query, AskType::Score, input, model_id, version)
 }
 
 /// Bucket search hits into the top `candidates` documents' evidence, best
