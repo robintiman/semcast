@@ -637,10 +637,7 @@ pub(crate) fn means_cache_key(
 /// joined by a probability from a different answer; naming the verdict
 /// lets [`cached_score`] refuse such a pair.
 pub(crate) fn yes_probability_key(verdict: &CacheKey) -> CacheKey {
-    CacheKey {
-        field: "means.yes_probability".to_owned(),
-        ..verdict.clone()
-    }
+    crate::semir::probability_key(verdict)
 }
 
 /// Cache a verdict, and the probability the model gave it when it reported

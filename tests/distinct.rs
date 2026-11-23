@@ -26,6 +26,23 @@ fn dedupe_model() -> Arc<MockModel> {
 
 async fn notes_context(model: Arc<MockModel>) -> (SessionContext, tempfile::TempDir) {
     let ctx = semcast_context(model);
+    notes_table(&ctx).await;
+    let dir = tempfile::tempdir().unwrap();
+    create_semantic_index(
+        &ctx,
+        "notes",
+        "body",
+        IndexOptions {
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    (ctx, dir)
+}
+
+/// notes(id, body), no index.
+async fn notes_table(ctx: &SessionContext) {
     let values: Vec<String> = ROWS
         .iter()
         .map(|(id, body)| format!("({id}, '{body}')"))
@@ -39,19 +56,6 @@ async fn notes_context(model: Arc<MockModel>) -> (SessionContext, tempfile::Temp
     .collect()
     .await
     .unwrap();
-
-    let dir = tempfile::tempdir().unwrap();
-    create_semantic_index(
-        &ctx,
-        "notes",
-        "body",
-        IndexOptions {
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
-    (ctx, dir)
 }
 
 async fn run(ctx: &SessionContext, sql: &str) -> Vec<RecordBatch> {
@@ -222,12 +226,12 @@ async fn dedupe_reports_a_funnel() {
 
 /// An index gap must leave duplicates in, never take rows out.
 #[tokio::test]
-async fn rows_the_index_never_saw_all_survive() {
+async fn rows_the_index_never_saw_are_compared_by_meaning() {
     let (ctx, _dir) = notes_context(dedupe_model()).await;
     ctx.sql(
         "INSERT INTO notes VALUES
              (6, 'the refund never turned up at all'),
-             (7, 'the refund never turned up at all either')",
+             (7, 'the launch moved again')",
     )
     .await
     .unwrap()
@@ -237,30 +241,47 @@ async fn rows_the_index_never_saw_all_survive() {
 
     let surviving = ids(&ctx, DEDUPE).await;
     assert!(
-        surviving.contains(&6) && surviving.contains(&7),
-        "unindexed rows keep their place rather than being collapsed: {surviving:?}"
+        !surviving.contains(&6) && !surviving.contains(&7),
+        "embedded for the query, the late rows collapse into their themes: {surviving:?}"
     );
 }
 
 #[tokio::test]
-async fn dedupe_without_an_index_is_a_plan_time_error() {
-    let ctx = semcast_context(dedupe_model());
-    ctx.sql("CREATE TABLE plain AS SELECT * FROM (VALUES (1, 'a')) AS t(id, body)")
+async fn a_row_the_index_lacks_keeps_its_place_when_embedding_it_fails() {
+    let model = Arc::new(
+        MockModel::default()
+            .embedding_by_theme(["refund", "launch", "outage"])
+            .failing_embeds_on(["turned up"]),
+    );
+    let (ctx, _dir) = notes_context(model).await;
+    ctx.sql("INSERT INTO notes VALUES (6, 'the refund never turned up at all')")
         .await
         .unwrap()
         .collect()
         .await
         .unwrap();
 
-    let message = error(&ctx, "SELECT SEMANTIC DISTINCT ON (body) id FROM plain").await;
+    let surviving = ids(&ctx, DEDUPE).await;
     assert!(
-        message.contains("requires a semantic index on plain(body)"),
-        "{message}"
+        surviving.contains(&6),
+        "no vector, so only an exact copy could collapse it: {surviving:?}"
     );
-    assert!(
-        message.contains("CREATE SEMANTIC INDEX ON plain(body)"),
-        "{message}"
+}
+
+#[tokio::test]
+async fn dedupe_without_an_index_embeds_the_column() {
+    let (indexed, _dir) = notes_context(dedupe_model()).await;
+    let with_index = ids(&indexed, DEDUPE).await;
+
+    let model = dedupe_model();
+    let ctx = semcast_context(Arc::clone(&model) as _);
+    notes_table(&ctx).await;
+    assert_eq!(
+        ids(&ctx, DEDUPE).await,
+        with_index,
+        "an index changes the cost"
     );
+    assert_eq!(model.completion_calls(), 0, "still no model calls");
 }
 
 #[tokio::test]
@@ -294,14 +315,14 @@ async fn semantic_key_in_a_where_clause_is_a_plan_time_error() {
 }
 
 #[tokio::test]
-async fn a_computed_text_expression_is_a_plan_time_error() {
+async fn a_computed_text_expression_is_deduplicated_by_its_own_vectors() {
     let (ctx, _dir) = notes_context(dedupe_model()).await;
-    let message = error(
+    let surviving = ids(
         &ctx,
-        "SELECT SEMANTIC DISTINCT ON (upper(body)) id, body FROM notes",
+        "SELECT SEMANTIC DISTINCT ON (body || '!') id, body FROM notes",
     )
     .await;
-    assert!(message.contains("plain indexed column"), "{message}");
+    assert_eq!(surviving.len(), 3, "{surviving:?}");
 }
 
 /// The dedupe threshold and a recall target are independent knobs and must

@@ -1,9 +1,10 @@
 //! The dedupe stage — collapsing near-duplicate rows.
 //!
-//! The cheapest semantic operator semcast has: **no model calls at all**. The
-//! index's document vectors already say how alike two documents are, and
-//! "same thing" is a threshold on that, not a judgement a model needs to
-//! make. One embed-free pass over vectors that were paid for at index time.
+//! The cheapest semantic operator semcast has: **no model calls at all**.
+//! Document vectors say how alike two documents are, and "same thing" is a
+//! threshold on that, not a judgement a model needs to make. With a semantic
+//! index, the vectors it paid for are read back; without one, the column is
+//! vectored the same way ([`DocVectors`]).
 //!
 //! Blocking, like clustering and for the same reason: whether a row is a
 //! duplicate is a fact about the rows around it. It materializes the group
@@ -34,15 +35,16 @@ use datafusion::physical_plan::{
 use futures::TryStreamExt;
 
 use crate::index::dedupe::greedy_groups;
-use crate::index::{SemanticIndex, doc_hash};
+use crate::index::doc_hash;
 use crate::model::Embedding;
+use crate::physical::doc_vectors::{DocVectors, VectorCounts};
 
 /// Groups near-duplicate input rows, appending the key of each row's group.
 ///
-/// Row semantics ("rows fail, queries don't"): a document the index has never
-/// seen is keyed by its own identity, so it can only ever collapse with a
-/// byte-identical twin. An index gap therefore degrades to exact-match
-/// dedupe — duplicates stay in, data never goes out.
+/// Row semantics ("rows fail, queries don't"): a document with no vector (an
+/// index gap whose embedding failed, an empty text) is keyed by its own
+/// identity, so it can only ever collapse with a byte-identical twin: that
+/// degrades to exact-match dedupe — duplicates stay in, data never goes out.
 ///
 /// NULL text keeps a NULL key, which SQL groups together exactly as a plain
 /// `DISTINCT ON` would.
@@ -54,7 +56,7 @@ pub struct SemDistinctExec {
     similarity: f32,
     /// Name of the appended key column.
     key_column: String,
-    index: Arc<dyn SemanticIndex>,
+    vectors: DocVectors,
     output_schema: SchemaRef,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
@@ -66,7 +68,7 @@ impl SemDistinctExec {
         text: Arc<dyn PhysicalExpr>,
         similarity: f32,
         key_column: impl Into<String>,
-        index: Arc<dyn SemanticIndex>,
+        vectors: DocVectors,
     ) -> Result<Self> {
         let key_column = key_column.into();
         let mut fields = input.schema().fields().to_vec();
@@ -84,7 +86,7 @@ impl SemDistinctExec {
             text,
             similarity,
             key_column,
-            index,
+            vectors,
             output_schema,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -98,8 +100,12 @@ impl DisplayAs for SemDistinctExec {
             f,
             "SemDistinctExec: SIMILARITY ≥ {:.2} embed_model={}   0 model calls",
             self.similarity,
-            self.index.embed_model_id(),
-        )
+            self.vectors.embed_model_id(),
+        )?;
+        if let DocVectors::Embed { .. } = self.vectors {
+            write!(f, " no index: embeds the column")?;
+        }
+        Ok(())
     }
 }
 
@@ -131,7 +137,7 @@ impl ExecutionPlan for SemDistinctExec {
             Arc::clone(&self.text),
             self.similarity,
             self.key_column.clone(),
-            Arc::clone(&self.index),
+            self.vectors.clone(),
         )?))
     }
 
@@ -144,11 +150,11 @@ impl ExecutionPlan for SemDistinctExec {
         let deduper = Deduper {
             text: Arc::clone(&self.text),
             similarity: self.similarity,
-            index: Arc::clone(&self.index),
+            vectors: self.vectors.clone(),
             output_schema: Arc::clone(&self.output_schema),
             groups: MetricBuilder::new(&self.metrics).counter("groups", partition),
             duplicate_rows: MetricBuilder::new(&self.metrics).counter("duplicate_rows", partition),
-            unindexed_rows: MetricBuilder::new(&self.metrics).counter("unindexed_rows", partition),
+            counts: VectorCounts::new(&self.metrics, partition),
         };
         // One future produces every output batch: no row can be called a
         // duplicate before every row has been seen.
@@ -183,17 +189,16 @@ impl ExecutionPlan for SemDistinctExec {
 struct Deduper {
     text: Arc<dyn PhysicalExpr>,
     similarity: f32,
-    index: Arc<dyn SemanticIndex>,
+    vectors: DocVectors,
     output_schema: SchemaRef,
     groups: Count,
     duplicate_rows: Count,
-    unindexed_rows: Count,
+    /// What vectoring the documents cost.
+    counts: VectorCounts,
 }
 
 impl Deduper {
     async fn run(self, mut input: SendableRecordBatchStream) -> Result<Vec<RecordBatch>> {
-        let vectors = self.index.doc_vectors().await?;
-
         let mut batches = Vec::new();
         while let Some(batch) = input.try_next().await? {
             batches.push(batch);
@@ -203,31 +208,38 @@ impl Deduper {
         // whole contract here: the first document of a group represents it,
         // so the grouping must not depend on how the scan batched rows.
         let mut hashes: Vec<u64> = Vec::new();
-        let mut seen = HashMap::new();
+        let mut texts: HashMap<u64, String> = HashMap::new();
+        let mut rows: HashMap<u64, usize> = HashMap::new();
         for batch in &batches {
-            let texts = self.evaluate_texts(batch)?;
-            let texts = texts
+            let values = self.evaluate_texts(batch)?;
+            let values = values
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .expect("text cast to Utf8");
-            for row in 0..texts.len() {
-                if !texts.is_valid(row) {
+            for row in 0..values.len() {
+                if !values.is_valid(row) {
                     continue;
                 }
-                let hash = doc_hash(texts.value(row));
-                // Left out of the grouping entirely rather than given a NULL
-                // key: SQL groups NULLs *together*, so a NULL key would
-                // collapse every unindexed row into one. `with_keys` falls
-                // back to the document's own identity instead.
-                if !vectors.contains_key(&hash) {
-                    self.unindexed_rows.add(1);
-                    continue;
-                }
-                if seen.insert(hash, ()).is_none() {
+                let text = values.value(row);
+                let hash = doc_hash(text);
+                *rows.entry(hash).or_default() += 1;
+                if texts.insert(hash, text.to_owned()).is_none() {
                     hashes.push(hash);
                 }
             }
         }
+        let vectors = if hashes.is_empty() {
+            HashMap::new()
+        } else {
+            self.vectors
+                .for_documents(&hashes, &texts, &rows, &self.counts)
+                .await?
+        };
+        // A document with no vector is left out of the grouping rather than
+        // given a NULL key: SQL groups NULLs *together*, so a NULL key would
+        // collapse them all into one. `with_keys` falls back to the
+        // document's own identity instead. Order is kept.
+        hashes.retain(|hash| vectors.contains_key(hash));
 
         let keys = self.keys(&hashes, &vectors);
         batches
@@ -282,7 +294,7 @@ impl Deduper {
             let hash = doc_hash(texts.value(row));
             match keys.get(&hash) {
                 Some(key) => builder.append_value(key),
-                // Unindexed: be its own group, keyed by its own identity, so
+                // No vector: be its own group, keyed by its own identity, so
                 // only a byte-identical twin joins it.
                 None => builder.append_value(format_key(hash)),
             }

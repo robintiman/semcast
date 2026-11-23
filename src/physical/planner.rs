@@ -28,8 +28,8 @@ use crate::physical::index_scan::{CalibrationConfig, ChunkEvidence, IndexScanExe
 use crate::physical::score_scan::ScorerHealth;
 use crate::physical::store_lookup::{StoreEvidence, StoreLookupExec};
 use crate::physical::{
-    ClusterVectors, ScoreScanExec, SemClassifyExec, SemClusterExec, SemDistinctExec,
-    SemExtractExec, SemRankExec, VerifyExec,
+    DocVectors, ScoreScanExec, SemClassifyExec, SemClusterExec, SemDistinctExec, SemExtractExec,
+    SemRankExec, VerifyExec,
 };
 
 /// The default DataFusion planner plus semcast extension planning.
@@ -282,54 +282,19 @@ impl ExtensionPlanner for SemcastExtensionPlanner {
         if let Some(distinct) = node.as_any().downcast_ref::<SemDistinctNode>() {
             let schema = logical_inputs[0].schema();
             let text = planner.create_physical_expr(&distinct.text, schema, session_state)?;
-            // Dedupe is the index's vectors or nothing — and unlike the other
-            // operators there is no model fallback, because no model is used.
-            let column = column_behind_casts(&distinct.text).ok_or_else(|| {
-                DataFusionError::Plan(format!(
-                    "SEMANTIC DISTINCT ON requires a plain indexed column, not a \
-                     computed expression (got `{}`)",
-                    distinct.text
-                ))
-            })?;
-            let (table, field) = qualified_name(column, schema)?;
-            let index = index_for(&table, &field, session_state).ok_or_else(|| {
-                DataFusionError::Plan(format!(
-                    "SEMANTIC DISTINCT ON requires a semantic index on {table}({field}); \
-                     create one with: CREATE SEMANTIC INDEX ON {table}({field});"
-                ))
-            })?;
+            let vectors = doc_vectors_for(&distinct.text, schema, session_state)?;
             return Ok(Some(Arc::new(SemDistinctExec::new(
                 Arc::clone(&physical_inputs[0]),
                 text,
                 distinct.similarity,
                 crate::logical::sem_distinct::key_column_name(distinct.id),
-                index,
+                vectors,
             )?)));
         }
         if let Some(cluster) = node.as_any().downcast_ref::<SemClusterNode>() {
             let schema = logical_inputs[0].schema();
             let text = planner.create_physical_expr(&cluster.text, schema, session_state)?;
-            // An index's vectors are read back; without one the column is
-            // embedded the same way (a computed or subquery column has none).
-            let index = column_behind_casts(&cluster.text)
-                .and_then(|column| qualified_name(column, schema).ok())
-                .and_then(|(table, field)| index_for(&table, &field, session_state));
-            let vectors = match index {
-                Some(index) => ClusterVectors::Index(index),
-                None => {
-                    let runtime = session_state
-                        .config()
-                        .get_extension::<SemcastRuntime>()
-                        .ok_or_else(|| {
-                            DataFusionError::Plan("MEANING OF needs a semcast session".to_owned())
-                        })?;
-                    ClusterVectors::Embed {
-                        embedder: Arc::clone(runtime.embedder()),
-                        store: Arc::clone(runtime.chunk_store()),
-                        dims: Arc::clone(runtime.embed_dims()),
-                    }
-                }
-            };
+            let vectors = doc_vectors_for(&cluster.text, schema, session_state)?;
             return Ok(Some(Arc::new(SemClusterExec::new(
                 Arc::clone(&physical_inputs[0]),
                 text,
@@ -433,6 +398,31 @@ fn resolve_index(
         .config()
         .get_extension::<SemcastRuntime>()?
         .index_for_text(&filter.text, schema)
+}
+
+/// The document vectors a set-level operator over `text` reads: an index
+/// over the column, or the column vectored with the session's embedder (a
+/// computed or subquery column has no index).
+fn doc_vectors_for(
+    text: &datafusion::logical_expr::Expr,
+    schema: &DFSchema,
+    session_state: &SessionState,
+) -> Result<DocVectors> {
+    let index = column_behind_casts(text)
+        .and_then(|column| qualified_name(column, schema).ok())
+        .and_then(|(table, field)| index_for(&table, &field, session_state));
+    if let Some(index) = index {
+        return Ok(DocVectors::Index(index));
+    }
+    let runtime = session_state
+        .config()
+        .get_extension::<SemcastRuntime>()
+        .ok_or_else(|| DataFusionError::Plan("not a semcast session".to_owned()))?;
+    Ok(DocVectors::Embed {
+        embedder: Arc::clone(runtime.embedder()),
+        store: Arc::clone(runtime.chunk_store()),
+        dims: Arc::clone(runtime.embed_dims()),
+    })
 }
 
 fn index_for(

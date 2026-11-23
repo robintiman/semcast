@@ -5,7 +5,8 @@
 //! `ASK(x, 'p', BOOL)`; `CONFIDENCE(x MEANS 'p')` is the probability of that
 //! same `ASK`; `CAST(x AS T)` is `ASK(x, synth(T), T)`, asked per generation
 //! unit of `T` ([`typed_answer_key`]); `x RELEVANCE TO 'q'` is
-//! `ASK(x, 'q', SCORE)`, a 0–1 score.
+//! `ASK(x, 'q', SCORE)`, a 0–1 score; naming a `MEANING OF` group is an
+//! `ASK` of the group's members (`LABEL`).
 //!
 //! An [`Ask`] has two identities, and keeping them apart is the point:
 //!
@@ -40,6 +41,9 @@ pub enum AskType {
     Typed,
     /// A relevance score from 0 to 1 — `RELEVANCE TO`.
     Score,
+    /// A short name for a group of documents — `MEANING OF`. Asked of the
+    /// group, not one text ([`answer_key_of_digest`]).
+    Label,
 }
 
 impl AskType {
@@ -53,6 +57,7 @@ impl AskType {
             AskType::Bool => "means",
             AskType::Typed => "typed",
             AskType::Score => "relevance",
+            AskType::Label => "label",
         }
     }
 }
@@ -136,11 +141,38 @@ pub fn answer_key(
     model: &ModelId,
     prompt_version: &str,
 ) -> CacheKey {
+    answer_key_of_digest(
+        instruction,
+        output,
+        stable_digest(&[input.as_bytes()]),
+        model,
+        prompt_version,
+    )
+}
+
+/// Where the model's P("yes") for a yes/no answer is kept: the answer's own
+/// key, another field. Durable, like every part of a key.
+pub fn probability_key(answer: &CacheKey) -> CacheKey {
+    CacheKey {
+        field: format!("{}.yes_probability", answer.field),
+        ..answer.clone()
+    }
+}
+
+/// [`answer_key`] for an input that isn't one text — a group of documents —
+/// given the digest that names it.
+pub fn answer_key_of_digest(
+    instruction: &str,
+    output: AskType,
+    input_digest: u128,
+    model: &ModelId,
+    prompt_version: &str,
+) -> CacheKey {
     debug_assert_eq!(normalize_instruction(instruction), instruction);
     CacheKey {
         type_version: instruction.to_owned(),
         field: output.field().to_owned(),
-        input_digest: stable_digest(&[input.as_bytes()]),
+        input_digest,
         model_id: model.clone(),
         prompt_version: prompt_version.to_owned(),
     }

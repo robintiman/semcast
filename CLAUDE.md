@@ -120,8 +120,11 @@ adds a digest of the input text, which is the verdict store's row key. On it:
 `ASK` per generation unit, each field stored under `typed_answer_key`) and
 `RELEVANCE TO` (`AskType::Score`, a 0–1 score; an index only picks
 candidates, and rows it doesn't cover are scored on full text).
-`MEANING OF` clusters document vectors (`EMBED`): an index's own, and
-`SemanticIndex::vectors_of` for the rest, built the same way.
+`MEANING OF` and `SEMANTIC DISTINCT ON` read document vectors (`EMBED`,
+`physical/doc_vectors.rs`): an index's own, and `SemanticIndex::vectors_of`
+for the rest, built the same way; a group's name is `AskType::Label`, keyed
+by its members (`answer_key_of_digest`). Every answer key is built in
+`src/semir/`.
 
 ### The funnel
 
@@ -184,9 +187,11 @@ plan's row estimate and the store's history for that filter; it decides nothing.
   sample, assumed a lost match wherever the floor would prune it.
 - An index gap degrades, never drops: unindexed documents pass the index
   pre-filter through to full-text verify (a scorer floor calibrated under
-  `WITH RECALL` may still prune them, inside its certificate);
-  `SEMANTIC DISTINCT` falls back to exact-match dedupe. Never silently
-  discard rows the index hasn't seen.
+  `WITH RECALL` may still prune them, inside its certificate); rank scores
+  them on full text; `MEANING OF` and `SEMANTIC DISTINCT` embed them for the
+  query (`physical/doc_vectors.rs`), and if that fails, leave them ungrouped
+  or dedupe them by exact match. Never silently discard rows the index
+  hasn't seen.
 - `UPDATE`/`DELETE` with a `MEANS`, `CONFIDENCE()` or subquery predicate is
   refused (`lib.rs::reject_semantic_dml`): DataFusion would hand the table
   no predicate and the statement would touch every row.
