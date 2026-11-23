@@ -22,9 +22,9 @@ use std::ops::ControlFlow;
 
 use datafusion::sql::parser::Statement;
 use datafusion::sql::sqlparser::ast::{
-    Cte, Expr, Function, FunctionArguments, Ident, ObjectName, OrderByKind, Query, SelectItem,
-    SelectItemQualifiedWildcardKind, SetExpr, TableAliasColumnDef, TableFactor, Visit, VisitMut,
-    Visitor, VisitorMut,
+    Cte, Expr, Function, FunctionArguments, Ident, ObjectName, OrderByKind, Query,
+    RenameSelectItem, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, TableAliasColumnDef,
+    TableFactor, Visit, VisitMut, Visitor, VisitorMut, WildcardAdditionalOptions,
 };
 
 use crate::sql::rank_udf::RELEVANCE_UDF_NAME;
@@ -112,24 +112,6 @@ fn relevance_aliases(query: &Query) -> RelevanceAliases {
     let SetExpr::Select(select) = query.body.as_ref() else {
         return aliases;
     };
-    for item in &select.projection {
-        match item {
-            SelectItem::ExprWithAlias { expr, alias } if contains_relevance_call(expr) => {
-                aliases.own.push(resolved(alias));
-            }
-            SelectItem::ExprWithAlias { alias, .. } => aliases.shadowed.push(resolved(alias)),
-            // A plain column in the select list is an output of that name too.
-            SelectItem::UnnamedExpr(Expr::Identifier(ident)) => {
-                aliases.shadowed.push(resolved(ident));
-            }
-            SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts)) => {
-                if let Some(last) = parts.last() {
-                    aliases.shadowed.push(resolved(last));
-                }
-            }
-            _ => {}
-        }
-    }
     let ctes: Vec<(String, &Cte)> = query
         .with
         .iter()
@@ -173,6 +155,36 @@ fn relevance_aliases(query: &Query) -> RelevanceAliases {
             aliases.tables.push((table.clone(), column));
         }
     }
+    for item in &select.projection {
+        match item {
+            SelectItem::ExprWithAlias { expr, alias } if contains_relevance_call(expr) => {
+                aliases.own.push(resolved(alias));
+            }
+            SelectItem::ExprWithAlias { alias, .. } => aliases.shadowed.push(resolved(alias)),
+            // A plain column in the select list is an output of that name:
+            // the table's score passed through, or something that hides it.
+            SelectItem::UnnamedExpr(Expr::Identifier(ident)) => {
+                let name = resolved(ident);
+                if aliases.tables.iter().any(|t| t.1 == name) {
+                    aliases.own.push(name);
+                } else {
+                    aliases.shadowed.push(name);
+                }
+            }
+            SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts)) => {
+                let [.., table, column] = parts.as_slice() else {
+                    continue;
+                };
+                let (table, column) = (resolved(table), resolved(column));
+                if aliases.tables.iter().any(|t| t.0 == table && t.1 == column) {
+                    aliases.own.push(column);
+                } else {
+                    aliases.shadowed.push(column);
+                }
+            }
+            _ => {}
+        }
+    }
     aliases
 }
 
@@ -204,10 +216,21 @@ fn exposed_scores(body: &Query, renamed: &[TableAliasColumnDef]) -> Vec<String> 
     let mut names = inner.own;
     for item in &select.projection {
         match item {
-            SelectItem::Wildcard(_) => {
-                names.extend(inner.tables.iter().map(|t| t.1.clone()));
+            SelectItem::Wildcard(options) => {
+                let hidden = replaced(options);
+                names.extend(
+                    inner
+                        .tables
+                        .iter()
+                        .map(|t| t.1.clone())
+                        .filter(|name| !hidden.contains(name)),
+                );
             }
-            SelectItem::QualifiedWildcard(SelectItemQualifiedWildcardKind::ObjectName(name), _) => {
+            SelectItem::QualifiedWildcard(
+                SelectItemQualifiedWildcardKind::ObjectName(name),
+                options,
+            ) => {
+                let hidden = replaced(options);
                 let Some(table) = name.0.last().and_then(|part| part.as_ident()) else {
                     continue;
                 };
@@ -216,12 +239,31 @@ fn exposed_scores(body: &Query, renamed: &[TableAliasColumnDef]) -> Vec<String> 
                     inner
                         .tables
                         .iter()
-                        .filter(|t| t.0 == table)
+                        .filter(|t| t.0 == table && !hidden.contains(&t.1))
                         .map(|t| t.1.clone()),
                 );
             }
             _ => {}
         }
+    }
+    names
+}
+
+/// The columns a `*` replaces or renames, which no longer carry what the
+/// table exposed under that name.
+fn replaced(options: &WildcardAdditionalOptions) -> Vec<String> {
+    let mut names: Vec<String> = options
+        .opt_replace
+        .iter()
+        .flat_map(|replace| &replace.items)
+        .map(|item| resolved(&item.column_name))
+        .collect();
+    match &options.opt_rename {
+        Some(RenameSelectItem::Single(rename)) => names.push(resolved(&rename.ident)),
+        Some(RenameSelectItem::Multiple(renames)) => {
+            names.extend(renames.iter().map(|rename| resolved(&rename.ident)));
+        }
+        None => {}
     }
     names
 }
@@ -391,6 +433,32 @@ mod tests {
             "SELECT * FROM (SELECT id, relevance(b, 'x') FROM t) AS q (k, score) ORDER BY score DESC NULLS LAST LIMIT 5"
         );
         let sql = "WITH r (k, s) AS (SELECT relevance(b, 'x'), id FROM t) SELECT * FROM r ORDER BY s DESC LIMIT 5";
+        assert_eq!(rewrite(sql), sql);
+    }
+
+    #[test]
+    fn a_selected_score_column_is_still_the_score() {
+        for (sql, expected) in [
+            (
+                "SELECT id, s FROM (SELECT id, relevance(b, 'x') AS s FROM t) AS q ORDER BY s DESC LIMIT 5",
+                "SELECT id, s FROM (SELECT id, relevance(b, 'x') AS s FROM t) AS q ORDER BY s DESC NULLS LAST LIMIT 5",
+            ),
+            (
+                "SELECT q.id, q.s FROM (SELECT id, relevance(b, 'x') AS s FROM t) AS q ORDER BY s DESC LIMIT 5",
+                "SELECT q.id, q.s FROM (SELECT id, relevance(b, 'x') AS s FROM t) AS q ORDER BY s DESC NULLS LAST LIMIT 5",
+            ),
+            (
+                "WITH r AS (SELECT id, relevance(b, 'x') AS s FROM t) SELECT id, s FROM r ORDER BY s DESC LIMIT 5",
+                "WITH r AS (SELECT id, relevance(b, 'x') AS s FROM t) SELECT id, s FROM r ORDER BY s DESC NULLS LAST LIMIT 5",
+            ),
+        ] {
+            assert_eq!(rewrite(sql), expected);
+        }
+    }
+
+    #[test]
+    fn a_replaced_column_is_not_the_score() {
+        let sql = "SELECT * FROM (SELECT * REPLACE (0 AS s) FROM (SELECT relevance(b, 'x') AS s FROM t) AS a) AS q ORDER BY s DESC LIMIT 5";
         assert_eq!(rewrite(sql), sql);
     }
 

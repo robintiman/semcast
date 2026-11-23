@@ -506,3 +506,18 @@ async fn a_score_sorted_from_an_outer_query_puts_no_score_last() {
         "the NULL transcript's score last: {ids:?}"
     );
 }
+
+#[tokio::test]
+async fn a_selected_score_from_an_outer_query_puts_no_score_last() {
+    let (ctx, _dir) = indexed_context(ranking_model()).await;
+    let batches = run(
+        &ctx,
+        "SELECT meeting_id, score FROM (
+             SELECT meeting_id, relevance(transcript, 'offline sync') AS score FROM meetings
+         ) AS q ORDER BY score DESC LIMIT 10",
+    )
+    .await;
+
+    let ids = ids(&batches);
+    assert_eq!(ids.last(), Some(&4), "no score sorts last: {ids:?}");
+}
