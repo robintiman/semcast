@@ -128,6 +128,9 @@ fn request_body(model: &str, request: &CompletionRequest) -> serde_json::Value {
         "max_tokens": request.max_tokens,
         "system": request.system,
         "messages": [{"role": "user", "content": request.input}],
+        // Haiku 5.5 thinks by default, and thinking counts against
+        // max_tokens: a one-word verdict budget is spent before any text.
+        "thinking": {"type": "disabled"},
     });
     if let Some(schema) = &request.schema {
         body["output_config"] = json!({
@@ -252,6 +255,7 @@ mod tests {
         let body = request_body("claude-haiku-4-5", &request);
         assert_eq!(body["model"], "claude-haiku-4-5");
         assert_eq!(body["system"], "sys");
+        assert_eq!(body["thinking"]["type"], "disabled");
         assert!(body.get("output_config").is_none());
     }
 
