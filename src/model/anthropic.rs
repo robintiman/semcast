@@ -17,7 +17,7 @@ use super::{Completion, CompletionRequest, Embedding, ModelId, ModelProvider};
 use crate::{Result, SemcastError};
 
 pub const DEFAULT_ANTHROPIC_URL: &str = "https://api.anthropic.com";
-pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-haiku-4-5";
+pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-haiku-5-5";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 pub struct AnthropicProvider {

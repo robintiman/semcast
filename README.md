@@ -41,7 +41,7 @@ Pick a provider:
   `nomic-embed-text`. Completions and embeddings, no API key. The default
   model is 17 GB and wants about 24 GB of memory at the default 32k context;
   on a smaller machine pass `--model gemma4:e4b`.
-* **Anthropic** — `export ANTHROPIC_API_KEY=...`; defaults to `claude-haiku-4-5`, the right
+* **Anthropic** — `export ANTHROPIC_API_KEY=...`; defaults to `claude-haiku-5-5`, the right
   tier for one-word verify calls. No embeddings, so pair with Ollama or Voyage
   to index. Select with `--provider anthropic`.
 * **Voyage** — `export VOYAGE_API_KEY=...`; hosted embeddings for the semantic
@@ -86,7 +86,7 @@ Flags of `semcast serve`:
 | `--host` | `127.0.0.1` | listen address |
 | `--port` | `5433` | leaves a local Postgres on 5432 alone |
 | `--provider` | `ollama` | completions: `ollama`, `anthropic`, or `replay` (answers `MEANS` from an earlier run's store, for evals; see [`eval/README.md`](eval/README.md#replay)) |
-| `--model` | per provider | `qwen3.8:27b` (Ollama), `claude-haiku-4-5` (Anthropic); required with `replay`: the recorded model's id |
+| `--model` | per provider | `qwen3.8:27b` (Ollama), `claude-haiku-5-5` (Anthropic); required with `replay`: the recorded model's id |
 | `--scorer-model` | off | small Ollama model that pre-filters an unindexed `MEANS` under [`WITH RECALL`](#with-recall) |
 | `--embed-provider` | `ollama` | embeddings: `ollama` or `voyage` |
 | `--embed-model` | `nomic-embed-text` | Ollama embedding model |
