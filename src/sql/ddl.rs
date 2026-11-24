@@ -49,6 +49,9 @@ pub enum SemanticDdl {
         name: String,
         explain: bool,
     },
+    /// `[EXPLAIN] REFRESH SEMANTIC VIEW name`: pay ahead for every semantic
+    /// question the view asks, or with `EXPLAIN`, quote it.
+    RefreshView { name: String, explain: bool },
     /// `CREATE SEMANTIC PREDICATE name(params) AS template [CHEAP USING ...]`
     CreatePredicate {
         name: String,
@@ -168,9 +171,19 @@ pub fn parse_alter_semantic(parser: &mut Parser) -> crate::Result<SemanticDdl> {
     Ok(ddl)
 }
 
-/// Parse the tail of `REFRESH SEMANTIC COLUMN table(name)` — `REFRESH
-/// SEMANTIC` is already consumed.
+/// Parse the tail of `REFRESH SEMANTIC COLUMN table(name)` or `REFRESH
+/// SEMANTIC VIEW name` — `REFRESH SEMANTIC` is already consumed.
 pub fn parse_semantic_refresh(parser: &mut Parser, explain: bool) -> crate::Result<SemanticDdl> {
+    if matches!(&parser.peek_token().token, Token::Word(w) if w.value.eq_ignore_ascii_case("VIEW"))
+    {
+        parser.next_token();
+        let name = parse_table_name(parser).map_err(view_error)?;
+        let _ = parser.consume_token(&Token::SemiColon);
+        parser
+            .expect_token(&Token::EOF)
+            .map_err(|e| view_error(e.to_string()))?;
+        return Ok(SemanticDdl::RefreshView { name, explain });
+    }
     expect_word(parser, "COLUMN").map_err(column_error)?;
     let table = parse_table_name(parser).map_err(column_error)?;
     parser
@@ -204,6 +217,13 @@ fn parse_table_name(parser: &mut Parser) -> Result<String, String> {
         ));
     }
     Ok(parts.join("."))
+}
+
+fn view_error(message: impl Into<String>) -> crate::SemcastError {
+    crate::SemcastError::DataFusion(DataFusionError::Plan(format!(
+        "invalid semantic view statement: {}; expected [EXPLAIN] REFRESH SEMANTIC VIEW name",
+        message.into()
+    )))
 }
 
 fn column_error(message: impl Into<String>) -> crate::SemcastError {

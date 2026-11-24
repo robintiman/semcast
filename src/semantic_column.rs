@@ -550,13 +550,8 @@ pub async fn refresh_column(
     }
     // The analyzer and optimizer rules apply to DataFrame plans too, so this
     // reads the column exactly as a query would.
-    let batches = ctx
-        .table(table)
-        .await?
-        .select_columns(&[name])?
-        .collect()
-        .await?;
-    Ok(batches.iter().map(|batch| batch.num_rows()).sum())
+    let frame = ctx.table(table).await?.select_columns(&[name])?;
+    crate::semantic_view::drain(frame).await
 }
 
 /// One `ALTER` at a time: each reads the table's columns, changes them, and
@@ -604,7 +599,6 @@ pub async fn explain_refresh(
     name: &str,
 ) -> crate::Result<datafusion::dataframe::DataFrame> {
     use datafusion::arrow::array::{ArrayRef, Float64Array, StringArray, UInt64Array};
-    use datafusion::arrow::compute::cast;
     use datafusion::arrow::record_batch::RecordBatch;
 
     let provider = ctx.table_provider(table).await?;
@@ -616,65 +610,29 @@ pub async fn explain_refresh(
                 "{table} has no semantic column named {name}"
             ))
         })?;
-    let runtime = crate::index::runtime(ctx)?;
-    let model = runtime.model.id();
-
-    // The text column only: no semantic column is read, so nothing is asked.
-    let batches = ctx
-        .table(table)
+    let model = crate::index::runtime(ctx)?.model.id();
+    let question = crate::semantic_view::Question {
+        kind: crate::semantic_view::QuestionKind::Filter,
+        conditions: vec![column.condition.clone()],
+        source: Some((table.to_owned(), column.text.clone())),
+    };
+    let quote = crate::semantic_view::quote(ctx, &question, &model)
         .await?
-        .select_columns(&[column.text.as_str()])?
-        .collect()
-        .await?;
-    let mut rows = 0_u64;
-    let mut seen = std::collections::HashSet::new();
-    let mut texts: Vec<String> = Vec::new();
-    for batch in &batches {
-        rows += batch.num_rows() as u64;
-        let strings = cast(batch.column(0), &DataType::Utf8)
-            .map_err(datafusion::error::DataFusionError::from)?;
-        let strings = strings
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("cast to Utf8");
-        for text in strings.iter().flatten() {
-            if seen.insert(crate::cache::stable_digest(&[text.as_bytes()])) {
-                texts.push(text.to_owned());
-            }
-        }
-    }
-    let keys: Vec<_> = texts
-        .iter()
-        .map(|text| {
-            crate::physical::verify::means_cache_key(
-                &column.condition,
-                text,
-                &model,
-                crate::physical::verify::MEANS_PROMPT_VERSION,
-            )
-        })
-        .collect();
-    let cache = std::sync::Arc::clone(runtime.cache());
-    let answers = tokio::task::spawn_blocking(move || cache.get_many(&keys))
-        .await
-        .map_err(|error| datafusion::error::DataFusionError::External(Box::new(error)))?;
-    let prompt_chars = crate::physical::verify::synthesize_means_prompt(&column.condition)
-        .chars()
-        .count() as u64;
-    let mut stored = 0_u64;
-    let mut input_tokens = 0_u64;
-    for (text, answer) in texts.iter().zip(&answers) {
-        if matches!(answer, Some(crate::cache::CachedValue::Value(_))) {
-            stored += 1;
-        } else {
-            input_tokens += (prompt_chars + text.chars().count() as u64).div_ceil(4);
-        }
-    }
-    let to_ask = texts.len() as u64 - stored;
-    let output_tokens = to_ask * crate::physical::verify::VERIFY_MAX_TOKENS as u64;
-    let cost = crate::model::pricing::price_per_mtok(&model).map(|(input, output)| {
-        (input_tokens as f64 * input + output_tokens as f64 * output) / 1_000_000.0
-    });
+        .ok_or_else(|| {
+            datafusion::error::DataFusionError::Plan(format!(
+                "cannot read {table}.{} to quote it",
+                column.text
+            ))
+        })?;
+    let crate::semantic_view::Quote {
+        rows,
+        texts,
+        stored,
+        to_ask,
+        input_tokens,
+        output_tokens,
+        cost,
+    } = quote;
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("model", DataType::Utf8, false),
@@ -690,7 +648,7 @@ pub async fn explain_refresh(
     let columns: Vec<ArrayRef> = vec![
         Arc::new(StringArray::from(vec![model.0.clone()])),
         Arc::new(UInt64Array::from(vec![rows])),
-        Arc::new(UInt64Array::from(vec![texts.len() as u64])),
+        Arc::new(UInt64Array::from(vec![texts])),
         Arc::new(UInt64Array::from(vec![stored])),
         Arc::new(UInt64Array::from(vec![to_ask])),
         Arc::new(UInt64Array::from(vec![input_tokens])),

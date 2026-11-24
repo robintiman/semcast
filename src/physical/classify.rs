@@ -56,7 +56,7 @@ use crate::physical::verify::{
 pub const CLASSIFY_PROMPT_VERSION: &str = "classify-v1";
 
 /// Enough for a small JSON object of booleans.
-const CLASSIFY_MAX_TOKENS: usize = 128;
+pub(crate) const CLASSIFY_MAX_TOKENS: usize = 128;
 
 /// The instruction the fused classify model sees. Users never write this.
 pub fn synthesize_classify_prompt(conditions: &[&str]) -> String {
